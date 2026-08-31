@@ -10,16 +10,27 @@ suite red and demands this file change in the same commit.
 
 ## Status
 
-The engine is mid-implementation (plan phase: check complete).
-Current verified surface:
+The engine is mid-implementation (plan phase: list_objects
+complete). Current verified surface:
 
 - `check` and `batch_check`: every non-condition case of the
   upstream YAML corpus (`consolidated_1_1_tests.yaml` +
   `abac_tests.yaml`) passes differentially against the oracle, in
   both the normal and contextual-tuples replay variants.
-- Conditions/ABAC, `list_objects`, `list_users`, `expand`, and
-  `read` are not implemented yet; every affected corpus case is a
-  generated, printed skip (no silent scope reduction).
+- `list_objects` (unary and the streamed adapter): every
+  non-condition corpus case passes differentially, each returned
+  object confirmed by a forward check; the 1000-result cap is
+  probed on both engines. The engine mirrors upstream's measured
+  envelope: reverse expansion charges no tuple-hop depth (a
+  100-link chain lists completely even where a forward check on
+  the same chain refuses as too complex).
+- `list_objects` returns complete results or an error — there is
+  no deadline machinery, and it is verified that no corpus case
+  depends on upstream's partial-results-on-deadline behaviour
+  (different-shape property, measurements M21/M22).
+- Conditions/ABAC, `list_users`, `expand`, and `read` are not
+  implemented yet; every affected corpus case is a generated,
+  printed skip (no silent scope reduction).
 
 ## Exclusions (out of v1 scope)
 

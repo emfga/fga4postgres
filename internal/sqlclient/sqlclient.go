@@ -105,6 +105,16 @@ func validate(in proto.Message) error {
 		}
 	case *openfgav1.WriteAuthorizationModelRequest:
 		m.StoreId = dummyULID
+	case *openfgav1.ListObjectsRequest:
+		m.StoreId = dummyULID
+		if m.AuthorizationModelId != "" {
+			m.AuthorizationModelId = dummyULID
+		}
+	case *openfgav1.ListUsersRequest:
+		m.StoreId = dummyULID
+		if m.AuthorizationModelId != "" {
+			m.AuthorizationModelId = dummyULID
+		}
 	}
 	v, ok := c.(interface{ Validate() error })
 	if !ok {
@@ -299,7 +309,39 @@ func (c *Client) ListObjects(
 	in *openfgav1.ListObjectsRequest,
 	_ ...grpc.CallOption,
 ) (*openfgav1.ListObjectsResponse, error) {
-	return nil, unimplemented("ListObjects", "phase 3")
+	if err := validate(in); err != nil {
+		return nil, err
+	}
+	mapped := proto.Clone(in).(*openfgav1.ListObjectsRequest)
+	mapped.User = c.mapUser(mapped.GetUser())
+	for i, tk := range mapped.GetContextualTuples().GetTupleKeys() {
+		mapped.ContextualTuples.TupleKeys[i] = c.mapTuple(tk)
+	}
+	req, err := marshal.Marshal(mapped)
+	if err != nil {
+		return nil, err
+	}
+	var out []byte
+	err = c.pool.QueryRow(ctx,
+		"SELECT fga.list_objects($1, $2)", in.GetStoreId(), req,
+	).Scan(&out)
+	if err != nil {
+		return nil, translate(err)
+	}
+	resp := &openfgav1.ListObjectsResponse{}
+	if err := protojson.Unmarshal(out, resp); err != nil {
+		return nil, err
+	}
+	// Map engine object ids back to the corpus originals.
+	if c.ids != nil {
+		for i, obj := range resp.GetObjects() {
+			typ, id, ok := strings.Cut(obj, ":")
+			if ok {
+				resp.Objects[i] = typ + ":" + c.ids.Back(id)
+			}
+		}
+	}
+	return resp, nil
 }
 
 func (c *Client) ListUsers(

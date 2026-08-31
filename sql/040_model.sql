@@ -57,7 +57,27 @@ CREATE TABLE IF NOT EXISTS fga.model_relation (
   relation_name text NOT NULL,
   rewrite jsonb NOT NULL,
   is_assignable boolean NOT NULL,
+  -- The rewrite tree contains intersection or difference, so a
+  -- reverse-expansion candidate arriving at this relation needs a
+  -- forward check (plan §1.5).
+  needs_check boolean NOT NULL DEFAULT false,
   PRIMARY KEY (store, model_id, type_name, relation_name)
+);
+
+ALTER TABLE fga.model_relation
+  ADD COLUMN IF NOT EXISTS needs_check boolean
+  NOT NULL DEFAULT false;
+
+-- Reverse computed-userset edges: relation_name grants to anyone
+-- holding computed_relation on the same object.
+CREATE TABLE IF NOT EXISTS fga.model_computed (
+  store uuid NOT NULL,
+  model_id uuid NOT NULL,
+  type_name text NOT NULL,
+  relation_name text NOT NULL,
+  computed_relation text NOT NULL,
+  PRIMARY KEY (store, model_id, type_name, relation_name,
+               computed_relation)
 );
 
 -- One row per entry of directly_related_user_types, in model
@@ -188,9 +208,21 @@ BEGIN
   SELECT store_id, new_id, td ->> 'type', rel.key, rel.value,
     coalesce(jsonb_array_length(
       td -> 'metadata' -> 'relations' -> rel.key
-         -> 'directly_related_user_types') > 0, false)
+         -> 'directly_related_user_types') > 0, false),
+    EXISTS (
+      SELECT FROM fga._rewrite_nodes(rel.value) AS n
+      WHERE n ? 'intersection' OR n ? 'difference'
+    )
   FROM jsonb_array_elements(request -> 'type_definitions') AS td,
        jsonb_each(coalesce(td -> 'relations', '{}'::jsonb)) AS rel;
+
+  INSERT INTO fga.model_computed
+  SELECT DISTINCT store_id, new_id, r.type_name, r.relation_name,
+    n -> 'computed_userset' ->> 'relation'
+  FROM fga.model_relation AS r,
+       fga._rewrite_nodes(r.rewrite) AS n
+  WHERE r.store = store_id AND r.model_id = new_id
+    AND n ? 'computed_userset';
 
   INSERT INTO fga.model_type_restriction
   SELECT store_id, new_id, td ->> 'type', rel.key,

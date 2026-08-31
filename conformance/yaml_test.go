@@ -91,7 +91,13 @@ func TestCheckCorpus(t *testing.T) {
 func TestListObjectsCorpus(t *testing.T) {
 	corpusCases(t, "list_objects",
 		func(t *testing.T, file string, tc corpus.Test) {
-			t.Fatal("replay not implemented (plan phase 3)")
+			t.Parallel()
+			t.Run("normal", func(t *testing.T) {
+				runListObjectsReplay(t, file, tc, false)
+			})
+			t.Run("ctxTuples", func(t *testing.T) {
+				runListObjectsReplay(t, file, tc, true)
+			})
 		})
 }
 

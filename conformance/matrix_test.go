@@ -5,6 +5,7 @@ import (
 
 	"github.com/openfga/openfga/tests"
 	"github.com/openfga/openfga/tests/check"
+	"github.com/openfga/openfga/tests/listobjects"
 
 	"github.com/emfga/fga4postgres/internal/skiplist"
 	"github.com/emfga/fga4postgres/internal/sqlclient"
@@ -34,4 +35,16 @@ func TestImportedCheckRunners(t *testing.T) {
 		testdb.Pool(t), uuidmap.New("imported/check"))
 	check.RunAllTests(t, client)
 	check.RunMatrixTests(t, "fga4postgres", "main", client)
+}
+
+func TestImportedListObjectsRunners(t *testing.T) {
+	if phase < 4 {
+		skiplist.Skip(t, "imported list_objects runners blocked "+
+			"on conditions: the matrix model declares xcond "+
+			"(plan phase 4 lifts; ISSUES.md 4)")
+	}
+	client := sqlclient.New(
+		testdb.Pool(t), uuidmap.New("imported/listobjects"))
+	listobjects.RunAllTests(t, client)
+	listobjects.RunMatrixTests(t, "fga4postgres", false, client)
 }

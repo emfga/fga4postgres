@@ -48,6 +48,7 @@ AS $$
 BEGIN
   DELETE FROM fga.tuple WHERE store = store_id;
   DELETE FROM fga.model_reachable WHERE store = store_id;
+  DELETE FROM fga.model_computed WHERE store = store_id;
   DELETE FROM fga.model_condition WHERE store = store_id;
   DELETE FROM fga.model_ttu WHERE store = store_id;
   DELETE FROM fga.model_type_restriction WHERE store = store_id;
