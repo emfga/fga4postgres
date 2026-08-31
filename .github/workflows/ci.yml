@@ -85,3 +85,102 @@ jobs:
       - name: Dump database logs
         if: failure()
         run: docker compose logs --no-color
+
+  # The release channels, proven on every run rather than only at
+  # publish time: the all-in bundle initdb-installs on the bare
+  # pinned image; the wrapped artifact installs through pg_tle via
+  # CREATE EXTENSION; and the grants template actually separates
+  # the two roles (a reader can check but not write).
+  artifacts:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920 # v2.20.0
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Build artifacts
+        run: ./scripts/build-release.sh
+
+      - name: Install the bundle on a bare database
+        run: |
+          version=$(sed -n "s/^VALUES ('\([0-9][0-9.]*\)');$/\1/p" \
+            sql/010_install.sql)
+          image=$(sed -n \
+            's/^ *image: \(postgres:[^ ]*\)$/\1/p' compose.yaml)
+          init=/docker-entrypoint-initdb.d/install.sql
+          docker run -d --rm --name relcheck \
+            -e POSTGRES_DB=fga -e POSTGRES_USER=fga \
+            -e POSTGRES_PASSWORD=pw \
+            -v "$PWD/dist/fga4postgres--$version.sql:$init:ro" \
+            "$image" >/dev/null
+          got=
+          for _ in $(seq 60); do
+            got=$(docker exec relcheck psql -U fga -d fga -tAc \
+              'SELECT fga.version()' 2>/dev/null) && break
+            sleep 2
+          done
+          if [ "$got" != "$version" ]; then
+            docker rm -f relcheck >/dev/null
+            echo "expected $version, got '$got'" >&2
+            exit 1
+          fi
+
+      - name: Verify the grants template separates the roles
+        run: |
+          docker exec relcheck psql -U fga -d fga \
+            -v ON_ERROR_STOP=1 -c \
+            'CREATE ROLE fga_reader NOLOGIN;
+             CREATE ROLE fga_writer NOLOGIN;'
+          docker exec -i relcheck psql -U fga -d fga \
+            -v ON_ERROR_STOP=1 <sql/900_grants.sql
+          docker exec relcheck psql -U fga -d fga \
+            -v ON_ERROR_STOP=1 -tAc \
+            "SET ROLE fga_reader; SELECT fga.version();"
+          if docker exec relcheck psql -U fga -d fga -tAc \
+            "SET ROLE fga_reader;
+             SELECT fga.create_store('nope');" 2>/dev/null
+          then
+            echo "fga_reader was able to write" >&2
+            exit 1
+          fi
+          docker exec relcheck psql -U fga -d fga \
+            -v ON_ERROR_STOP=1 -tAc \
+            "SET ROLE fga_writer;
+             SELECT (fga.create_store('ok')).id;"
+          docker rm -f relcheck >/dev/null
+
+      - name: Install through pg_tle
+        run: |
+          version=$(sed -n "s/^VALUES ('\([0-9][0-9.]*\)');$/\1/p" \
+            sql/010_install.sql)
+          base=$(sed -n \
+            's/^ *image: \(postgres:[^ ]*\)$/\1/p' compose.yaml)
+          docker build -f docker/pg_tle.Dockerfile \
+            --build-arg BASE_IMAGE="$base" -t pgtle .
+          ./scripts/pgtle-wrap.sh fga4postgres "$version" \
+            "dist/fga4postgres--$version.sql" >wrapped.sql
+          docker run -d --rm --name tle \
+            -e POSTGRES_DB=fga -e POSTGRES_USER=fga \
+            -e POSTGRES_PASSWORD=pw \
+            -v "$PWD/wrapped.sql:/wrapped.sql:ro" \
+            pgtle -c shared_preload_libraries=pg_tle >/dev/null
+          for _ in $(seq 60); do
+            docker exec tle pg_isready -U fga -d fga -q \
+              2>/dev/null && break
+            sleep 2
+          done
+          docker exec tle psql -U fga -d fga -v ON_ERROR_STOP=1 \
+            -c 'CREATE EXTENSION pg_tle;' \
+            -f /wrapped.sql \
+            -c 'CREATE EXTENSION fga4postgres;'
+          got=$(docker exec tle psql -U fga -d fga -tAc \
+            "SELECT extversion FROM pg_extension
+             WHERE extname = 'fga4postgres'")
+          docker rm -f tle >/dev/null
+          if [ "$got" != "$version" ]; then
+            echo "pg_extension says '$got', not $version" >&2
+            exit 1
+          fi

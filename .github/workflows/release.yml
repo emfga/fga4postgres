@@ -1,0 +1,172 @@
+name: Release
+
+# Manual only. Publishing is a deliberate act: someone chooses the
+# moment, from main, on the canonical repository -- never a fork,
+# and never as a side effect of a push.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Guarded twice over on every job: workflow_dispatch lets a caller
+# pick any ref, and forks carry this file too. Anything but main
+# on emfga/fga4postgres skips rather than publishes.
+#
+# The artifact build is deterministic and instant, so each job
+# rebuilds dist/ from the checkout instead of passing files
+# between jobs -- fewer moving parts, and nothing to pin.
+
+jobs:
+  # The plain-scripts channel: the all-in bundle initdb-installs
+  # on the bare pinned image and answers fga.version(); the
+  # engine-only file installs over the vendored cel4postgres
+  # bundle the same way compose layers them.
+  smoke:
+    if: >-
+      github.repository == 'emfga/fga4postgres' &&
+      github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920 # v2.20.0
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Build and install artifacts
+        run: |
+          ./scripts/build-release.sh
+          version=$(sed -n \
+            "s/^VALUES ('\([0-9][0-9.]*\)');$/\1/p" \
+            sql/010_install.sql)
+          image=$(sed -n 's/^ *image: \(postgres:[^ ]*\)$/\1/p' \
+            compose.yaml)
+          smoke() {
+            docker run -d --rm --name relcheck \
+              -e POSTGRES_DB=fga -e POSTGRES_USER=fga \
+              -e POSTGRES_PASSWORD=pw "$@" \
+              "$image" >/dev/null
+            got=
+            for _ in $(seq 60); do
+              got=$(docker exec relcheck psql -U fga -d fga \
+                -tAc 'SELECT fga.version()' 2>/dev/null) && break
+              sleep 2
+            done
+            docker rm -f relcheck >/dev/null
+            if [ "$got" != "$version" ]; then
+              echo "expected $version, got '$got'" >&2
+              exit 1
+            fi
+          }
+          init=/docker-entrypoint-initdb.d
+          echo "== fga4postgres--$version.sql"
+          smoke -v "$PWD/dist/fga4postgres--$version.sql:$init/install.sql:ro"
+          echo "== fga4postgres-engine--$version.sql over vendored cel"
+          smoke \
+            -v "$PWD/vendor:/vendor:ro" \
+            -v "$PWD/dist/fga4postgres-engine--$version.sql:/engine.sql:ro" \
+            -v "$PWD/scripts/release-engine-initdb.sh:$init/000.sh:ro"
+
+  # The flagship channel: the all-in bundle wrapped by
+  # scripts/pgtle-wrap.sh into pgtle.install_extension, installed
+  # with CREATE EXTENSION fga4postgres, and proven by an actual
+  # engine call refusing with the engine's own error surface.
+  pgtle:
+    if: >-
+      github.repository == 'emfga/fga4postgres' &&
+      github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920 # v2.20.0
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install through pg_tle and probe
+        run: |
+          ./scripts/build-release.sh
+          version=$(sed -n \
+            "s/^VALUES ('\([0-9][0-9.]*\)');$/\1/p" \
+            sql/010_install.sql)
+          base=$(sed -n 's/^ *image: \(postgres:[^ ]*\)$/\1/p' \
+            compose.yaml)
+          docker build -f docker/pg_tle.Dockerfile \
+            --build-arg BASE_IMAGE="$base" -t pgtle .
+          ./scripts/pgtle-wrap.sh fga4postgres "$version" \
+            "dist/fga4postgres--$version.sql" >wrapped.sql
+          docker run -d --rm --name tle \
+            -e POSTGRES_DB=fga -e POSTGRES_USER=fga \
+            -e POSTGRES_PASSWORD=pw \
+            -v "$PWD/wrapped.sql:/wrapped.sql:ro" \
+            pgtle -c shared_preload_libraries=pg_tle >/dev/null
+          for _ in $(seq 60); do
+            docker exec tle pg_isready -U fga -d fga -q \
+              2>/dev/null && break
+            sleep 2
+          done
+          docker exec tle psql -U fga -d fga -v ON_ERROR_STOP=1 \
+            -c 'CREATE EXTENSION pg_tle;' \
+            -f /wrapped.sql \
+            -c 'CREATE EXTENSION fga4postgres;'
+          got=$(docker exec tle psql -U fga -d fga -tAc \
+            "SELECT extversion FROM pg_extension
+             WHERE extname = 'fga4postgres'")
+          if [ "$got" != "$version" ]; then
+            echo "pg_extension says '$got', not $version" >&2
+            exit 1
+          fi
+          got=$(docker exec tle psql -U fga -d fga -tAc "
+            SELECT fga.check((fga.create_store('s')).id,
+              '{\"tuple_key\":{\"object\":
+                \"doc:11111111-1111-7111-8111-111111111111\",
+                \"relation\":\"viewer\",\"user\":
+                \"user:22222222-2222-7222-8222-222222222222\"}}'
+              ::jsonb)" 2>&1 || true)
+          docker rm -f tle >/dev/null
+          case $got in
+            *"no authorization models exist"*) ;;
+            *)
+              echo "engine probe answered: $got" >&2
+              exit 1
+              ;;
+          esac
+
+  # The tag does not exist beforehand; gh creates it at the
+  # released commit, and re-running on an already-released
+  # version fails here instead of republishing.
+  publish:
+    if: >-
+      github.repository == 'emfga/fga4postgres' &&
+      github.ref == 'refs/heads/main'
+    needs: [smoke, pgtle]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      # gh release create pushes the tag and uploads the assets.
+      contents: write
+    steps:
+      - uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920 # v2.20.0
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Build and publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ./scripts/build-release.sh
+          version=$(sed -n \
+            "s/^VALUES ('\([0-9][0-9.]*\)');$/\1/p" \
+            sql/010_install.sql)
+          notes="Install with: psql -v ON_ERROR_STOP=1"
+          notes="$notes -f fga4postgres--$version.sql."
+          notes="$notes Verify downloads against SHA256SUMS."
+          gh release create "v$version" dist/* \
+            --target "$GITHUB_SHA" \
+            --title "fga4postgres $version" \
+            --notes "$notes"

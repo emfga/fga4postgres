@@ -147,6 +147,17 @@ measurements M15/M30/M31; none corpus-visible):
 - **Inherited from cel4postgres**: `matches()` runs on POSIX ARE
   rather than RE2; strings cannot contain U+0000 (a Postgres
   substrate limit); plus its measured divergence list.
+- **Sibling-object condition errors (M42, not pinnable)**:
+  upstream's user-first iteration can surface a 2000 condition
+  error from a conditioned tuple on an object structurally
+  outside the query (measured on the market fixture), and does
+  so NONDETERMINISTICALLY — the same request on the same store
+  sometimes answers false instead. The engine always answers
+  plain false there. Because the oracle side is racy, this
+  class cannot be pinned two-sided; the real-world sweep
+  tolerates false-vs-2xxx disagreements in both directions and
+  logs each instance, and never tolerates a true-vs-anything
+  disagreement.
 
 ## Product properties beyond upstream
 
