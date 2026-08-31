@@ -11,6 +11,11 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/structpb"
+
+	"github.com/emfga/fga4postgres/internal/oracle"
+	"github.com/emfga/fga4postgres/internal/sqlclient"
+	"github.com/emfga/fga4postgres/internal/testdb"
+	"github.com/emfga/fga4postgres/internal/uuidmap"
 )
 
 // probeClient is the seven-method surface probes and the replayer
@@ -35,10 +40,21 @@ type probeClient interface {
 	) (*openfgav1.CheckResponse, error)
 }
 
+// bothSides returns the two engines for a differential probe: the
+// oracle raw, and the sqlclient with a probe-scoped uuid map so
+// corpus-style ids work.
+func bothSides(t *testing.T, suite string) []side {
+	return []side{
+		{name: "engine", client: sqlclient.New(
+			testdb.Pool(t), uuidmap.New("probe/"+suite))},
+		{name: "oracle", client: oracle.Client(t)},
+	}
+}
+
 // setup creates a fresh store, writes the DSL model, and writes
 // the tuples in upstream-sized chunks of 40.
 func setup(
-	t *testing.T, client probeClient, dsl string,
+	t testing.TB, client probeClient, dsl string,
 	tuples []*openfgav1.TupleKey,
 ) (storeID, modelID string) {
 	t.Helper()
@@ -105,7 +121,7 @@ func (r checkResult) String() string {
 }
 
 func doCheck(
-	t *testing.T, client probeClient, storeID, modelID string,
+	t testing.TB, client probeClient, storeID, modelID string,
 	object, relation, user string,
 	ctxTuples []*openfgav1.TupleKey, reqCtx *structpb.Struct,
 ) checkResult {

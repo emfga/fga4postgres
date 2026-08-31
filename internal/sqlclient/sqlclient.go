@@ -22,6 +22,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"strings"
 	"time"
 
@@ -30,6 +31,7 @@ import (
 	openfgav1 "github.com/openfga/api/proto/openfga/v1"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
@@ -308,10 +310,80 @@ func (c *Client) ListUsers(
 	return nil, unimplemented("ListUsers", "phase 5")
 }
 
+// StreamedListObjects adapts the unary ListObjects into the
+// client-stream shape the upstream runners consume. Like the real
+// server, errors surface on the first Recv, not on the call
+// itself. One deliberate divergence carried over from the unary
+// path (plan §1.5): a condition evaluation error always fails the
+// stream, where upstream may have streamed partial results first.
 func (c *Client) StreamedListObjects(
 	ctx context.Context,
 	in *openfgav1.StreamedListObjectsRequest,
 	_ ...grpc.CallOption,
 ) (openfgav1.OpenFGAService_StreamedListObjectsClient, error) {
-	return nil, unimplemented("StreamedListObjects", "phase 2")
+	resp, err := c.ListObjects(ctx, &openfgav1.ListObjectsRequest{
+		StoreId:              in.GetStoreId(),
+		AuthorizationModelId: in.GetAuthorizationModelId(),
+		Type:                 in.GetType(),
+		Relation:             in.GetRelation(),
+		User:                 in.GetUser(),
+		ContextualTuples:     in.GetContextualTuples(),
+		Context:              in.GetContext(),
+	})
+	s := &streamedListObjects{ctx: ctx}
+	if err != nil {
+		s.err = err
+	} else {
+		s.objects = resp.GetObjects()
+	}
+	return s, nil
+}
+
+type streamedListObjects struct {
+	ctx     context.Context
+	objects []string
+	err     error
+	i       int
+}
+
+func (s *streamedListObjects) Recv() (
+	*openfgav1.StreamedListObjectsResponse, error,
+) {
+	if s.err != nil {
+		return nil, s.err
+	}
+	if s.i >= len(s.objects) {
+		return nil, io.EOF
+	}
+	obj := s.objects[s.i]
+	s.i++
+	return &openfgav1.StreamedListObjectsResponse{
+		Object: obj,
+	}, nil
+}
+
+func (s *streamedListObjects) Header() (metadata.MD, error) {
+	return nil, nil
+}
+func (s *streamedListObjects) Trailer() metadata.MD { return nil }
+func (s *streamedListObjects) CloseSend() error     { return nil }
+func (s *streamedListObjects) Context() context.Context {
+	return s.ctx
+}
+func (s *streamedListObjects) SendMsg(any) error {
+	return status.Error(codes.Unimplemented,
+		"fga4postgres: client stream is receive-only")
+}
+func (s *streamedListObjects) RecvMsg(m any) error {
+	resp, err := s.Recv()
+	if err != nil {
+		return err
+	}
+	out, ok := m.(*openfgav1.StreamedListObjectsResponse)
+	if !ok {
+		return status.Error(codes.Internal,
+			"fga4postgres: unexpected message type")
+	}
+	proto.Merge(out, resp)
+	return nil
 }
