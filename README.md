@@ -10,6 +10,16 @@ SQL — without a superuser, a filesystem, or a restart. CEL condition
 support comes from [cel4postgres](https://github.com/emfga/cel4postgres),
 itself pure SQL, vendored into the install.
 
+**PostgreSQL 18 or newer.** Engine-generated store and model ids are
+native `uuidv7()`, used without a compatibility shim.
+
+**The id domain is `uuid`.** Object and subject ids are native
+uuids, accepted in canonical lower-case hyphenated spelling only,
+where upstream OpenFGA accepts nearly arbitrary strings. This is a
+deliberate, documented divergence in the safe (refusing) direction,
+in exchange for native uuid storage, indexes, and joins against
+your application's own tables.
+
 **Status: early development.** The engine is being built against a
 pinned conformance target,
 [openfga/openfga v1.19.0](https://github.com/openfga/openfga/tree/v1.19.0).
