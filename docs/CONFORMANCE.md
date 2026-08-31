@@ -10,16 +10,16 @@ suite red and demands this file change in the same commit.
 
 ## Status
 
-The engine is mid-implementation (plan phase: conditions
+The engine is mid-implementation (plan phase: list_users
 complete). Current verified surface:
 
 - Conditions/ABAC: the whole `abac_tests.yaml` corpus passes
-  differentially for check and list_objects, and upstream's own
-  imported test runners (`tests/check`, `tests/listobjects` at the
-  pin — the YAML replays plus the generated matrix corpora, ~3000
-  assertions) run green against the engine through the SQL
-  adapter, with only the list_users sub-asserts skipped until that
-  API lands. Conditions evaluate through cel4postgres under the
+  differentially for check, list_objects and list_users, and
+  upstream's own imported test runners (`tests/check`,
+  `tests/listobjects`, `tests/listusers` at the pin — the YAML
+  replays plus the generated matrix corpora, list_users
+  sub-asserts included) run green against the engine through the
+  SQL adapter. Conditions evaluate through cel4postgres under the
   `openfga` env (the `ipaddress` type and `in_cidr` registered via
   its registries); typed parameters convert per upstream's
   grammar; the tuple's condition context wins over the request
@@ -41,9 +41,22 @@ complete). Current verified surface:
   no deadline machinery, and it is verified that no corpus case
   depends on upstream's partial-results-on-deadline behaviour
   (different-shape property, measurements M21/M22).
-- `list_users`, `expand`, and `read` are not implemented yet;
-  every affected corpus case is a generated, printed skip (no
-  silent scope reduction).
+- `list_users`: every corpus case passes differentially in both
+  replay variants. The measured envelope the engine mirrors:
+  exactly one user filter; userset filters are reflexive (every
+  expansion node matching the filter emits itself); a wildcard
+  survives concrete subtraction as an invisible exception
+  (`user:*` minus `user:bob` answers `user:*`, and an
+  intersection sibling cannot resurrect the excluded user); a
+  wildcard subtrahend empties the result; depth refuses one
+  tuple-hop earlier than check (2002 at a 25-link ladder where
+  check refuses at 26); a condition error on a relevant path
+  fails the request immediately with 2000, while paths that
+  cannot reach the filter type are pruned before their tuples
+  (or conditions) are touched.
+- `expand` and `read` are not implemented yet; every affected
+  corpus case is a generated, printed skip (no silent scope
+  reduction).
 
 ## Exclusions (out of v1 scope)
 

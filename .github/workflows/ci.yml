@@ -72,27 +72,15 @@ jobs:
 
       # -json feeds the run-derived skip list and the conformance
       # report; confreport exits non-zero when any test failed, so
-      # nothing is lost to the pipe.
+      # nothing is lost to the pipe. The imported upstream runners
+      # (check, list_objects, list_users) run inside this same
+      # invocation, list_users sub-asserts included.
       - name: Test
         run: |
-          go test -count=1 -json ./... | tee /tmp/gotest.json |
+          go test -count=1 -timeout 20m -json ./... |
+            tee /tmp/gotest.json |
             go run ./internal/cmd/confreport
           go run ./internal/cmd/skipgen < /tmp/gotest.json
-
-      # The imported upstream runners need a -skip for the
-      # list_users sub-asserts until plan phase 5 (no skip hook
-      # exists inside upstream's runner code); skipgen harvests
-      # the run-derived skip list from this run too.
-      - name: Imported upstream runners
-        env:
-          FGA_RUN_IMPORTED: "1"
-        run: |
-          go test -count=1 -timeout 20m -json \
-            -run 'TestImported' \
-            -skip '.*/.*/.*/.*/assertion_list_users_.*' \
-            ./conformance/ | tee /tmp/imported.json |
-            go run ./internal/cmd/confreport
-          go run ./internal/cmd/skipgen < /tmp/imported.json
 
       - name: Dump database logs
         if: failure()

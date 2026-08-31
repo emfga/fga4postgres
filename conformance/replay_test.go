@@ -7,6 +7,7 @@ import (
 	"math/rand"
 	"slices"
 	"sort"
+	"strings"
 	"testing"
 
 	openfgav1 "github.com/openfga/api/proto/openfga/v1"
@@ -321,6 +322,162 @@ func runListObjectsAssertion(
 					"allowed=%v err=%v",
 					s.name, obj, cr.GetAllowed(), err)
 			}
+		}
+	}
+}
+
+// runListUsersReplay mirrors the upstream listusers runner:
+// set-compare the formatted users against the expectation.
+func runListUsersReplay(
+	t *testing.T, file string, tc corpus.Test, ctxVariant bool,
+) {
+	ctx := context.Background()
+	rng := caseRand(t.Name())
+
+	if ctxVariant {
+		if len(tc.Stages) > 1 {
+			skiplist.Skip(t, "ctxTuples variant skips multi-stage "+
+				"tests (upstream contract)")
+		}
+		for _, s := range tc.Stages {
+			if len(s.Tuples) > 100 {
+				skiplist.Skip(t, "ctxTuples variant skips stages "+
+					"over 100 tuples (API cap)")
+			}
+		}
+	}
+
+	sides := []*side{
+		{name: "engine", client: engineForCase(t, file)},
+		{name: "oracle", client: oracle.Client(t)},
+	}
+	for _, s := range sides {
+		resp, err := s.client.CreateStore(ctx,
+			&openfgav1.CreateStoreRequest{Name: tc.Name})
+		if err != nil {
+			t.Fatalf("%s: create store: %v", s.name, err)
+		}
+		s.storeID = resp.GetId()
+	}
+	t.Cleanup(func() {
+		_ = sides[0].client.(*sqlclient.Client).
+			DeleteStore(ctx, sides[0].storeID)
+		_, _ = oracle.Client(t).DeleteStore(ctx,
+			&openfgav1.DeleteStoreRequest{StoreId: sides[1].storeID})
+	})
+
+	for stageNum, stage := range tc.Stages {
+		st := stage
+		t.Run(fmt.Sprintf("stage_%d", stageNum), func(t *testing.T) {
+			writeStageBoth(t, rng, sides, st, ctxVariant)
+			for i, a := range st.ListUsersAssertions {
+				assertion := a
+				t.Run(fmt.Sprintf("assertion_%d", i),
+					func(t *testing.T) {
+						runListUsersAssertion(
+							t, rng, sides, st, assertion, ctxVariant)
+					})
+			}
+		})
+	}
+}
+
+func luFilterProto(f string) *openfgav1.UserTypeFilter {
+	typ, rel, ok := strings.Cut(f, "#")
+	uf := &openfgav1.UserTypeFilter{Type: typ}
+	if ok {
+		uf.Relation = rel
+	}
+	return uf
+}
+
+func luUserString(u *openfgav1.User) string {
+	switch x := u.GetUser().(type) {
+	case *openfgav1.User_Object:
+		return x.Object.GetType() + ":" + x.Object.GetId()
+	case *openfgav1.User_Userset:
+		return x.Userset.GetType() + ":" + x.Userset.GetId() +
+			"#" + x.Userset.GetRelation()
+	case *openfgav1.User_Wildcard:
+		return x.Wildcard.GetType() + ":*"
+	}
+	return "?"
+}
+
+func runListUsersAssertion(
+	t *testing.T, rng *rand.Rand, sides []*side,
+	stage *corpus.Stage, a *corpus.ListUsersAssertion,
+	ctxVariant bool,
+) {
+	ctx := context.Background()
+
+	ctxTuples := a.ContextualTuples
+	if ctxVariant {
+		ctxTuples = append(append([]*openfgav1.TupleKey{},
+			ctxTuples...), stage.Tuples...)
+	}
+	ctxTuples = shuffledTuples(rng, ctxTuples)
+
+	objType, objID, _ := strings.Cut(a.Request.Object, ":")
+	var filters []*openfgav1.UserTypeFilter
+	for _, f := range a.Request.Filters {
+		filters = append(filters, luFilterProto(f))
+	}
+
+	for _, s := range sides {
+		req := &openfgav1.ListUsersRequest{
+			StoreId:              s.storeID,
+			AuthorizationModelId: s.modelID,
+			Object: &openfgav1.Object{
+				Type: objType, Id: objID,
+			},
+			Relation:    a.Request.Relation,
+			UserFilters: filters,
+			Context:     a.Context,
+		}
+		if len(ctxTuples) > 0 {
+			keys := make([]*openfgav1.TupleKey, len(ctxTuples))
+			for i, ct := range ctxTuples {
+				keys[i] = proto.Clone(ct).(*openfgav1.TupleKey)
+			}
+			req.ContextualTuples = keys
+		}
+
+		resp, err := s.client.(interface {
+			ListUsers(context.Context,
+				*openfgav1.ListUsersRequest,
+				...grpc.CallOption,
+			) (*openfgav1.ListUsersResponse, error)
+		}).ListUsers(ctx, req)
+
+		if a.ErrorCode != 0 {
+			if err == nil {
+				t.Errorf("%s: want error code %d, got %v",
+					s.name, a.ErrorCode, resp.GetUsers())
+				continue
+			}
+			st2, _ := status.FromError(err)
+			if int(st2.Code()) != a.ErrorCode {
+				t.Errorf("%s: error code %d, want %d (%v)",
+					s.name, int(st2.Code()), a.ErrorCode, err)
+			}
+			continue
+		}
+		if err != nil {
+			t.Errorf("%s: unexpected error (seed %d): %v",
+				s.name, suiteSeed, err)
+			continue
+		}
+		var got []string
+		for _, u := range resp.GetUsers() {
+			got = append(got, luUserString(u))
+		}
+		want := append([]string{}, a.Expectation...)
+		sort.Strings(got)
+		sort.Strings(want)
+		if !slices.Equal(got, want) {
+			t.Errorf("%s: users %v, want %v (seed %d)",
+				s.name, got, want, suiteSeed)
 		}
 	}
 }

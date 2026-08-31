@@ -349,7 +349,42 @@ func (c *Client) ListUsers(
 	in *openfgav1.ListUsersRequest,
 	_ ...grpc.CallOption,
 ) (*openfgav1.ListUsersResponse, error) {
-	return nil, unimplemented("ListUsers", "phase 5")
+	if err := validate(in); err != nil {
+		return nil, err
+	}
+	mapped := proto.Clone(in).(*openfgav1.ListUsersRequest)
+	if c.ids != nil && mapped.GetObject() != nil {
+		mapped.Object.Id = c.ids.ID(mapped.GetObject().GetId())
+	}
+	for i, tk := range mapped.GetContextualTuples() {
+		mapped.ContextualTuples[i] = c.mapTuple(tk)
+	}
+	req, err := marshal.Marshal(mapped)
+	if err != nil {
+		return nil, err
+	}
+	var out []byte
+	err = c.pool.QueryRow(ctx,
+		"SELECT fga.list_users($1, $2)", in.GetStoreId(), req,
+	).Scan(&out)
+	if err != nil {
+		return nil, translate(err)
+	}
+	resp := &openfgav1.ListUsersResponse{}
+	if err := protojson.Unmarshal(out, resp); err != nil {
+		return nil, err
+	}
+	if c.ids != nil {
+		for _, u := range resp.GetUsers() {
+			switch x := u.GetUser().(type) {
+			case *openfgav1.User_Object:
+				x.Object.Id = c.ids.Back(x.Object.GetId())
+			case *openfgav1.User_Userset:
+				x.Userset.Id = c.ids.Back(x.Userset.GetId())
+			}
+		}
+	}
+	return resp, nil
 }
 
 // StreamedListObjects adapts the unary ListObjects into the
