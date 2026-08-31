@@ -88,6 +88,7 @@ services:
       GOCACHE: /tmp/go-build
       GOFLAGS: -mod=mod
       GOMODCACHE: /tmp/go-mod
+      OPENFGA_GRPC_ADDR: openfga:8081
       OPENFGA_URL: http://openfga:8080
     image: golang:1.26-alpine
     profiles:

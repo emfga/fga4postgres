@@ -1,0 +1,9 @@
+// Committed deliberately, and not for multi-module reasons: in
+// workspace mode the go command does not treat the repo's vendor/
+// directory as Go vendoring. vendor/ here holds the pinned
+// cel4postgres SQL bundle (CLAUDE.md decision 4), not Go modules,
+// and without this file every go command fails with "inconsistent
+// vendoring".
+go 1.25.7
+
+use .
