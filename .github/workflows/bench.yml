@@ -1,0 +1,111 @@
+# Benchmarks, separate from ci.yml so their noise never gates a
+# merge. Pull requests run the 100k size with short per-case
+# budgets (~9 minutes computed: 39 cases at ~8s each plus setup);
+# workflow_dispatch runs a chosen size at the full budgets. CI
+# numbers come from shared runners on tmpfs storage — they spot
+# order-of-magnitude movement; quiet-machine comparison happens
+# locally (docs/BENCHMARKS.md).
+name: Bench
+
+on:
+  pull_request:
+    branches: [main]
+    # Everything that changes measured behaviour; docs PRs pay
+    # nothing.
+    paths:
+      - sql/**
+      - internal/bench/**
+      - internal/cmd/bench/**
+      - internal/cmd/benchreport/**
+      - vendor/**
+      - compose*.yaml
+      - docker/**
+      - go.mod
+      - go.sum
+      - .github/workflows/bench.yml
+  workflow_dispatch:
+    inputs:
+      size:
+        description: Dataset size
+        type: choice
+        required: true
+        default: 100k
+        # Forced duplication of internal/bench/sizes.go — GitHub
+        # cannot generate choices dynamically. That file is the
+        # source of truth and the binary validates, so a drifted
+        # entry fails loudly. Larger sizes are local-only
+        # (GH-hosted runners cannot hold them).
+        options:
+          - 100k
+          - 1m
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bench-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ github.event_name == 'workflow_dispatch' && 60 || 15 }}
+
+    # Mirrors the compose defaults, like ci.yml: the harness
+    # builds its DSN from these.
+    env:
+      POSTGRES_DB: fga
+      POSTGRES_HOST: localhost
+      POSTGRES_PASSWORD: password
+      POSTGRES_PORT: 5432
+      POSTGRES_USER: fga
+
+    steps:
+      - uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920 # v2.20.0
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # The default stack's postgres only (tmpfs is fine at CI
+      # sizes; benchmarks never call the oracle). --wait means
+      # installed, not merely listening.
+      - run: docker compose up -d --wait postgres
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+
+      - name: Bench
+        run: |
+          SIZE="${{ inputs.size || '100k' }}"
+          if [ "${{ github.event_name }}" = pull_request ]; then
+            KNOBS="-warmup 3s -duration 5s"
+          else
+            KNOBS="-warmup 5s -duration 30s"
+          fi
+          go run ./internal/cmd/bench -size "$SIZE" $KNOBS \
+            -results bench-results
+
+      # The baseline guard (decision 9): deltas appear only once
+      # a curated baseline is committed; until then the summary
+      # shows absolute numbers, deliberately.
+      - name: Report
+        run: |
+          SIZE="${{ inputs.size || '100k' }}"
+          BASE=""
+          if [ -f "docs/benchmarks/baseline-$SIZE.json" ]; then
+            BASE="-baseline docs/benchmarks/baseline-$SIZE.json"
+          fi
+          go run ./internal/cmd/benchreport $BASE \
+            bench-results/*.json >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: bench-results-${{ inputs.size || '100k' }}
+          path: bench-results/
+          retention-days: 30
+
+      - name: Dump database logs
+        if: failure()
+        run: docker compose logs --no-color
