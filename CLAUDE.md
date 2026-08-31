@@ -11,7 +11,7 @@ database that already holds the application's data.
 
 "Zero-dependency" is the product claim and the design constraint: a
 consumer installs fga4postgres by running SQL scripts against a database
-they can already connect to, on any PostgreSQL — self-hosted, RDS,
+they can already connect to, on any PostgreSQL 18+ — self-hosted, RDS,
 Aurora, Cloud SQL — without a superuser, a filesystem, or a restart.
 CEL condition support comes from cel4postgres, itself pure SQL, vendored
 into the install.
@@ -125,6 +125,19 @@ a future contributor will otherwise reopen.
    Never label a table-reading function `IMMUTABLE` to win an index;
    cel4postgres logs exactly that as a review item, not a pattern.
    Every function carries `SET search_path = fga, pg_temp`.
+10. **The id domain is native `uuid`; PostgreSQL 18 is the version
+    floor.** Object and subject ids are `uuid` columns, accepted in
+    canonical lower-case hyphenated spelling only — Postgres's uuid
+    grammar folds spellings upstream treats as distinct ids, so
+    accepting any parseable spelling would turn a refusing
+    divergence into a granting one. The nil uuid is reserved as the
+    wildcard sentinel and refused as an id. Engine-generated store
+    and model ids are `uuidv7()` (hence the PG18 floor, taken
+    deliberately over a compatibility shim); upstream-shaped ULID
+    ids are refused as not-found. Every deviation this causes from
+    upstream is a pinned, refusing-direction divergence in
+    docs/CONFORMANCE.md; the conformance harness maps corpus string
+    ids to deterministic uuids. Owner-directed.
 
 ## Architecture
 
