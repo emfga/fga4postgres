@@ -20,36 +20,49 @@ deliberate, documented divergence in the safe (refusing) direction,
 in exchange for native uuid storage, indexes, and joins against
 your application's own tables.
 
-**Status: early development.** The engine is being built against a
-pinned conformance target,
-[openfga/openfga v1.19.0](https://github.com/openfga/openfga/tree/v1.19.0).
-Nothing here is ready for use yet.
+**Status: v1 surface complete, pre-release.** The engine is built
+and verified against a pinned conformance target,
+[openfga/openfga v1.19.0](https://github.com/openfga/openfga/tree/v1.19.0):
+the upstream YAML corpus and upstream's own imported test runners
+run green differentially against the live pinned server, and every
+knowing divergence is measured, pinned from both sides, and
+documented in [docs/CONFORMANCE.md](docs/CONFORMANCE.md).
 
-## Planned v1 surface
+## v1 surface
 
-- `check` (including batch), `expand`, `list_objects`, `list_users`
+- `check` (including `batch_check`), `expand`, `list_objects`,
+  `list_users`
 - `write_authorization_model` — whole-model, upstream JSON shape,
   immutable and versioned
-- Tuple `write`/`delete` with upstream error semantics, and `read`
-  with keyset pagination
+- Tuple `write`/`delete` with upstream error semantics
+  (including `on_duplicate`/`on_missing`), and `read` with keyset
+  pagination
 - A minimal store namespace (`create_store`/`delete_store`)
 
-Distribution will be plain SQL scripts and
-[pg_tle](https://github.com/aws/pg_tle), both first-class.
+Distribution is plain SQL scripts and
+[pg_tle](https://github.com/aws/pg_tle), both first-class — see
+[docs/INSTALL.md](docs/INSTALL.md).
 
 ## Installation
 
-Into any database you can connect to:
+From a release, one file installs everything:
 
 ```bash
-psql -v ON_ERROR_STOP=1 -f vendor/cel4postgres--0.0.1.sql "$DB_URL"
+psql -v ON_ERROR_STOP=1 -f fga4postgres--<version>.sql "$DB_URL"
+```
+
+From a checkout:
+
+```bash
+psql -v ON_ERROR_STOP=1 -f vendor/cel4postgres--*.sql "$DB_URL"
 for f in sql/*.sql; do
   psql -v ON_ERROR_STOP=1 -f "$f" "$DB_URL"
 done
 ```
 
 The scripts are idempotent; re-running the installer is the upgrade
-path.
+path. [docs/INSTALL.md](docs/INSTALL.md) covers the pg_tle channel
+and the consumer privilege template.
 
 ## Development environment
 
