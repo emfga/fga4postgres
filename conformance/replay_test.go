@@ -1,0 +1,237 @@
+package conformance
+
+import (
+	"context"
+	"fmt"
+	"hash/fnv"
+	"math/rand"
+	"testing"
+
+	openfgav1 "github.com/openfga/api/proto/openfga/v1"
+	parser "github.com/openfga/language/pkg/go/transformer"
+	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
+
+	"github.com/emfga/fga4postgres/internal/corpus"
+	"github.com/emfga/fga4postgres/internal/oracle"
+	"github.com/emfga/fga4postgres/internal/skiplist"
+	"github.com/emfga/fga4postgres/internal/sqlclient"
+	"github.com/emfga/fga4postgres/internal/testdb"
+	"github.com/emfga/fga4postgres/internal/uuidmap"
+)
+
+// The YAML replayer, mirroring upstream's runner contract
+// (workspace doc 06 §1): every test runs twice — once normal,
+// once with the stage tuples handed as contextual tuples; fresh
+// store per test on both engines; tuples seeded-shuffled and
+// written in chunks of 40; assertions checked against the corpus
+// expectation on BOTH engines, which is also the differential
+// assert (both sides must land on the same answer to both pass).
+
+const writeChunk = 40
+
+// caseRand derives a per-case shuffle source from the suite seed
+// (printed by TestMain) and the case name, so one failing case
+// reproduces without replaying the whole file.
+func caseRand(name string) *rand.Rand {
+	h := fnv.New64a()
+	fmt.Fprintf(h, "%d/%s", suiteSeed, name)
+	return rand.New(rand.NewSource(int64(h.Sum64())))
+}
+
+func shuffledTuples(
+	rng *rand.Rand, in []*openfgav1.TupleKey,
+) []*openfgav1.TupleKey {
+	out := make([]*openfgav1.TupleKey, len(in))
+	copy(out, in)
+	rng.Shuffle(len(out), func(i, j int) {
+		out[i], out[j] = out[j], out[i]
+	})
+	return out
+}
+
+// engineForCase builds the sqlclient with a per-file uuid map —
+// deterministic across runs, disjoint across files (plan §2.3).
+func engineForCase(t *testing.T, file string) *sqlclient.Client {
+	return sqlclient.New(
+		testdb.Pool(t), uuidmap.New("yaml/"+file),
+	)
+}
+
+type side struct {
+	name    string
+	client  probeClient
+	storeID string
+	modelID string
+}
+
+func runCheckReplay(
+	t *testing.T, file string, tc corpus.Test, ctxVariant bool,
+) {
+	ctx := context.Background()
+	rng := caseRand(t.Name())
+
+	if ctxVariant {
+		if len(tc.Stages) > 1 {
+			skiplist.Skip(t, "ctxTuples variant skips multi-stage "+
+				"tests (upstream contract)")
+		}
+		for _, s := range tc.Stages {
+			if len(s.Tuples) > 100 {
+				skiplist.Skip(t, "ctxTuples variant skips stages "+
+					"over 100 tuples (API cap)")
+			}
+		}
+	}
+
+	sides := []*side{
+		{name: "engine", client: engineForCase(t, file)},
+		{name: "oracle", client: oracle.Client(t)},
+	}
+	for _, s := range sides {
+		resp, err := s.client.CreateStore(ctx,
+			&openfgav1.CreateStoreRequest{Name: tc.Name})
+		if err != nil {
+			t.Fatalf("%s: create store: %v", s.name, err)
+		}
+		s.storeID = resp.GetId()
+	}
+	t.Cleanup(func() {
+		_ = sides[0].client.(*sqlclient.Client).
+			DeleteStore(ctx, sides[0].storeID)
+		_, _ = oracle.Client(t).DeleteStore(ctx,
+			&openfgav1.DeleteStoreRequest{StoreId: sides[1].storeID})
+	})
+
+	for stageNum, stage := range tc.Stages {
+		st := stage
+		t.Run(fmt.Sprintf("stage_%d", stageNum), func(t *testing.T) {
+			model, err := parser.TransformDSLToProto(st.Model)
+			if err != nil {
+				t.Fatalf("model DSL: %v", err)
+			}
+			for _, s := range sides {
+				resp, err := s.client.WriteAuthorizationModel(ctx,
+					&openfgav1.WriteAuthorizationModelRequest{
+						StoreId:         s.storeID,
+						SchemaVersion:   model.GetSchemaVersion(),
+						TypeDefinitions: model.GetTypeDefinitions(),
+						Conditions:      model.GetConditions(),
+					})
+				if err != nil {
+					if s.name == "oracle" {
+						// Upstream gates stages on modelgraph and
+						// skips; the oracle refusing the model is
+						// the same signal.
+						skiplist.Skip(t,
+							"oracle refused the stage model: "+
+								err.Error())
+					}
+					t.Fatalf("%s: write model: %v", s.name, err)
+				}
+				s.modelID = resp.GetAuthorizationModelId()
+			}
+
+			if !ctxVariant && len(st.Tuples) > 0 {
+				tuples := shuffledTuples(rng, st.Tuples)
+				for start := 0; start < len(tuples); start += writeChunk {
+					end := min(start+writeChunk, len(tuples))
+					for _, s := range sides {
+						_, err := s.client.Write(ctx,
+							&openfgav1.WriteRequest{
+								StoreId:              s.storeID,
+								AuthorizationModelId: s.modelID,
+								Writes: &openfgav1.WriteRequestWrites{
+									TupleKeys: tuples[start:end],
+								},
+							})
+						if err != nil {
+							t.Fatalf(
+								"%s: write tuples [%d:%d] "+
+									"(seed %d): %v",
+								s.name, start, end, suiteSeed, err)
+						}
+					}
+				}
+			}
+
+			for i, a := range st.CheckAssertions {
+				name := a.Name
+				if name == "" {
+					name = fmt.Sprintf("assertion_%d", i)
+				}
+				assertion := a
+				t.Run(name, func(t *testing.T) {
+					runCheckAssertion(
+						t, rng, sides, st, assertion, ctxVariant)
+				})
+			}
+		})
+	}
+}
+
+func runCheckAssertion(
+	t *testing.T, rng *rand.Rand, sides []*side,
+	stage *corpus.Stage, a *corpus.CheckAssertion,
+	ctxVariant bool,
+) {
+	ctx := context.Background()
+
+	ctxTuples := a.ContextualTuples
+	if ctxVariant {
+		ctxTuples = append(append([]*openfgav1.TupleKey{},
+			ctxTuples...), stage.Tuples...)
+	}
+	ctxTuples = shuffledTuples(rng, ctxTuples)
+
+	for _, s := range sides {
+		var tk *openfgav1.CheckRequestTupleKey
+		if a.Tuple != nil {
+			tk = &openfgav1.CheckRequestTupleKey{
+				Object:   a.Tuple.GetObject(),
+				Relation: a.Tuple.GetRelation(),
+				User:     a.Tuple.GetUser(),
+			}
+		}
+		req := &openfgav1.CheckRequest{
+			StoreId:              s.storeID,
+			AuthorizationModelId: s.modelID,
+			TupleKey:             tk,
+			Context:              a.Context,
+		}
+		if len(ctxTuples) > 0 {
+			keys := make([]*openfgav1.TupleKey, len(ctxTuples))
+			for i, ct := range ctxTuples {
+				keys[i] = proto.Clone(ct).(*openfgav1.TupleKey)
+			}
+			req.ContextualTuples = &openfgav1.ContextualTupleKeys{
+				TupleKeys: keys,
+			}
+		}
+
+		resp, err := s.client.Check(ctx, req)
+		if a.ErrorCode == 0 {
+			if err != nil {
+				t.Errorf("%s: unexpected error (seed %d): %v",
+					s.name, suiteSeed, err)
+				continue
+			}
+			if resp.GetAllowed() != a.Expectation {
+				t.Errorf("%s: allowed=%v, want %v (seed %d)",
+					s.name, resp.GetAllowed(), a.Expectation,
+					suiteSeed)
+			}
+			continue
+		}
+		if err == nil {
+			t.Errorf("%s: want error code %d, got allowed=%v",
+				s.name, a.ErrorCode, resp.GetAllowed())
+			continue
+		}
+		st, _ := status.FromError(err)
+		if int(st.Code()) != a.ErrorCode {
+			t.Errorf("%s: error code %d, want %d (%v)",
+				s.name, int(st.Code()), a.ErrorCode, err)
+		}
+	}
+}

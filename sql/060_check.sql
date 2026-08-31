@@ -115,7 +115,8 @@ DECLARE
   caught_msg text;
 BEGIN
   -- Exact probe. A userset subject is compared, never expanded.
-  IF fga._read_exact(store_id, ot, oid, rel, st, sid, srel, ctx)
+  IF fga._read_exact(store_id, model_id, ot, oid, rel,
+       st, sid, srel, ctx)
   THEN
     RETURN (true, false);
   END IF;
@@ -124,7 +125,7 @@ BEGIN
   -- subject is never wildcard-matched, and a wildcard subject
   -- only matches literal wildcard tuples (the exact probe above).
   IF srel = '' AND NOT s_wild AND fga._read_exact(
-       store_id, ot, oid, rel, st,
+       store_id, model_id, ot, oid, rel, st,
        '00000000-0000-0000-0000-000000000000', '', ctx)
   THEN
     RETURN (true, false);
@@ -133,7 +134,7 @@ BEGIN
   -- Userset expansion: a union over dispatches, with the deferred
   -- error re-raise of M01 and the dispatch-only depth charge.
   FOR u IN
-    SELECT * FROM fga._read_usersets(store_id, ot, oid, rel, ctx)
+    SELECT * FROM fga._read_usersets(store_id, model_id, ot, oid, rel, ctx)
   LOOP
     BEGIN
       IF depth >= 25 THEN

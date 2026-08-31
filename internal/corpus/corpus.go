@@ -114,7 +114,22 @@ type Features struct {
 	ListObjects int
 	ListUsers   int
 	CtxTuples   int // total contextual tuples across assertions
+
+	// Rewrite operators the models use, for the phase-1 interior
+	// 1a/1b gate. Text-scanned from define lines; a false negative
+	// shows up as a loud unimplemented-operator failure, never as
+	// a wrong answer.
+	TTU          bool
+	Intersection bool
+	Exclusion    bool
 }
+
+var (
+	defineLine = regexp.MustCompile(`(?m)^\s*define\s.*$`)
+	ttuScan    = regexp.MustCompile(`\sfrom\s`)
+	interScan  = regexp.MustCompile(`\sand\s`)
+	butNotScan = regexp.MustCompile(`\sbut not\s`)
+)
 
 func Classify(tc Test) Features {
 	var f Features
@@ -122,6 +137,17 @@ func Classify(tc Test) Features {
 	for _, s := range tc.Stages {
 		if conditionDecl.MatchString(s.Model) {
 			f.Conditions = true
+		}
+		for _, line := range defineLine.FindAllString(s.Model, -1) {
+			if ttuScan.MatchString(line) {
+				f.TTU = true
+			}
+			if interScan.MatchString(line) {
+				f.Intersection = true
+			}
+			if butNotScan.MatchString(line) {
+				f.Exclusion = true
+			}
 		}
 		for _, tup := range s.Tuples {
 			if tup.GetCondition() != nil {

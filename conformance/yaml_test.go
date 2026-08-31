@@ -49,7 +49,7 @@ func TestCorpusInventory(t *testing.T) {
 //	go test ./conformance/... -run 'TestCheckCorpus/<file>/<case>'
 func corpusCases(
 	t *testing.T, kind string,
-	run func(t *testing.T, tc corpus.Test),
+	run func(t *testing.T, file string, tc corpus.Test),
 ) {
 	for _, f := range loadCorpus(t) {
 		t.Run(f.Name, func(t *testing.T) {
@@ -68,7 +68,7 @@ func corpusCases(
 					if r := skipReason(kind, feat); r != "" {
 						skiplist.Skip(t, r)
 					}
-					run(t, tc)
+					run(t, f.Name, tc)
 				})
 			}
 		})
@@ -77,21 +77,27 @@ func corpusCases(
 
 func TestCheckCorpus(t *testing.T) {
 	corpusCases(t, "check",
-		func(t *testing.T, tc corpus.Test) {
-			t.Fatal("replay not implemented (plan phase 1)")
+		func(t *testing.T, file string, tc corpus.Test) {
+			t.Parallel()
+			t.Run("normal", func(t *testing.T) {
+				runCheckReplay(t, file, tc, false)
+			})
+			t.Run("ctxTuples", func(t *testing.T) {
+				runCheckReplay(t, file, tc, true)
+			})
 		})
 }
 
 func TestListObjectsCorpus(t *testing.T) {
 	corpusCases(t, "list_objects",
-		func(t *testing.T, tc corpus.Test) {
+		func(t *testing.T, file string, tc corpus.Test) {
 			t.Fatal("replay not implemented (plan phase 3)")
 		})
 }
 
 func TestListUsersCorpus(t *testing.T) {
 	corpusCases(t, "list_users",
-		func(t *testing.T, tc corpus.Test) {
+		func(t *testing.T, file string, tc corpus.Test) {
 			t.Fatal("replay not implemented (plan phase 5)")
 		})
 }

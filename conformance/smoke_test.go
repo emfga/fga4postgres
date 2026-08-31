@@ -29,7 +29,7 @@ func TestEngineVersion(t *testing.T) {
 // one live method of plan phase 0.
 func TestEngineStoreRoundTrip(t *testing.T) {
 	ctx := context.Background()
-	client := sqlclient.New(testdb.Pool(t))
+	client := sqlclient.New(testdb.Pool(t), nil)
 
 	resp, err := client.CreateStore(
 		ctx, &openfgav1.CreateStoreRequest{Name: t.Name()},

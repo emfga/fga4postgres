@@ -360,9 +360,16 @@ $$;
 -- phase 4, replace-vs-concatenate semantics collapse to plain
 -- existence/union; the composite-array shape is what phase 4
 -- extends.
+--
+-- Stored rows are filtered against the request's model
+-- (upstream's FilterInvalidTuples): a tuple written under an
+-- older model whose subject facet the current model no longer
+-- allows is invisible, not an error. Contextual tuples skip the
+-- filter — they were already write-grade validated against this
+-- very model at request time.
 
 CREATE OR REPLACE FUNCTION fga._read_exact(
-  store_id uuid,
+  store_id uuid, model_id uuid,
   ot text, oid uuid, rel text,
   st text, sid uuid, srel text,
   ctx fga._tuple_key[]
@@ -377,17 +384,30 @@ AS $$
     WHERE c.object_type = ot AND c.object_id = oid
       AND c.relation = rel AND c.subject_type = st
       AND c.subject_id = sid AND c.subject_relation = srel
-  ) OR EXISTS (
-    SELECT FROM fga.tuple t
-    WHERE t.store = store_id
-      AND t.object_type = ot AND t.object_id = oid
-      AND t.relation = rel AND t.subject_type = st
-      AND t.subject_id = sid AND t.subject_relation = srel
+  ) OR (
+    EXISTS (
+      SELECT FROM fga.tuple t
+      WHERE t.store = store_id
+        AND t.object_type = ot AND t.object_id = oid
+        AND t.relation = rel AND t.subject_type = st
+        AND t.subject_id = sid AND t.subject_relation = srel
+    )
+    AND EXISTS (
+      SELECT FROM fga.model_type_restriction tr
+      WHERE tr.store = store_id
+        AND tr.model_id = _read_exact.model_id
+        AND tr.type_name = ot AND tr.relation_name = rel
+        AND tr.subject_type = st
+        AND tr.subject_relation = srel
+        AND tr.is_wildcard
+              = (sid = '00000000-0000-0000-0000-000000000000'
+                 AND srel = '')
+    )
   );
 $$;
 
 CREATE OR REPLACE FUNCTION fga._read_usersets(
-  store_id uuid,
+  store_id uuid, model_id uuid,
   ot text, oid uuid, rel text,
   ctx fga._tuple_key[]
 )
@@ -406,7 +426,16 @@ AS $$
   FROM fga.tuple t
   WHERE t.store = store_id
     AND t.object_type = ot AND t.object_id = oid
-    AND t.relation = rel AND t.subject_relation <> '';
+    AND t.relation = rel AND t.subject_relation <> ''
+    AND EXISTS (
+      SELECT FROM fga.model_type_restriction tr
+      WHERE tr.store = store_id
+        AND tr.model_id = _read_usersets.model_id
+        AND tr.type_name = ot AND tr.relation_name = rel
+        AND tr.subject_type = t.subject_type
+        AND tr.subject_relation = t.subject_relation
+        AND NOT tr.is_wildcard
+    );
 $$;
 
 COMMIT;

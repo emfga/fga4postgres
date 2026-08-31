@@ -3,6 +3,15 @@
 // conformance corpora drive the engine exactly as they drive the
 // reference server.
 //
+// The adapter owns three translations (workspace decision 5):
+// proto to the engine's jsonb request shapes (snake_case
+// protojson), engine SQLSTATEs back to the gRPC codes upstream
+// carries, and the deterministic uuid-mapping of corpus string ids
+// into the engine's uuid-only id domain. It also mirrors the
+// server's proto-shape validation (generated protovalidate
+// methods) so shape errors surface as gRPC InvalidArgument exact
+// as they do at the oracle (measurements.md M10 step 1).
+//
 // Methods land on the plan's phase schedule; a method whose engine
 // surface does not exist yet returns a typed Unimplemented error
 // naming its phase, which the skip machinery turns into a printed
@@ -13,6 +22,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgconn"
@@ -21,19 +31,29 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/encoding/protojson"
+	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/timestamppb"
+
+	"github.com/emfga/fga4postgres/internal/uuidmap"
 )
 
 // Client speaks the seven-method interface the upstream runners
 // need (tests.ClientInterface at the pin). It is goroutine-safe:
-// the pool is, and the client holds nothing else mutable.
+// the pool and the uuid map are, and the client holds nothing
+// else mutable.
 type Client struct {
 	pool *pgxpool.Pool
+	ids  *uuidmap.Map
 }
 
-func New(pool *pgxpool.Pool) *Client {
-	return &Client{pool: pool}
+// New builds a client. ids may be nil for callers that already
+// speak uuids (the engine's native id domain).
+func New(pool *pgxpool.Pool, ids *uuidmap.Map) *Client {
+	return &Client{pool: pool, ids: ids}
 }
+
+var marshal = protojson.MarshalOptions{UseProtoNames: true}
 
 // translate maps engine SQLSTATEs from the reserved YF class to
 // the gRPC status codes upstream carries (docs/ERRORS.md holds the
@@ -59,6 +79,85 @@ func translate(err error) error {
 	return err
 }
 
+// dummyULID satisfies upstream's 26-char ULID patterns during
+// proto-shape validation. Engine store and model ids are uuids
+// (the pinned id-domain divergence), so those two fields are
+// exempted from the pattern by substitution before validating —
+// every other field keeps the server's exact shape rules.
+const dummyULID = "00000000000000000000000000"
+
+// validate mirrors the gRPC server's protovalidate interceptor,
+// with the id-domain exemption above.
+func validate(in proto.Message) error {
+	c := proto.Clone(in)
+	switch m := c.(type) {
+	case *openfgav1.CheckRequest:
+		m.StoreId = dummyULID
+		if m.AuthorizationModelId != "" {
+			m.AuthorizationModelId = dummyULID
+		}
+	case *openfgav1.WriteRequest:
+		m.StoreId = dummyULID
+		if m.AuthorizationModelId != "" {
+			m.AuthorizationModelId = dummyULID
+		}
+	case *openfgav1.WriteAuthorizationModelRequest:
+		m.StoreId = dummyULID
+	}
+	v, ok := c.(interface{ Validate() error })
+	if !ok {
+		return nil
+	}
+	if err := v.Validate(); err != nil {
+		return status.Error(codes.InvalidArgument, err.Error())
+	}
+	return nil
+}
+
+// mapObject rewrites the id segment of "type:id" through the uuid
+// map. Strings without the shape pass through untouched — the
+// engine refuses them natively, which is the point.
+func (c *Client) mapObject(s string) string {
+	if c.ids == nil {
+		return s
+	}
+	typ, id, ok := strings.Cut(s, ":")
+	if !ok || typ == "" || id == "" {
+		return s
+	}
+	return typ + ":" + c.ids.ID(id)
+}
+
+// mapUser handles "type:id", "type:id#relation" and the "type:*"
+// wildcard (never mapped).
+func (c *Client) mapUser(s string) string {
+	if c.ids == nil {
+		return s
+	}
+	rest, rel, hasRel := strings.Cut(s, "#")
+	typ, id, ok := strings.Cut(rest, ":")
+	if !ok || typ == "" || id == "" || id == "*" {
+		return s
+	}
+	mapped := typ + ":" + c.ids.ID(id)
+	if hasRel {
+		mapped += "#" + rel
+	}
+	return mapped
+}
+
+func (c *Client) mapTuple(
+	tk *openfgav1.TupleKey,
+) *openfgav1.TupleKey {
+	if c.ids == nil || tk == nil {
+		return tk
+	}
+	out := proto.Clone(tk).(*openfgav1.TupleKey)
+	out.Object = c.mapObject(out.GetObject())
+	out.User = c.mapUser(out.GetUser())
+	return out
+}
+
 func unimplemented(method, phase string) error {
 	return status.Error(codes.Unimplemented, fmt.Sprintf(
 		"fga4postgres: %s arrives in plan %s", method, phase,
@@ -70,6 +169,9 @@ func (c *Client) CreateStore(
 	in *openfgav1.CreateStoreRequest,
 	_ ...grpc.CallOption,
 ) (*openfgav1.CreateStoreResponse, error) {
+	if err := validate(in); err != nil {
+		return nil, err
+	}
 	var (
 		id, name  string
 		createdAt time.Time
@@ -105,7 +207,26 @@ func (c *Client) WriteAuthorizationModel(
 	in *openfgav1.WriteAuthorizationModelRequest,
 	_ ...grpc.CallOption,
 ) (*openfgav1.WriteAuthorizationModelResponse, error) {
-	return nil, unimplemented("WriteAuthorizationModel", "phase 1")
+	if err := validate(in); err != nil {
+		return nil, err
+	}
+	req, err := marshal.Marshal(in)
+	if err != nil {
+		return nil, err
+	}
+	var out []byte
+	err = c.pool.QueryRow(ctx,
+		"SELECT fga.write_authorization_model($1, $2)",
+		in.GetStoreId(), req,
+	).Scan(&out)
+	if err != nil {
+		return nil, translate(err)
+	}
+	resp := &openfgav1.WriteAuthorizationModelResponse{}
+	if err := protojson.Unmarshal(out, resp); err != nil {
+		return nil, err
+	}
+	return resp, nil
 }
 
 func (c *Client) Write(
@@ -113,7 +234,28 @@ func (c *Client) Write(
 	in *openfgav1.WriteRequest,
 	_ ...grpc.CallOption,
 ) (*openfgav1.WriteResponse, error) {
-	return nil, unimplemented("Write", "phase 1")
+	if err := validate(in); err != nil {
+		return nil, err
+	}
+	mapped := proto.Clone(in).(*openfgav1.WriteRequest)
+	for i, tk := range mapped.GetWrites().GetTupleKeys() {
+		mapped.Writes.TupleKeys[i] = c.mapTuple(tk)
+	}
+	for i, tk := range mapped.GetDeletes().GetTupleKeys() {
+		del := mapped.Deletes.TupleKeys[i]
+		del.Object = c.mapObject(tk.GetObject())
+		del.User = c.mapUser(tk.GetUser())
+	}
+	req, err := marshal.Marshal(mapped)
+	if err != nil {
+		return nil, err
+	}
+	_, err = c.pool.Exec(ctx,
+		"SELECT fga.write($1, $2)", in.GetStoreId(), req)
+	if err != nil {
+		return nil, translate(err)
+	}
+	return &openfgav1.WriteResponse{}, nil
 }
 
 func (c *Client) Check(
@@ -121,7 +263,33 @@ func (c *Client) Check(
 	in *openfgav1.CheckRequest,
 	_ ...grpc.CallOption,
 ) (*openfgav1.CheckResponse, error) {
-	return nil, unimplemented("Check", "phase 1")
+	if err := validate(in); err != nil {
+		return nil, err
+	}
+	mapped := proto.Clone(in).(*openfgav1.CheckRequest)
+	if tk := mapped.GetTupleKey(); tk != nil {
+		tk.Object = c.mapObject(tk.GetObject())
+		tk.User = c.mapUser(tk.GetUser())
+	}
+	for i, tk := range mapped.GetContextualTuples().GetTupleKeys() {
+		mapped.ContextualTuples.TupleKeys[i] = c.mapTuple(tk)
+	}
+	req, err := marshal.Marshal(mapped)
+	if err != nil {
+		return nil, err
+	}
+	var out []byte
+	err = c.pool.QueryRow(ctx,
+		"SELECT fga.check($1, $2)", in.GetStoreId(), req,
+	).Scan(&out)
+	if err != nil {
+		return nil, translate(err)
+	}
+	resp := &openfgav1.CheckResponse{}
+	if err := protojson.Unmarshal(out, resp); err != nil {
+		return nil, err
+	}
+	return resp, nil
 }
 
 func (c *Client) ListObjects(
