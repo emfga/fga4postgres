@@ -1,10 +1,17 @@
 # Benchmarks, separate from ci.yml so their noise never gates a
 # merge. Pull requests run the 100k size with short per-case
-# budgets (~9 minutes computed: 39 cases at ~8s each plus setup);
-# workflow_dispatch runs a chosen size at the full budgets. CI
-# numbers come from shared runners on tmpfs storage — they spot
-# order-of-magnitude movement; quiet-machine comparison happens
-# locally (docs/BENCHMARKS.md).
+# budgets; workflow_dispatch runs a chosen size at the full
+# budgets. CI numbers come from shared runners on tmpfs storage —
+# they spot order-of-magnitude movement; quiet-machine comparison
+# happens locally (docs/BENCHMARKS.md).
+#
+# PR budget, measured (one laptop run at 100k): the 39 cases'
+# 8s floors cost ~7 min with warmups and setup, and the slow
+# cases run past their duration to reach the sample floor —
+# write:churn at ~3.4s per 100+100-op pair dominates. At
+# -min-ops 25 that overrun is ~5 min, hence the 20-minute
+# timeout. If shared runners still flap, the named fallback is
+# demoting the PR trigger to dispatch-only.
 name: Bench
 
 on:
@@ -49,7 +56,7 @@ concurrency:
 jobs:
   bench:
     runs-on: ubuntu-latest
-    timeout-minutes: ${{ github.event_name == 'workflow_dispatch' && 60 || 15 }}
+    timeout-minutes: ${{ github.event_name == 'workflow_dispatch' && 90 || 20 }}
 
     # Mirrors the compose defaults, like ci.yml: the harness
     # builds its DSN from these.
@@ -80,7 +87,10 @@ jobs:
         run: |
           SIZE="${{ inputs.size || '100k' }}"
           if [ "${{ github.event_name }}" = pull_request ]; then
-            KNOBS="-warmup 3s -duration 5s"
+            # Percentiles from fewer than 100 samples are ~-
+            # annotated in the report; PR runs accept that for
+            # the slow cases to fit the budget.
+            KNOBS="-warmup 3s -duration 5s -min-ops 25"
           else
             KNOBS="-warmup 5s -duration 30s"
           fi
