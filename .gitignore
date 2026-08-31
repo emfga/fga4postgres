@@ -1,0 +1,13 @@
+# Planning workspaces are working memory, never a deliverable.
+# See CLAUDE.md -> Planning workspaces.
+.claude/workspace/
+
+# Per-machine environment; .env.example documents the variables.
+.env
+
+# Per-machine path to a local openfga/openfga checkout.
+# See CLAUDE.md -> Reference implementations.
+.openfga_repo
+
+# Release artifacts are built by scripts/build-release.sh.
+dist/

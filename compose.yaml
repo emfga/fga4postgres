@@ -1,0 +1,97 @@
+name: ${PREFIX:-fga4postgres}
+
+# The database exists to be thrown away. PGDATA is a tmpfs, so every
+# `docker compose down` discards it and every `up` starts from initdb
+# with the schema reinstalled -- there is no volume to remember to
+# delete, and no way for a stale schema to survive into a test run.
+services:
+  postgres:
+    container_name: ${PREFIX:-fga4postgres}-postgres
+    environment:
+      PGDATA: /var/lib/postgresql/data
+      POSTGRES_DB: ${POSTGRES_DB:-fga}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-password}
+      POSTGRES_USER: ${POSTGRES_USER:-fga}
+    # Readiness means installed, not merely listening. The image runs
+    # /docker-entrypoint-initdb.d over a socket-only server before it
+    # opens for connections, so a bare pg_isready can go green while
+    # sql/ has not been applied yet. Selecting fga.version() (and
+    # cel.version(), the vendored dependency) closes that race: the
+    # container is healthy exactly when the schema is there, and
+    # `--wait` therefore means what a caller assumes.
+    healthcheck:
+      interval: 2s
+      retries: 30
+      start_period: 20s
+      test:
+        - CMD-SHELL
+        - >-
+          pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB} -q &&
+          psql -U $${POSTGRES_USER} -d $${POSTGRES_DB} -tAc
+          'SELECT cel.version(), fga.version()' >/dev/null
+      timeout: 5s
+    image: postgres:18-alpine@sha256:d3e1620b530c944afa6e887d22eb899824da68e19c52024bf98f5220c88a65b2
+    ports:
+      # Host side is configurable; container side is always 5432.
+      - ${POSTGRES_PORT:-5432}:5432
+    restart: unless-stopped
+    tmpfs:
+      - /var/lib/postgresql/data
+    volumes:
+      # PGDATA is a tmpfs, so the data directory is empty on every
+      # start and the image re-runs initdb on every start. Installing
+      # the schema is therefore part of bringing the database up --
+      # there is no second step to forget, and no stale schema.
+      #
+      # docker/000_install.sh applies vendor/ (cel4postgres) first,
+      # then sql/, in name order. A single-file bind mount cannot be
+      # layered over a read-only directory mount, hence the runner
+      # script instead of mounting sql/ as initdb.d directly.
+      - ./docker:/docker-entrypoint-initdb.d:ro
+      - ./sql:/sql:ro
+      - ./vendor:/vendor:ro
+
+  # The conformance oracle: the reference OpenFGA server, pinned to the
+  # conformance target version. The memory datastore makes it as
+  # disposable as the tmpfs Postgres -- a restart is a reset.
+  openfga:
+    command: run
+    container_name: ${PREFIX:-fga4postgres}-openfga
+    healthcheck:
+      interval: 2s
+      retries: 30
+      start_period: 20s
+      test:
+        - CMD
+        - /usr/local/bin/grpc_health_probe
+        - -addr=localhost:8081
+      timeout: 5s
+    image: openfga/openfga:v1.19.0@sha256:78d1fa601d42340ecb131305d80d3767d0f254f9b1bc3646f9a557e11b24c63a
+    ports:
+      - ${OPENFGA_HTTP_PORT:-8080}:8080
+      - ${OPENFGA_GRPC_PORT:-8081}:8081
+    restart: unless-stopped
+
+  # The suite, containerised, for CI parity and for running without a
+  # Go toolchain on the host. Behind a profile so the default `up`
+  # brings up the database without running tests:
+  #   docker compose run --rm test
+  test:
+    command: go test ./...
+    depends_on:
+      openfga:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://${POSTGRES_USER:-fga}:${POSTGRES_PASSWORD:-password}@postgres:5432/${POSTGRES_DB:-fga}?sslmode=disable
+      GOCACHE: /tmp/go-build
+      GOFLAGS: -mod=mod
+      GOMODCACHE: /tmp/go-mod
+      OPENFGA_URL: http://openfga:8080
+    image: golang:1.26-alpine
+    profiles:
+      - test
+    volumes:
+      - ./:/src
+    working_dir: /src

@@ -1,0 +1,58 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    # Mirrors the compose defaults. The harness reads .env when it
+    # exists and the process environment otherwise, so CI needs no
+    # file -- but it does need these, or the DSN cannot be built.
+    env:
+      POSTGRES_DB: fga
+      POSTGRES_HOST: localhost
+      POSTGRES_PASSWORD: password
+      POSTGRES_PORT: 5432
+      POSTGRES_USER: fga
+
+    steps:
+      - uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920 # v2.20.0
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # The schema installs during initdb (vendored cel4postgres first,
+      # then sql/) and the healthcheck selects cel.version() and
+      # fga.version(), so --wait returns only once the database is up
+      # AND installed. A broken script fails this step rather than
+      # reaching the suite as a mysterious test failure. The OpenFGA
+      # oracle gates on its own grpc health probe.
+      - run: docker compose up -d --wait
+
+      # Until the Go harness exists this is the whole suite: prove the
+      # install answers and the oracle serves. setup-go, gofmt, vet and
+      # `go test ./...` return here with the first harness commit.
+      - name: Verify installed schema and oracle
+        run: |
+          psql "postgres://$POSTGRES_USER:$POSTGRES_PASSWORD@$POSTGRES_HOST:$POSTGRES_PORT/$POSTGRES_DB" \
+            -v ON_ERROR_STOP=1 \
+            -c "SELECT cel.version(), fga.version()" \
+            -c "SELECT cel.evaluate('1 + 2 == 3', '{}', 'standard')"
+          curl -fsS http://localhost:8080/healthz
+
+      - name: Dump database logs
+        if: failure()
+        run: docker compose logs --no-color
