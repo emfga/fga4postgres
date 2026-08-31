@@ -1,7 +1,7 @@
 // Package corpus loads the pinned upstream YAML conformance corpus
 // straight from the openfga module's embedded assets — the bytes
-// come from the pin, never from copied files — and classifies each
-// case's feature set so skip decisions are computed, not listed by
+// come from the pin, never from copied files — and counts each
+// case's assertions so skip decisions are computed, not listed by
 // hand.
 //
 // The structs mirror the shapes upstream's runners decode into
@@ -98,98 +98,20 @@ func Load() ([]File, error) {
 	return out, nil
 }
 
-// conditionDecl spots condition declarations in the DSL model text
-// without a parser: both the block form ("condition name(...)") and
-// inline type restrictions ("[user with cond]").
-var conditionDecl = regexp.MustCompile(
-	`(?m)^\s*condition\s+\w+\s*\(|\[[^\]]*\bwith\s+\w+`,
-)
-
-// Features is one test case's computed feature set — the input to
-// every phase's mechanical skip decision.
+// Features is one test case's assertion counts, the input to the
+// computed decision of which corpus tests each replay runs.
 type Features struct {
-	Conditions  bool // model, tuples, or assertions use conditions
-	MultiStage  bool
-	Check       int // assertion counts
+	Check       int
 	ListObjects int
 	ListUsers   int
-	CtxTuples   int // total contextual tuples across assertions
-
-	// Rewrite operators the models use, for the phase-1 interior
-	// 1a/1b gate. Text-scanned from define lines; a false negative
-	// shows up as a loud unimplemented-operator failure, never as
-	// a wrong answer.
-	TTU          bool
-	Intersection bool
-	Exclusion    bool
 }
-
-var (
-	defineLine = regexp.MustCompile(`(?m)^\s*define\s.*$`)
-	ttuScan    = regexp.MustCompile(`\sfrom\s`)
-	interScan  = regexp.MustCompile(`\sand\s`)
-	butNotScan = regexp.MustCompile(`\sbut not\s`)
-)
 
 func Classify(tc Test) Features {
 	var f Features
-	f.MultiStage = len(tc.Stages) > 1
 	for _, s := range tc.Stages {
-		if conditionDecl.MatchString(s.Model) {
-			f.Conditions = true
-		}
-		for _, line := range defineLine.FindAllString(s.Model, -1) {
-			if ttuScan.MatchString(line) {
-				f.TTU = true
-			}
-			if interScan.MatchString(line) {
-				f.Intersection = true
-			}
-			if butNotScan.MatchString(line) {
-				f.Exclusion = true
-			}
-		}
-		for _, tup := range s.Tuples {
-			if tup.GetCondition() != nil {
-				f.Conditions = true
-			}
-		}
 		f.Check += len(s.CheckAssertions)
 		f.ListObjects += len(s.ListObjectsAssertions)
 		f.ListUsers += len(s.ListUsersAssertions)
-		for _, a := range s.CheckAssertions {
-			f.CtxTuples += len(a.ContextualTuples)
-			if a.Context != nil {
-				f.Conditions = true
-			}
-			for _, tup := range a.ContextualTuples {
-				if tup.GetCondition() != nil {
-					f.Conditions = true
-				}
-			}
-		}
-		for _, a := range s.ListObjectsAssertions {
-			f.CtxTuples += len(a.ContextualTuples)
-			if a.Context != nil {
-				f.Conditions = true
-			}
-			for _, tup := range a.ContextualTuples {
-				if tup.GetCondition() != nil {
-					f.Conditions = true
-				}
-			}
-		}
-		for _, a := range s.ListUsersAssertions {
-			f.CtxTuples += len(a.ContextualTuples)
-			if a.Context != nil {
-				f.Conditions = true
-			}
-			for _, tup := range a.ContextualTuples {
-				if tup.GetCondition() != nil {
-					f.Conditions = true
-				}
-			}
-		}
 	}
 	return f
 }

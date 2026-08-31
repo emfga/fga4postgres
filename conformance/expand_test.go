@@ -25,7 +25,7 @@ type expandClient interface {
 // normTree canonicalizes an expand tree for comparison: users
 // lists and TTU computed lists sort (upstream's ordering is
 // tuple order, ours is ulid order — order-insensitivity is the
-// measured contract, M19); operator children sort by their
+// measured contract); operator children sort by their
 // serialized form since both sides preserve rewrite order but
 // the guard costs nothing.
 func normTree(n *openfgav1.UsersetTree_Node) string {
@@ -89,11 +89,11 @@ func joinStrings(ss []string) string {
 	return out
 }
 
-// Expand has no upstream corpus (plan phase 7): this suite is
-// the differential contract — every operator shape, wildcard and
-// userset leaves, TTU fan-out, contextual tuples, the measured
-// no-condition-evaluation property (M20), and the all-2000 error
-// surface (M19).
+// Expand has no upstream corpus: this suite is the differential
+// contract — every operator shape, wildcard and userset leaves,
+// TTU fan-out, contextual tuples, the measured
+// no-condition-evaluation property, and the all-2000 error
+// surface.
 func TestExpandDifferential(t *testing.T) {
 	ctx := context.Background()
 

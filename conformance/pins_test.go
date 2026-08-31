@@ -15,8 +15,8 @@ import (
 	"github.com/emfga/fga4postgres/internal/uuidmap"
 )
 
-// Pinned divergences, asserted from BOTH sides (tsfga's pattern,
-// plan §2.2/§4): each test requires the oracle to accept what the
+// Pinned divergences, asserted from BOTH sides (tsfga's
+// pattern): each test requires the oracle to accept what the
 // engine refuses. If upstream ever starts refusing too — or the
 // engine starts accepting — the pin turns red and its entry in
 // docs/CONFORMANCE.md must be updated in the same change.
@@ -114,7 +114,8 @@ func TestPinnedIDDomain(t *testing.T) {
 }
 
 // PIN-ID-4: upstream-shaped ULID model ids are refused as
-// not-found (uuidv7 model ids, workspace decision 3). One-sided by
+// not-found (engine model ids are uuidv7, never ULIDs). One-sided
+// by
 // nature — the oracle's own model ids ARE ULIDs, which is the
 // divergence — so the assert is that the engine refuses with the
 // not-found code, and that the oracle accepts its own ULID id
@@ -132,7 +133,7 @@ func TestPinnedULIDModelID(t *testing.T) {
 
 // PIN-READ-1: a continuation token reused under a CHANGED filter.
 // Upstream's token is positional and silently continues at that
-// offset under the new filter (measured M27); the engine binds
+// offset under the new filter (measured); the engine binds
 // the token to its filter and refuses 2007. Refusing direction.
 func TestPinnedReadTokenFilter(t *testing.T) {
 	ctx := context.Background()
@@ -216,8 +217,8 @@ func TestPinnedReadTokenFilter(t *testing.T) {
 
 // PIN-CTX-1: the condition-context write boundary is 32768 bytes
 // on BOTH sides, but measured over different encodings (proto
-// bytes upstream, jsonb-normalized text here) — a
-// different-boundary pin (measured M29). protojson 1e300 is a
+// bytes upstream, jsonb-normalized text here) — a measured
+// different-boundary pin. protojson 1e300 is a
 // short literal and an 8-byte proto double; Postgres numeric
 // prints it as 301 digits, so a list of 2500 such doubles is
 // under the proto limit and far over the jsonb one.
@@ -280,7 +281,7 @@ condition lcond(xs: list<double>) {
 }
 
 // PIN-DEPTH-1: near the depth boundary, deep recursive negatives
-// are strategy-dependent upstream (M41): on the snowflake
+// are strategy-dependent upstream: on the snowflake
 // fixture's full store, upstream refuses 2002 at 25 tuple hops
 // for an absent user where the engine — which implements the
 // documented budget (25 dispatches resolve, the 26th refuses) —

@@ -5,17 +5,16 @@
 -- keyed by an immutable uuidv7 model id, and derives the
 -- normalized rows the resolver reads. Models are immutable and
 -- versioned: old models stay queryable, checks may pin a model id,
--- defaulting to the store's latest (CLAUDE.md decision 3).
+-- defaulting to the store's latest.
 --
--- Refusal-side model validation (the CONFIG-* matrix) arrives in
--- plan phase 6; the corpus models this phase replays are pre-gated
--- by upstream's own modelgraph, so normalization is the contract
--- here, not validation.
+-- Refusal-side model validation (the CONFIG-* matrix) lives in
+-- fga._validate_model below; the derivation queries themselves
+-- assume upstream-shaped input and only normalize.
 
 BEGIN;
 
--- The id-domain gate (workspace decisions 1-3): every id the API
--- accepts must be a canonical lower-case hyphenated uuid, and the
+-- The id-domain gate: every id the API accepts must be a
+-- canonical lower-case hyphenated uuid, and the
 -- nil uuid is reserved as the wildcard sentinel. Everything else
 -- returns NULL; callers raise their own error code, because the
 -- right code depends on where the id appeared (request key,
@@ -59,7 +58,7 @@ CREATE TABLE IF NOT EXISTS fga.model_relation (
   is_assignable boolean NOT NULL,
   -- The rewrite tree contains intersection or difference, so a
   -- reverse-expansion candidate arriving at this relation needs a
-  -- forward check (plan §1.5).
+  -- forward check.
   needs_check boolean NOT NULL DEFAULT false,
   PRIMARY KEY (store, model_id, type_name, relation_name)
 );
@@ -118,7 +117,7 @@ CREATE TABLE IF NOT EXISTS fga.model_condition (
   PRIMARY KEY (store, model_id, name)
 );
 
--- The precomputed PathExists prune (plan §1.4): every graph node
+-- The precomputed PathExists prune: every graph node
 -- (subject_type, subject_relation) a relation can possibly grant
 -- to, computed once at model-write time so the resolver's prune is
 -- one indexed lookup. subject_relation '' covers plain-object and
@@ -250,7 +249,8 @@ BEGIN
   -- parse failure refuses the model. (Full result-type checking
   -- needs declared-variable support upstream's cel-go has and
   -- cel4postgres's checker does not; a non-bool condition is
-  -- refused at evaluation instead — measurements M15.)
+  -- refused at evaluation instead — a documented
+  -- accepting-direction divergence, docs/CONFORMANCE.md.)
   INSERT INTO fga.model_condition
   SELECT store_id, new_id, cond.key,
     cond.value ->> 'expression',
@@ -327,16 +327,17 @@ BEGIN
 END;
 $$;
 
--- The CONFIG-* model validation rules (plan phase 6), every one
--- measured against the oracle (measurements M16) and refused with
--- YF156 (2056 invalid_authorization_model). Whole-model atomic
--- validation (CLAUDE.md decision 3) closes the forward-reference
--- gaps a per-relation gate cannot decide.
+-- The CONFIG-* model validation rules, every one measured against
+-- the pinned oracle (re-verified by TestModelGateMatrix and
+-- conformance/probe_write_test.go) and refused with YF156 (2056
+-- invalid_authorization_model). Whole-model atomic validation
+-- closes the forward-reference gaps a per-relation gate cannot
+-- decide.
 --
 -- Deliberately absent (accepting-direction divergences, in
 -- docs/CONFORMANCE.md): upstream's whole-model entrypoint
 -- analysis ("no entrypoints defined") and condition
--- result-type/cost checking (M15).
+-- result-type/cost checking.
 CREATE OR REPLACE FUNCTION fga._validate_model(
   store_id uuid,
   new_id uuid,
@@ -586,8 +587,8 @@ END;
 $$;
 
 -- Resolves the model a request pins: '' or NULL means the store's
--- latest; a non-canonical id is refused as not-found (workspace
--- decision 3 — upstream-shaped ULIDs land here); a canonical id
+-- latest; a non-canonical id is refused as not-found (the uuid
+-- id domain — upstream-shaped ULIDs land here); a canonical id
 -- must exist.
 CREATE OR REPLACE FUNCTION fga._resolve_model(
   store_id uuid,

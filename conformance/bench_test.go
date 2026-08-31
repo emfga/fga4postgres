@@ -12,12 +12,11 @@ import (
 	"github.com/emfga/fga4postgres/internal/uuidmap"
 )
 
-// Phase-2 resolver benchmarks (plan §3). Run with:
+// Resolver benchmarks. Run with:
 //
 //	go test -bench BenchmarkCheck -benchtime 2s ./conformance/
 //
-// Numbers are recorded in workspace measurements.md; rerun after
-// resolver changes that touch the hot path.
+// Rerun after resolver changes that touch the hot path.
 
 func benchClient(b *testing.B) *sqlclient.Client {
 	return sqlclient.New(testdb.Pool(b), uuidmap.New("bench"))

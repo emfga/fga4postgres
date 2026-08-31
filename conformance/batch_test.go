@@ -13,7 +13,7 @@ import (
 	"github.com/emfga/fga4postgres/internal/testdb"
 )
 
-// The engine's batch_check against the M34-measured oracle
+// The engine's batch_check against the measured oracle
 // contract: per-item error capture, request-level refusal of
 // duplicate correlation ids and of more than 50 items.
 func TestEngineBatchCheck(t *testing.T) {

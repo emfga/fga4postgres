@@ -24,8 +24,8 @@ import (
 	"github.com/emfga/fga4postgres/internal/uuidmap"
 )
 
-// The YAML replayer, mirroring upstream's runner contract
-// (workspace doc 06 §1): every test runs twice — once normal,
+// The YAML replayer, mirroring upstream's runner contract:
+// every test runs twice — once normal,
 // once with the stage tuples handed as contextual tuples; fresh
 // store per test on both engines; tuples seeded-shuffled and
 // written in chunks of 40; assertions checked against the corpus
@@ -55,7 +55,7 @@ func shuffledTuples(
 }
 
 // engineForCase builds the sqlclient with a per-file uuid map —
-// deterministic across runs, disjoint across files (plan §2.3).
+// deterministic across runs, disjoint across files.
 func engineForCase(t *testing.T, file string) *sqlclient.Client {
 	return sqlclient.New(
 		testdb.Pool(t), uuidmap.New("yaml/"+file),
@@ -183,7 +183,8 @@ func writeStageBoth(
 
 // runListObjectsReplay mirrors the upstream listobjects runner:
 // unary set-compare per assertion, plus a confirming Check for
-// every returned object (doc 06 §1 item 6). The streamed variant
+// every returned object, as upstream's runner does. The
+// streamed variant
 // is exercised implicitly — the sqlclient adapts it over the same
 // unary path — so it carries no separate assert here.
 func runListObjectsReplay(

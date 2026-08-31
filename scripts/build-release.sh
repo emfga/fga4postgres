@@ -6,8 +6,9 @@
 # than keeping a copy that could drift (CLAUDE.md: no version
 # copies).
 #
-# Two shapes, per the distribution decision (CLAUDE.md decision
-# 7): the all-in bundle inlines the vendored cel4postgres release
+# Two shapes, because plain SQL scripts and pg_tle are both
+# first-class distribution channels:
+# the all-in bundle inlines the vendored cel4postgres release
 # so one `psql -f` installs everything on a bare database; the
 # engine-only file serves databases that already run the pinned
 # cel4postgres. Plain concatenation is safe because every script

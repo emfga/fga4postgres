@@ -4,7 +4,7 @@
 // inventory in docs/write-causes.json cannot silently drift: a
 // cause upstream adds, removes or rewords turns the gate test
 // red until the inventory is regenerated and re-attributed
-// (tsfga's causes-inventory CI shape, workspace doc 05 §4).
+// (a CI shape ported from tsfga).
 package causes
 
 import (

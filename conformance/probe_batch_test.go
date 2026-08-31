@@ -12,9 +12,9 @@ import (
 	"github.com/emfga/fga4postgres/internal/oracle"
 )
 
-// M34: batch_check semantics as served — caps, duplicate
+// batch_check semantics as served — caps, duplicate
 // correlation ids, per-item error isolation.
-func TestProbeM34BatchCheck(t *testing.T) {
+func TestProbeBatchCheck(t *testing.T) {
 	client := oracle.Client(t)
 	ctx := context.Background()
 	store, model := setup(t, client, plainDSL,

@@ -1,11 +1,13 @@
 -- expand: one relation on one object, unrolled a single level
--- into upstream's UsersetTree (measured shapes, M19/M20).
+-- into upstream's UsersetTree (shapes measured against the
+-- pinned oracle; re-verified by
+-- conformance/probe_expand_test.go).
 --
 -- Expand never evaluates conditions (an unmet-able conditioned
--- tuple still appears — M20) and never recurses: computed
+-- tuple still appears) and never recurses: computed
 -- usersets and TTU parents come back as references for the
 -- caller to expand further. Every error is 2000, including
--- undefined type/relation (unlike check's 2021/2022 — M19).
+-- undefined type/relation (unlike check's 2021/2022).
 -- Users lists are emitted sorted; the TTU computed list follows
 -- write (ulid) order, matching upstream's tuple order; the
 -- differential comparison is order-insensitive over both.

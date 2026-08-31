@@ -11,10 +11,10 @@ import (
 	"github.com/emfga/fga4postgres/internal/oracle"
 )
 
-// M19/M20 + the expand response shapes phase 7 encodes: the tree
-// per operator, TTU computed-list ordering, wildcard/userset
-// leaves, condition handling, and the error surface.
-func TestProbeM19M20Expand(t *testing.T) {
+// The expand response shapes the engine encodes: the tree per
+// operator, TTU computed-list ordering, wildcard/userset leaves,
+// condition handling, and the error surface.
+func TestProbeExpand(t *testing.T) {
 	client := oracle.Client(t)
 	ctx := context.Background()
 
@@ -86,8 +86,8 @@ condition icond(x: int) {
 			c[0], c[1], code, j)
 	}
 
-	// M20: a conditioned tuple whose condition cannot be met with
-	// an empty context.
+	// A conditioned tuple whose condition cannot be met with an
+	// empty context.
 	one := 1
 	_ = one
 	condTK := tk("doc:1", "bound", "user:bob")
@@ -102,7 +102,7 @@ condition icond(x: int) {
 		t.Fatalf("write conditioned tuple: %v", err)
 	}
 	j, code := expand(store, model, "doc:1", "bound", nil)
-	t.Logf("OBSERVED: M20 unmet-able condition: code=%d %s",
+	t.Logf("OBSERVED: unmet-able condition: code=%d %s",
 		code, j)
 
 	// Contextual tuples in expand?

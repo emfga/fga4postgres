@@ -9,14 +9,14 @@ import (
 	"github.com/emfga/fga4postgres/internal/oracle"
 )
 
-// Oracle probes for the phase-1 measurement session. Each test
-// carries the id of the measurements.md entry it closes; the
-// OBSERVED lines are the record. These run against the oracle
-// only — they define the contract the engine is then built to.
+// Oracle probes: each test measures one load-bearing check
+// behaviour against the pinned oracle; the OBSERVED lines are the
+// record. These run against the oracle only — they define the
+// contract the engine is built to.
 
-// M01a: a computed-userset chain far beyond the depth limit still
+// A computed-userset chain far beyond the depth limit still
 // resolves — computed usersets spend no depth budget.
-func TestProbeM01ComputedChainFree(t *testing.T) {
+func TestProbeComputedChainFree(t *testing.T) {
 	client := oracle.Client(t)
 	store, model := setup(t, client, computedChainDSL(40),
 		[]*openfgav1.TupleKey{tk("doc:1", "r0", "user:anne")})
@@ -28,9 +28,9 @@ func TestProbeM01ComputedChainFree(t *testing.T) {
 	}
 }
 
-// M01b: userset dispatch chains — find the exact boundary where
+// Userset dispatch chains — find the exact boundary where
 // too-complex fires.
-func TestProbeM01UsersetChainBoundary(t *testing.T) {
+func TestProbeUsersetChainBoundary(t *testing.T) {
 	client := oracle.Client(t)
 	store, model := setup(
 		t, client, chainGroupsDSL, groupChain(30),
@@ -59,7 +59,7 @@ func TestProbeM01UsersetChainBoundary(t *testing.T) {
 
 // depthDSL wires a deep userset path and a direct path into
 // union, intersection and exclusion shapes for the
-// error-swallowing matrix (M01c, M11).
+// error-swallowing matrix.
 const depthDSL = `model
   schema 1.1
 type user
@@ -85,7 +85,7 @@ func deepDocTuples(chainLen int) []*openfgav1.TupleKey {
 		fmt.Sprintf("group:g%d#member", chainLen)))
 }
 
-func TestProbeM01ErrorSwallowing(t *testing.T) {
+func TestProbeErrorSwallowing(t *testing.T) {
 	client := oracle.Client(t)
 
 	// Store A: direct also granted to anne.
@@ -118,7 +118,7 @@ func TestProbeM01ErrorSwallowing(t *testing.T) {
 	}
 }
 
-// M04: tuple cycles — the cycle answer alone, and cycles feeding
+// Tuple cycles — the cycle answer alone, and cycles feeding
 // exclusion (both sides) and intersection.
 const cycleDSL = `model
   schema 1.1
@@ -136,7 +136,7 @@ type node
     define inter_mutual: granted and x
 `
 
-func TestProbeM04Cycles(t *testing.T) {
+func TestProbeCycles(t *testing.T) {
 	client := oracle.Client(t)
 	tuples := []*openfgav1.TupleKey{
 		tk("node:1", "looped", "node:2#looped"),
@@ -156,7 +156,7 @@ func TestProbeM04Cycles(t *testing.T) {
 	}
 }
 
-// M05: false-by-unreachable-type vs false-by-empty-traversal must
+// False-by-unreachable-type vs false-by-empty-traversal must
 // be the same answer.
 const pathExistsDSL = `model
   schema 1.1
@@ -167,7 +167,7 @@ type doc
     define viewer: [user]
 `
 
-func TestProbeM05PathExists(t *testing.T) {
+func TestProbePathExists(t *testing.T) {
 	client := oracle.Client(t)
 	store, model := setup(t, client, pathExistsDSL, nil)
 	unreachable := doCheck(t, client, store, model,
@@ -181,7 +181,7 @@ func TestProbeM05PathExists(t *testing.T) {
 	}
 }
 
-// M06: undefined relation at the request vs undefined computed
+// Undefined relation at the request vs undefined computed
 // relation behind a TTU link.
 const ttuUndefDSL = `model
   schema 1.1
@@ -195,7 +195,7 @@ type folder
     define viewer: [user] or viewer from parent
 `
 
-func TestProbeM06UndefinedRelation(t *testing.T) {
+func TestProbeUndefinedRelation(t *testing.T) {
 	client := oracle.Client(t)
 	tuples := []*openfgav1.TupleKey{
 		// team defines no viewer: the TTU-linked undefined case.
@@ -218,7 +218,7 @@ func TestProbeM06UndefinedRelation(t *testing.T) {
 	}
 }
 
-// M08: contextual-tuple API limits — count cap, duplicates within
+// Contextual-tuple API limits — count cap, duplicates within
 // the request, duplicate against a stored tuple.
 const plainDSL = `model
   schema 1.1
@@ -228,7 +228,7 @@ type doc
     define viewer: [user]
 `
 
-func TestProbeM08ContextualTupleLimits(t *testing.T) {
+func TestProbeContextualTupleLimits(t *testing.T) {
 	client := oracle.Client(t)
 	store, model := setup(t, client, plainDSL,
 		[]*openfgav1.TupleKey{tk("doc:1", "viewer", "user:bob")})
@@ -261,8 +261,8 @@ func TestProbeM08ContextualTupleLimits(t *testing.T) {
 	t.Logf("OBSERVED: ctx duplicates stored: %v", dupStored)
 }
 
-// M09: wide fan-out is a concurrency bound, never a refusal.
-func TestProbeM09Breadth(t *testing.T) {
+// Wide fan-out is a concurrency bound, never a refusal.
+func TestProbeBreadth(t *testing.T) {
 	client := oracle.Client(t)
 	tuples := []*openfgav1.TupleKey{
 		tk("group:g90", "member", "user:anne"),
@@ -280,9 +280,9 @@ func TestProbeM09Breadth(t *testing.T) {
 	}
 }
 
-// M10: which invalid part of a check request wins when several
+// Which invalid part of a check request wins when several
 // are invalid at once.
-func TestProbeM10ValidationOrder(t *testing.T) {
+func TestProbeCheckValidationOrder(t *testing.T) {
 	client := oracle.Client(t)
 	store, model := setup(t, client, plainDSL, nil)
 

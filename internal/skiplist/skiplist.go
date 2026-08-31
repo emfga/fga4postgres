@@ -23,8 +23,8 @@ var (
 )
 
 // Skip records the skip and skips the test. The reason should name
-// the phase or divergence that lifts it, so the printed list reads
-// as a work register, not an excuse list.
+// the divergence or contract that explains it, so the printed list
+// reads as a work register, not an excuse list.
 func Skip(t testing.TB, reason string) {
 	t.Helper()
 	mu.Lock()

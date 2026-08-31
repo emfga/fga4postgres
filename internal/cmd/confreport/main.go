@@ -1,36 +1,22 @@
 // confreport renders the conformance report from a
 // `go test -json` stream (stdin): pass/fail/skip totals, suite
-// wall time, the skip list grouped by reason, corpus inventory,
-// and the count of still-open measurement entries.
+// wall time, the corpus inventory, and the skip list grouped by
+// reason.
 //
 //	go test -json ./... | go run ./internal/cmd/confreport
-//
-// The measurements file is workspace-local (gitignored); when it
-// is absent — CI, a fresh checkout — the report says so instead of
-// pretending the count is zero.
 package main
 
 import (
-	"flag"
 	"fmt"
 	"os"
 	"sort"
-	"strings"
 	"time"
 
 	"github.com/emfga/fga4postgres/internal/corpus"
 	"github.com/emfga/fga4postgres/internal/gotestjson"
 )
 
-var measurementsPath = flag.String(
-	"measurements",
-	".claude/workspace/v1-design/measurements.md",
-	"path to the workspace measurements file",
-)
-
 func main() {
-	flag.Parse()
-
 	sum, err := gotestjson.Parse(os.Stdin)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "confreport:", err)
@@ -70,17 +56,6 @@ func main() {
 			"%d list_objects, %d list_users\n\n",
 		tests, stages, checks, lobjs, lusers,
 	)
-
-	fmt.Printf("## Open measurements\n\n")
-	b, err := os.ReadFile(*measurementsPath)
-	if err != nil {
-		fmt.Printf("- measurements file not present at %s "+
-			"(workspace-local)\n\n", *measurementsPath)
-	} else {
-		open := strings.Count(string(b), "Status: OPEN")
-		closed := strings.Count(string(b), "Status: CLOSED")
-		fmt.Printf("- OPEN: %d, CLOSED: %d\n\n", open, closed)
-	}
 
 	fmt.Printf("## Skipped (run-derived)\n\n")
 	byReason := map[string][]string{}

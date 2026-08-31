@@ -1,23 +1,24 @@
--- list_objects: reverse expansion (workspace decision 4), as an
--- iterative BFS over userset nodes with a global seen-set.
+-- list_objects: reverse expansion, as an iterative BFS over
+-- userset nodes with a global seen-set.
 --
--- Measured contract (measurements.md):
---   M21: reverse expansion NEVER charges tuple-hop depth at the
+-- Measured contract (against the pinned oracle; re-verified by
+-- conformance/probe_listobjects_test.go):
+--   Depth: reverse expansion NEVER charges tuple-hop depth at the
 --        pin — 40- and 100-link chains return complete results
 --        while a forward check on the same chain raises 2002.
 --        That upstream-internal inconsistency is mirrored, not
 --        repaired: the BFS terminates on dedup alone and raises
 --        no too-complex error. (No corpus list_objects case
 --        asserts 2002.)
---   M37: validation order — contextual tuples (invalid_tuple),
---        then target type (type_not_found 2021), then target
---        relation (relation_not_found 2022), then the subject
+--   Validation order: contextual tuples (invalid_tuple), then
+--        target type (type_not_found 2021), then target relation
+--        (relation_not_found 2022), then the subject
 --        (validation_error 2000).
---   M07: per-row conditions evaluate during expansion with the
---        merged context; condition errors are collected per
+--   Conditions: per-row conditions evaluate during expansion with
+--        the merged context; condition errors are collected per
 --        candidate and raised only when the result count stays
---        below the 1000 cap (upstream's scoping, doc 04 §5) —
---        otherwise tolerated.
+--        below the 1000 cap (upstream's scoping) — otherwise
+--        tolerated.
 --
 -- Candidates whose path crossed a relation containing
 -- intersection or difference carry a sticky taint and are
@@ -95,7 +96,7 @@ BEGIN
   mid := fga._resolve_model(
     store_id, request ->> 'authorization_model_id');
 
-  -- Validation, in the measured order (M37).
+  -- Validation, in the measured order.
   FOR tkj IN
     SELECT * FROM jsonb_array_elements(coalesce(
       request -> 'contextual_tuples' -> 'tuple_keys',
@@ -312,11 +313,11 @@ BEGIN
     ) AS u(type_name, object_id, relation_name, tainted,
            cond_name, cond_ctx)
     -- Target pruning: upstream's reverse expansion only walks
-    -- the subgraph between the user and the target relation
-    -- (M40 — edges that cannot lead to the target are never
-    -- read, so their conditions never evaluate, let alone
-    -- error). A candidate node survives if it IS the target or
-    -- the target can grant through it.
+    -- the subgraph between the user and the target relation —
+    -- edges that cannot lead to the target are never read, so
+    -- their conditions never evaluate, let alone error. A
+    -- candidate node survives if it IS the target or the target
+    -- can grant through it.
     WHERE (u.type_name = target_type
            AND u.relation_name = target_rel)
        OR EXISTS (

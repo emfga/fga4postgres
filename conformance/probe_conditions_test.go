@@ -41,10 +41,10 @@ func reqCtx(x int) *structpb.Struct {
 	}
 }
 
-// M07: condition context precedence — tuple context vs request
+// Condition context precedence — tuple context vs request
 // context on the same key, and a contextual tuple duplicating a
 // stored tuple with a different condition context.
-func TestProbeM07ConditionPrecedence(t *testing.T) {
+func TestProbeConditionPrecedence(t *testing.T) {
 	client := oracle.Client(t)
 	two := 2
 
@@ -104,9 +104,9 @@ condition xcond(x: int) {
   x == 1
 }`
 
-// M07 continued: the iterator-shaped read (userset expansion) —
+// Continued: the iterator-shaped read (userset expansion) —
 // concatenate (either row can grant) or replace?
-func TestProbeM07IteratorOverlay(t *testing.T) {
+func TestProbeIteratorOverlay(t *testing.T) {
 	client := oracle.Client(t)
 	one, two := 1, 2
 

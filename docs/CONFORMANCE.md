@@ -2,7 +2,9 @@
 
 What "conformant" claims, what it excludes, and every knowing
 divergence. The conformance target is **openfga/openfga v1.19.0**,
-pinned everywhere at once (CLAUDE.md decision 1). Every claim below
+pinned everywhere at once — the compose oracle image, the corpus
+the harness replays, and every source citation name the same
+version and are bumped together or not at all. Every claim below
 is backed by a test the suite runs against the live pinned
 container; a divergence is *pinned from both sides*
 (`conformance/pins_test.go`), so a gap upstream closes turns the
@@ -39,7 +41,7 @@ All planned v1 APIs are implemented. Current verified surface:
 - `list_objects` returns complete results or an error — there is
   no deadline machinery, and it is verified that no corpus case
   depends on upstream's partial-results-on-deadline behaviour
-  (different-shape property, measurements M21/M22).
+  (a measured different-shape property).
 - `list_users`: every corpus case passes differentially in both
   replay variants. The measured envelope the engine mirrors:
   exactly one user filter; userset filters are reflexive (every
@@ -84,8 +86,8 @@ All planned v1 APIs are implemented. Current verified surface:
   (`TestExpandDifferential`) covers every operator tree shape,
   wildcard and userset leaves, TTU fan-out, contextual tuples,
   the measured no-condition-evaluation property (an unmet-able
-  conditioned tuple still appears — M20), and the all-2000 error
-  surface including undefined type/relation (M19 — unlike
+  conditioned tuple still appears), and the all-2000 error
+  surface including undefined type/relation (unlike
   check's 2021/2022). Users lists compare order-insensitively:
   upstream's TTU computed list follows tuple order, the engine's
   ulid order.
@@ -96,7 +98,8 @@ All planned v1 APIs are implemented. Current verified surface:
   fixture (`TestRealWorldModels`), refusals compared as
   outcomes.
 - Condition-error scoping follows upstream's filtered-iterator
-  rule, from source and probes at the pin (M40): a held
+  rule, from source and probes at the pin
+  (`internal/iterator/filter.go`): a held
   condition error is scoped per model-graph edge and dropped
   when any row of that edge passes its filter; list_objects
   walks only the subgraph between the user and the target, so
@@ -124,10 +127,10 @@ sides refuse, at different limits.
 | PIN-ID-4 | Store/model ids are uuidv7; upstream-shaped ULID ids are refused as not-found, and ids never transfer between engines | refusing | TestPinnedULIDModelID |
 | PIN-READ-1 | A read continuation token reused under a changed filter is refused (2007); upstream's positional token silently continues at that offset under the new filter | refusing | TestPinnedReadTokenFilter |
 | PIN-CTX-1 | The condition-context write boundary is 32768 bytes of jsonb-normalized text; upstream's is 32768 proto bytes — number-heavy contexts refuse here and pass there, near-boundary strings flip at slightly different lengths | different-boundary | TestPinnedContextBoundary |
-| PIN-DEPTH-1 | Deep recursive negatives near the depth boundary are strategy-dependent upstream (M41): the engine implements the documented budget (25 dispatches resolve, the 26th refuses 2002); upstream may answer false at any depth (recursive fast path) or refuse 2002 one dispatch early depending on model and store shape. The disagreement class is only false-vs-2002, never true-vs-false; positives agree exactly on the boundary | different-boundary | TestPinnedDeepRecursionStrategy |
+| PIN-DEPTH-1 | Deep recursive negatives near the depth boundary are strategy-dependent upstream: the engine implements the documented budget (25 dispatches resolve, the 26th refuses 2002); upstream may answer false at any depth (recursive fast path) or refuse 2002 one dispatch early depending on model and store shape. The disagreement class is only false-vs-2002, never true-vs-false; positives agree exactly on the boundary | different-boundary | TestPinnedDeepRecursionStrategy |
 
-Condition-layer divergences (measured or by construction,
-measurements M15/M30/M31; none corpus-visible):
+Condition-layer divergences (measured or by construction; none
+corpus-visible):
 
 - **Accepting at model write**: a condition with type errors (a
   parse-clean expression misusing its parameters) is accepted at
@@ -141,13 +144,13 @@ measurements M15/M30/M31; none corpus-visible):
   computed relation is undefined on every linked type is stored
   rather than refused (resolution answers false, the measured
   semantic). Upstream's model size limit is also not reproduced
-  (corpus-invisible, M14). These accepting-direction divergences
+  (corpus-invisible). These accepting-direction divergences
   concern which *models* are storable, never which authorization
   answers are given.
 - **Inherited from cel4postgres**: `matches()` runs on POSIX ARE
   rather than RE2; strings cannot contain U+0000 (a Postgres
   substrate limit); plus its measured divergence list.
-- **Sibling-object condition errors (M42, not pinnable)**:
+- **Sibling-object condition errors (not pinnable)**:
   upstream's user-first iteration can surface a 2000 condition
   error from a conditioned tuple on an object structurally
   outside the query (measured on the market fixture), and does

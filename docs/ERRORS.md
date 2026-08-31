@@ -1,7 +1,7 @@
 # Error scheme
 
-Frozen in plan phase 0. Changing an allocation after code raises it
-is a breaking change to consumers who catch these codes.
+Frozen. Changing an allocation after code raises it is a breaking
+change to consumers who catch these codes.
 
 ## The SQLSTATE class
 

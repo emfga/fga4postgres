@@ -47,10 +47,9 @@ condition icond(x: int) {
 }
 `
 
-// The write/delete refusal matrix (plan phase 6, measurements
-// M35/M39/M25): every rule asserted differentially — the same
-// request against both engines must refuse with the same code
-// (or succeed on both).
+// The write/delete refusal matrix, every rule asserted
+// differentially — the same request against both engines must
+// refuse with the same code (or succeed on both).
 func TestWriteGateMatrix(t *testing.T) {
 	ctx := context.Background()
 
@@ -187,7 +186,7 @@ func TestWriteGateMatrix(t *testing.T) {
 	}
 }
 
-// on_duplicate semantics (M35): ignore tolerates the identical
+// on_duplicate semantics: ignore tolerates the identical
 // row; a same-key row with a different condition aborts (gRPC
 // 10) even under ignore; the plain duplicate stays 2017.
 func TestWriteOnDuplicate(t *testing.T) {
@@ -387,8 +386,8 @@ func TestReadDifferential(t *testing.T) {
 	}
 }
 
-// The CONFIG-* model validation matrix (measurements M16),
-// asserted differentially: raw protos so the DSL parser cannot
+// The CONFIG-* model validation matrix, asserted
+// differentially: raw protos so the DSL parser cannot
 // pre-empt either server. Every rule must refuse with the same
 // code on both engines (2056 from validation, 3 from the proto
 // shape).

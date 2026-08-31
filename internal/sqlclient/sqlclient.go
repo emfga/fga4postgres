@@ -3,25 +3,19 @@
 // conformance corpora drive the engine exactly as they drive the
 // reference server.
 //
-// The adapter owns three translations (workspace decision 5):
+// The adapter owns three translations:
 // proto to the engine's jsonb request shapes (snake_case
 // protojson), engine SQLSTATEs back to the gRPC codes upstream
 // carries, and the deterministic uuid-mapping of corpus string ids
 // into the engine's uuid-only id domain. It also mirrors the
 // server's proto-shape validation (generated protovalidate
 // methods) so shape errors surface as gRPC InvalidArgument exact
-// as they do at the oracle (measurements.md M10 step 1).
-//
-// Methods land on the plan's phase schedule; a method whose engine
-// surface does not exist yet returns a typed Unimplemented error
-// naming its phase, which the skip machinery turns into a printed
-// skip rather than a silent absence.
+// as they do at the oracle (measured request-validation order).
 package sqlclient
 
 import (
 	"context"
 	"errors"
-	"fmt"
 	"io"
 	"strings"
 	"time"
@@ -177,12 +171,6 @@ func (c *Client) mapTuple(
 	out.Object = c.mapObject(out.GetObject())
 	out.User = c.mapUser(out.GetUser())
 	return out
-}
-
-func unimplemented(method, phase string) error {
-	return status.Error(codes.Unimplemented, fmt.Sprintf(
-		"fga4postgres: %s arrives in plan %s", method, phase,
-	))
 }
 
 func (c *Client) CreateStore(
@@ -541,8 +529,8 @@ func (c *Client) ListUsers(
 // client-stream shape the upstream runners consume. Like the real
 // server, errors surface on the first Recv, not on the call
 // itself. One deliberate divergence carried over from the unary
-// path (plan §1.5): a condition evaluation error always fails the
-// stream, where upstream may have streamed partial results first.
+// path: a condition evaluation error always fails the stream,
+// where upstream may have streamed partial results first.
 func (c *Client) StreamedListObjects(
 	ctx context.Context,
 	in *openfgav1.StreamedListObjectsRequest,

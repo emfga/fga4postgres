@@ -11,12 +11,12 @@ import (
 	"github.com/emfga/fga4postgres/internal/oracle"
 )
 
-// M21: the deep-chain envelope for list_objects. tsfga measured
-// (at v1.18.2) that upstream reverse expansion returns all 41
-// objects of a 40-hop chain where forward-checking returns 25;
+// The deep-chain envelope for list_objects. tsfga measured (at
+// v1.18.2) that upstream reverse expansion returns all 41 objects
+// of a 40-hop chain where forward-checking returns 25;
 // re-measured here at the pin, for both the userset-chain and
 // TTU-chain shapes.
-func TestProbeM21DeepChainEnvelope(t *testing.T) {
+func TestProbeDeepChainEnvelope(t *testing.T) {
 	client := oracle.Client(t)
 	ctx := context.Background()
 
@@ -82,8 +82,8 @@ func TestProbeM21DeepChainEnvelope(t *testing.T) {
 	}
 }
 
-// M10b: list_objects request validation order.
-func TestProbeM10bListObjectsValidationOrder(t *testing.T) {
+// list_objects request validation order.
+func TestProbeListObjectsValidationOrder(t *testing.T) {
 	client := oracle.Client(t)
 	ctx := context.Background()
 	store, model := setup(t, client, plainDSL, nil)
@@ -133,7 +133,7 @@ type node
     define y: [user, node#x]
 `
 
-func TestProbeM21AlternatingChain(t *testing.T) {
+func TestProbeAlternatingChain(t *testing.T) {
 	client := oracle.Client(t)
 	ctx := context.Background()
 	tuples := []*openfgav1.TupleKey{
@@ -169,7 +169,7 @@ func TestProbeM21AlternatingChain(t *testing.T) {
 	t.Logf("OBSERVED: alt chain check n40: %v", r)
 }
 
-// Group F: the 1000-result cap, both engines.
+// The 1000-result cap, both engines.
 func TestProbeListObjectsResultCap(t *testing.T) {
 	ctx := context.Background()
 	for _, sd := range bothSides(t, "lo-cap") {

@@ -32,7 +32,7 @@ func TestCorpusInventory(t *testing.T) {
 				feat.ListUsers
 		}
 	}
-	// Counted at openfga v1.19.0 (workspace doc 06).
+	// Counted at openfga v1.19.0.
 	if tests != 161 || stages != 188 || assertions != 1227 {
 		t.Fatalf(
 			"corpus inventory drifted: %d tests, %d stages, "+
@@ -64,9 +64,6 @@ func corpusCases(
 					if n == 0 {
 						skiplist.Skip(t,
 							"no "+kind+" assertions in this case")
-					}
-					if r := skipReason(kind, feat); r != "" {
-						skiplist.Skip(t, r)
 					}
 					run(t, f.Name, tc)
 				})

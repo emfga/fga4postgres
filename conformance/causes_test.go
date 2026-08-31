@@ -8,8 +8,8 @@ import (
 	"github.com/emfga/fga4postgres/internal/causes"
 )
 
-// The causes-inventory gate (workspace doc 05 §4, ported from
-// tsfga): every error construction site in upstream's write-path
+// The causes-inventory gate (a CI shape ported from tsfga):
+// every error construction site in upstream's write-path
 // files at the pinned version must carry a human attribution in
 // docs/write-causes.json. A pin bump, an upstream reword, or a
 // new cause turns this red until `go run ./internal/cmd/causegen`

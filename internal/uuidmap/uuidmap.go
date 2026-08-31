@@ -2,7 +2,7 @@
 // (nearly arbitrary strings like "anne") into the engine's
 // uuid-only id domain, and back.
 //
-// The rules (plan §2.3):
+// The rules:
 //
 //   - a well-formed id maps through uuidv5 over one per-suite
 //     namespace, so the mapping is total, deterministic across

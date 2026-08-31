@@ -25,8 +25,7 @@ func TestEngineVersion(t *testing.T) {
 	}
 }
 
-// CreateStore/DeleteStore round-trip through the sqlclient — the
-// one live method of plan phase 0.
+// CreateStore/DeleteStore round-trip through the sqlclient.
 func TestEngineStoreRoundTrip(t *testing.T) {
 	ctx := context.Background()
 	client := sqlclient.New(testdb.Pool(t), nil)

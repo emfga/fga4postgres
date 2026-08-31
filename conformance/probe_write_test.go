@@ -14,8 +14,8 @@ import (
 	"github.com/emfga/fga4postgres/internal/oracle"
 )
 
-// M35 — write cap, duplicates, on_duplicate/on_missing.
-func TestProbeM35WriteSemantics(t *testing.T) {
+// Write cap, duplicates, on_duplicate/on_missing.
+func TestProbeWriteSemantics(t *testing.T) {
 	client := oracle.Client(t)
 	ctx := context.Background()
 
@@ -136,10 +136,10 @@ condition xcond(x: int) {
 		code, msg)
 }
 
-// M39 — the remaining tuple-write gate rules: implicit tuples,
+// The remaining tuple-write gate rules: implicit tuples,
 // wildcard shapes, condition context parameter checks, control
 // characters.
-func TestProbeM39WriteGates(t *testing.T) {
+func TestProbeWriteGates(t *testing.T) {
 	client := oracle.Client(t)
 	ctx := context.Background()
 
@@ -224,8 +224,8 @@ condition icond(x: int) {
 	try("condition name forbidden chars", dirty)
 }
 
-// M25 — tuple field length limits at write time.
-func TestProbeM25FieldLengths(t *testing.T) {
+// Tuple field length limits at write time.
+func TestProbeFieldLengths(t *testing.T) {
 	client := oracle.Client(t)
 	ctx := context.Background()
 
@@ -268,9 +268,9 @@ type doc
 		strings.Repeat("r", 51), "user:anne")
 }
 
-// M26/M27/M28 — Read filter rules, token/filter mismatch, page
+// Read filter rules, token/filter mismatch, page
 // size.
-func TestProbeM26To28Read(t *testing.T) {
+func TestProbeRead(t *testing.T) {
 	client := oracle.Client(t)
 	ctx := context.Background()
 
@@ -345,8 +345,8 @@ type doc
 	read("page_size 0 default", nil, 0, "")
 }
 
-// M29 — condition context byte limit at tuple write.
-func TestProbeM29ContextLimit(t *testing.T) {
+// Condition context byte limit at tuple write.
+func TestProbeContextLimit(t *testing.T) {
 	client := oracle.Client(t)
 	ctx := context.Background()
 
@@ -401,9 +401,9 @@ condition strcond(s: string) {
 	}
 }
 
-// M16 — model-write refusal codes for the CONFIG-* rules, sent as
+// Model-write refusal codes for the CONFIG-* rules, sent as
 // raw protos so the DSL parser cannot pre-empt the server.
-func TestProbeM16ModelValidation(t *testing.T) {
+func TestProbeModelValidation(t *testing.T) {
 	client := oracle.Client(t)
 	ctx := context.Background()
 
@@ -680,10 +680,10 @@ func wrapInt32(v int32) *wrapperspb.Int32Value {
 // may grow here.
 var _ = parser.TransformDSLToProto
 
-// M40 — condition evaluation laziness in check and list_objects:
+// Condition evaluation laziness in check and list_objects:
 // is a conditioned tuple's condition evaluated when the branch it
 // gates cannot grant anyway?
-func TestProbeM40LazyConditions(t *testing.T) {
+func TestProbeLazyConditions(t *testing.T) {
 	client := oracle.Client(t)
 	ctx := context.Background()
 
@@ -779,10 +779,10 @@ condition ncond(now: timestamp, expires_at: timestamp) {
 	}
 }
 
-// M40b — sibling mix: one clean (false) row beside one
+// Sibling mix: one clean (false) row beside one
 // condition-errored row, exactly the shape the saas fixture
 // exposed.
-func TestProbeM40SiblingMix(t *testing.T) {
+func TestProbeSiblingMix(t *testing.T) {
 	client := oracle.Client(t)
 	ctx := context.Background()
 

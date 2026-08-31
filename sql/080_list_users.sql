@@ -1,8 +1,9 @@
 -- list_users: forward recursive expansion from object#relation,
 -- collecting every user matching the single filter.
 --
--- Measured contract (measurements.md M17/M18/M23/M24, probe
--- TestProbeM17To24ListUsers, corpus differentials):
+-- Measured contract (against the pinned oracle; re-verified by
+-- conformance/probe_listusers_test.go and the corpus
+-- differentials):
 --   - exactly one user filter (arity is proto-enforced; the
 --     adapter's generated validators reproduce it);
 --   - EVERY expansion node whose (type, relation) matches a

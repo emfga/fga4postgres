@@ -1,6 +1,6 @@
--- Consumer privilege template (workspace decision 8, design doc
--- 13): two conventional NOLOGIN group roles the consumer grants
--- to their actual users.
+-- Consumer privilege template: two conventional NOLOGIN group
+-- roles the consumer grants to their actual users (see
+-- docs/INSTALL.md, "Consumer privileges").
 --
 --   CREATE ROLE fga_reader NOLOGIN;
 --   CREATE ROLE fga_writer NOLOGIN;
@@ -30,7 +30,7 @@ BEGIN
 
   -- Query entry points, plus every internal helper they reach
   -- (the privilege boundary is table DML, which honest
-  -- volatility labels already separate — CLAUDE.md decision 9).
+  -- volatility labels already separate).
   GRANT EXECUTE ON FUNCTION
     fga.check(uuid, jsonb),
     fga.batch_check(uuid, jsonb),

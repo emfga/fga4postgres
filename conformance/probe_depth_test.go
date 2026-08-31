@@ -7,9 +7,9 @@ import (
 	openfgav1 "github.com/openfga/api/proto/openfga/v1"
 )
 
-// M02/M03: does any fast-path resolver shape change the depth
-// boundary measured in M01 (first 2002 at 26 dispatches)? Probed
-// on the two remaining recursion shapes: a TTU parent chain and a
+// Does any fast-path resolver shape change the measured depth
+// boundary (first 2002 at 26 dispatches)? Probed on the two
+// remaining recursion shapes: a TTU parent chain and a
 // self-recursive TTU.
 const ttuChainDSL = `model
   schema 1.1
@@ -20,7 +20,7 @@ type folder
     define viewer: [user] or viewer from parent
 `
 
-func TestProbeM02TTUChainBoundary(t *testing.T) {
+func TestProbeTTUChainBoundary(t *testing.T) {
 	tuples := []*openfgav1.TupleKey{
 		tk("folder:f0", "viewer", "user:anne"),
 	}
@@ -29,7 +29,7 @@ func TestProbeM02TTUChainBoundary(t *testing.T) {
 			fmt.Sprintf("folder:f%d", i), "parent",
 			fmt.Sprintf("folder:f%d", i-1)))
 	}
-	for _, side := range bothSides(t, "M02-ttu") {
+	for _, side := range bothSides(t, "ttu-chain") {
 		store, model := setup(t, side.client, ttuChainDSL, tuples)
 		boundary := -1
 		for n := 20; n <= 30; n++ {
@@ -56,7 +56,7 @@ func TestProbeM02TTUChainBoundary(t *testing.T) {
 // Wide-but-shallow weight-2 shape for the same question from the
 // other side: a single userset level fanned out never charges more
 // than two levels, so it must never hit the budget.
-func TestProbeM02Weight2Wide(t *testing.T) {
+func TestProbeWeight2Wide(t *testing.T) {
 	var tuples []*openfgav1.TupleKey
 	for i := 0; i < 200; i++ {
 		g := fmt.Sprintf("group:g%d", i)
@@ -66,7 +66,7 @@ func TestProbeM02Weight2Wide(t *testing.T) {
 	}
 	tuples = append(tuples,
 		tk("group:g199", "member", "user:anne"))
-	for _, side := range bothSides(t, "M02-wide") {
+	for _, side := range bothSides(t, "wide-fanout") {
 		store, model := setup(t, side.client, depthDSL, tuples)
 		r := doCheck(t, side.client, store, model,
 			"doc:1", "deep", "user:anne", nil, nil)

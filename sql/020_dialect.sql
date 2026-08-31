@@ -1,5 +1,5 @@
--- The OpenFGA CEL dialect, as a cel4postgres extension
--- (CLAUDE.md decision 4): the `ipaddress` opaque type with its
+-- The OpenFGA CEL dialect, as a cel4postgres extension:
+-- the `ipaddress` opaque type with its
 -- constructor and `in_cidr`, registered through the cel registry
 -- tables exactly as cel4postgres's own extensions register —
 -- never a fork. Conditions evaluate under the 'openfga' env,
@@ -7,13 +7,14 @@
 --
 -- Also here: the typed-parameter conversion layer implementing
 -- upstream's converter grammar for declared condition parameters
--- (doc 04 §7), and the condition evaluator the read paths call.
--- Context merge precedence is measured (measurements.md M07):
--- the tuple's condition context wins over the request context per
--- key; a parameter absent from the merged context only errors if
--- the expression actually references it — which matches
--- upstream's partial-evaluation behaviour without needing UNKNOWN
--- support (M30).
+-- (internal/condition/types at the pin), and the condition
+-- evaluator the read paths call. Context merge precedence is
+-- measured against the pinned oracle (re-verified by
+-- conformance/probe_conditions_test.go): the tuple's condition
+-- context wins over the request context per key; a parameter
+-- absent from the merged context only errors if the expression
+-- actually references it — which matches upstream's
+-- partial-evaluation behaviour without needing UNKNOWN support.
 
 BEGIN;
 
@@ -142,7 +143,7 @@ END;
 $$;
 
 -- One declared parameter's conversion (upstream's converter
--- grammar, doc 04 §7): numbers parse with integral checks for
+-- grammar): numbers parse with integral checks for
 -- int/uint, strings parse for numerics, timestamps and durations
 -- are string-only, ipaddress goes through the strict parser.
 -- Refusals raise in the YF class; the evaluator catches them into
@@ -304,7 +305,8 @@ $$;
 -- Evaluates one named condition under merged context. Never
 -- raises: the caller decides what a condition error means at its
 -- read site (held per read, dropped if a sibling row grants —
--- measurements M07, doc 05 trap 6).
+-- the measured scoping, re-verified by
+-- conformance/probe_conditions_test.go).
 CREATE OR REPLACE FUNCTION fga._eval_condition(
   store_id uuid,
   model_id uuid,
@@ -335,7 +337,7 @@ BEGIN
     RETURN;
   END IF;
 
-  -- Tuple context wins over request context per key (M07).
+  -- Tuple context wins over request context per key (measured).
   merged := coalesce(req_ctx, '{}'::jsonb)
          || coalesce(tuple_ctx, '{}'::jsonb);
 

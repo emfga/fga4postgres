@@ -29,7 +29,7 @@ CREATE TABLE IF NOT EXISTS fga.tuple (
          OR subject_relation = '')
 );
 
--- Read pagination and (future) changelog ordering (decision 8).
+-- Read pagination and (future) changelog ordering.
 CREATE UNIQUE INDEX IF NOT EXISTS tuple_ulid_idx
   ON fga.tuple (store, ulid);
 
@@ -40,7 +40,7 @@ CREATE INDEX IF NOT EXISTS tuple_reverse_idx
                 relation, object_type, object_id);
 
 -- The composite shape shared by stored rows and the contextual-
--- tuple overlay, so one read path serves both (plan §1.4).
+-- tuple overlay, so one read path serves both.
 DO $$
 BEGIN
   CREATE TYPE fga._tuple_key AS (
@@ -59,10 +59,10 @@ END;
 $$;
 
 -- ULID per tuple: 48-bit millisecond timestamp + 80 random bits,
--- Crockford base32. Entropy from random() only — core Postgres, no
--- pgcrypto (CLAUDE.md decision 7). Uniqueness is enforced by the
--- index; within one millisecond ordering is arbitrary, like
--- upstream's ULIDs.
+-- Crockford base32. Entropy from random() only — core Postgres,
+-- no pgcrypto, so the install stays dependency-free. Uniqueness
+-- is enforced by the index; within one millisecond ordering is
+-- arbitrary, like upstream's ULIDs.
 CREATE OR REPLACE FUNCTION fga._ulid()
 RETURNS text
 LANGUAGE plpgsql
@@ -157,14 +157,16 @@ $$;
 -- error code: YF127 when the tuple is contextual, the write
 -- family when it is being written. Returns the parsed ids.
 --
--- Deliberately not yet here (plan phase 6): the tupleset
--- direct-only rule and field length limits.
+-- Deliberately not here: the tupleset direct-only rule (enforced
+-- at model write in fga._validate_model) and the proto
+-- field-length limits (an API-boundary refusal, mirrored by the
+-- Go adapter's request validation).
 -- errcode covers structural refusals (bad form, unknown type or
 -- relation, facet mismatch); cond_errcode covers condition-layer
 -- refusals (undefined condition, condition-binding mismatch). The
 -- split is measured: check wraps both as invalid_tuple, while
 -- list_objects reports the condition layer as validation_error
--- (measurements M38).
+-- (re-verified by conformance/probe_condbind_test.go).
 CREATE OR REPLACE FUNCTION fga._validate_tuple(
   store_id uuid,
   model_id uuid,
@@ -256,8 +258,8 @@ BEGIN
 
   -- The type-restriction write gate: facet match INCLUDING the
   -- condition binding — an unconditioned tuple needs an
-  -- unconditioned restriction and vice versa (trap 5's
-  -- admissibility, applied before any condition evaluates).
+  -- unconditioned restriction and vice versa (admissibility,
+  -- applied before any condition evaluates).
   IF NOT EXISTS (
     SELECT FROM fga.model_type_restriction tr
     WHERE tr.store = store_id AND tr.model_id = _validate_tuple.model_id
@@ -327,7 +329,8 @@ $$;
 
 -- Control-character scan over a condition context: keys and
 -- string values at any depth (a tab counts) refuse before
--- anything else looks at the context — measured ordering, M39.
+-- anything else looks at the context — the measured ordering
+-- (conformance/probe_write_test.go).
 CREATE OR REPLACE FUNCTION fga._ctx_scan(ctx jsonb)
 RETURNS void
 LANGUAGE plpgsql
@@ -364,7 +367,8 @@ BEGIN
 END;
 $$;
 
--- Write-time condition-context gates (M29/M39): control chars,
+-- Write-time condition-context gates (measured;
+-- conformance/probe_write_test.go): control chars,
 -- the 32KiB jsonb-text boundary (pinned different-boundary
 -- against upstream's 32768 proto bytes), undeclared parameters,
 -- and declared-type coercibility. Write only — checks accept
@@ -426,11 +430,12 @@ BEGIN
 END;
 $$;
 
--- The single tuple write path (CLAUDE.md decision 8: every
--- mutation goes through here, so a changelog is addable without
--- rework). Request is upstream's WriteRequest JSON shape,
+-- The single tuple write path: every mutation goes through here,
+-- so a changelog is addable without rework.
+-- Request is upstream's WriteRequest JSON shape,
 -- including writes.on_duplicate / deletes.on_missing (measured
--- M35): "ignore" tolerates the identical duplicate and the
+-- against the pinned oracle): "ignore" tolerates the identical
+-- duplicate and the
 -- missing delete, but a same-key row holding a DIFFERENT
 -- condition aborts (gRPC 10) even under ignore.
 CREATE OR REPLACE FUNCTION fga.write(
@@ -486,8 +491,8 @@ BEGIN
   END IF;
 
   -- Request-level dedup across BOTH lists, before any row lands
-  -- (measured M35: the same key twice in writes, or once in
-  -- writes and once in deletes, refuses as 2004).
+  -- (measured: the same key twice in writes, or once in writes
+  -- and once in deletes, refuses as 2004).
   FOR tkj IN
     SELECT * FROM jsonb_array_elements(writes)
     UNION ALL
@@ -513,8 +518,8 @@ BEGIN
       'YF100', 'YF100');
 
     -- Implicit tuples are a write-only refusal — the same shape
-    -- is accepted contextually (measured M39; pinned both halves
-    -- in tsfga's inventory).
+    -- is accepted contextually (measured; both halves asserted
+    -- in conformance/gates_test.go).
     IF v.subject_type = v.object_type
        AND v.subject_id = v.object_id
        AND v.subject_relation = v.relation THEN
@@ -584,8 +589,7 @@ BEGIN
   END LOOP;
 
   -- Deletes are validated syntactically only — never against the
-  -- model — so rows stranded by a model change stay deletable
-  -- (plan §1.8).
+  -- model — so rows stranded by a model change stay deletable.
   FOR tkj IN SELECT * FROM jsonb_array_elements(deletes) LOOP
     SELECT o.object_type, fga._uuid_or_null(o.id_text) AS oid,
            s.subject_type,
@@ -620,11 +624,11 @@ BEGIN
 END;
 $$;
 
--- Filtered tuple listing with keyset pagination (plan §1.8):
+-- Filtered tuple listing with keyset pagination:
 -- deliberately UNFILTERED by the model — the maintenance escape
 -- hatch that can see rows a model change stranded. The token is
 -- bound to its filter (upstream's positional token silently
--- misaligns under a changed filter — measured M27; refusing
+-- misaligns under a changed filter — measured; refusing
 -- here) and pages by ulid keyset, so a page boundary never
 -- loses or repeats a row.
 CREATE OR REPLACE FUNCTION fga.read(
@@ -666,7 +670,7 @@ BEGIN
   END IF;
 
   IF tkey IS NOT NULL AND tkey <> '{}'::jsonb THEN
-    -- Measured filter rule (M26): object TYPE is required, and
+    -- Measured filter rule: object TYPE is required, and
     -- object id or user must be present.
     SELECT * INTO o FROM fga._parse_object(
       coalesce(tkey ->> 'object', ''));
@@ -800,10 +804,7 @@ AS $$
     'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"');
 $$;
 
--- Overlay reads (plan §1.4). With conditions out of play until
--- phase 4, replace-vs-concatenate semantics collapse to plain
--- existence/union; the composite-array shape is what phase 4
--- extends.
+-- Overlay reads: how contextual tuples combine with stored rows.
 --
 -- Stored rows are filtered against the request's model
 -- (upstream's FilterInvalidTuples): a tuple written under an
@@ -813,7 +814,7 @@ $$;
 -- very model at request time.
 
 -- Exact-key read: contextual rows REPLACE the stored row when any
--- match (measured, M07); each returned row carries its condition
+-- match (measured); each returned row carries its condition
 -- for the caller to evaluate. Stored rows must be valid under the
 -- model including the condition binding of their facet.
 CREATE OR REPLACE FUNCTION fga._read_exact(
@@ -858,7 +859,7 @@ AS $$
 $$;
 
 -- Iterator read: contextual and stored rows CONCATENATE, no dedup
--- (measured, M07). Condition columns ride along for per-row
+-- (measured). Condition columns ride along for per-row
 -- evaluation at the call site.
 CREATE OR REPLACE FUNCTION fga._read_usersets(
   store_id uuid, model_id uuid,

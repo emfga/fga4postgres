@@ -20,10 +20,10 @@ condition isOk(ok: bool) {
   ok
 }`
 
-// M38: the error code for a contextual tuple whose only fault is
+// The error code for a contextual tuple whose only fault is
 // the condition binding (facet exists unconditioned, tuple carries
 // a condition — and the reverse).
-func TestProbeM38ConditionBindingCode(t *testing.T) {
+func TestProbeConditionBindingCode(t *testing.T) {
 	client := oracle.Client(t)
 	ctx := context.Background()
 	store, model := setup(t, client, condBindDSL, nil)

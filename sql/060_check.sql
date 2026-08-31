@@ -1,35 +1,36 @@
 -- The check resolver.
 --
--- Semantics are measured, not intuited: every load-bearing rule
--- here cites a CLOSED measurements.md entry (workspace v1-design).
+-- Semantics are measured against the pinned oracle, not intuited;
+-- the probes in conformance/probe_*_test.go re-verify every rule
+-- below on each run.
 --
---   M01: depth is charged only on dispatch to another object
---        (userset expansion, TTU). Computed usersets and set
---        operands cost nothing. 25 dispatches succeed; the 26th
---        raises too-complex (YF102) — never a plain false.
---   M01: a false sibling swallows an operand error in union and
---        intersection; a true sibling never does. Implemented as
---        deferred re-raise: operand errors of our own class are
---        caught per child (class catch 'YF000', never OTHERS) and
---        re-raised only if no sibling produced the swallowing
---        answer.
---   M04: a cycle is a tracked outcome (allowed=false,
+--   Depth: charged only on dispatch to another object (userset
+--        expansion, TTU). Computed usersets and set operands cost
+--        nothing. 25 dispatches succeed; the 26th raises
+--        too-complex (YF102) — never a plain false.
+--   Error swallowing: a false sibling swallows an operand error
+--        in union and intersection; a true sibling never does.
+--        Implemented as deferred re-raise: operand errors of our
+--        own class are caught per child (class catch 'YF000',
+--        never OTHERS) and re-raised only if no sibling produced
+--        the swallowing answer.
+--   Cycles: a cycle is a tracked outcome (allowed=false,
 --        cycled=true) — except a cycle confined to one
 --        self-recursive relation, which resolves to a plain
---        false, decided by the visited-segment rule (workspace
---        decision 11).
---   M05: the reachability prune answers plain false.
---   M06: an undefined relation in the request errors (YF100); a
---        TTU parent whose type lacks the computed relation is
---        skipped.
---   M07: per-row conditions — the tuple's condition context wins
+--        false, decided by the visited-segment rule (in
+--        _check_node below).
+--   Pruning: the reachability prune answers plain false.
+--   Undefined relations: an undefined relation in the request
+--        errors (YF100); a TTU parent whose type lacks the
+--        computed relation is skipped.
+--   Conditions: per row — the tuple's condition context wins
 --        over the request context per key; admissibility (facet
 --        + condition binding) is checked by the read helpers
 --        BEFORE anything evaluates; a condition error is held per
---        read and dropped if any sibling grants (trap 6).
---   M10: request validation order: user form, subject type,
---        subject relation, object form, object type, request
---        relation; contextual tuples last, refused as YF127.
+--        read and dropped if any sibling grants.
+--   Validation order: user form, subject type, subject relation,
+--        object form, object type, request relation; contextual
+--        tuples last, refused as YF127.
 
 BEGIN;
 
@@ -79,7 +80,10 @@ DECLARE
   node_key text := ot || ':' || oid::text || '#' || rel;
   rw jsonb;
 BEGIN
-  -- Cycle handling per M04 / workspace decision 11.
+  -- Cycle handling: the visited-segment rule. A revisited node
+  -- is a plain false when the whole visited segment since the
+  -- first visit stayed on one self-recursive relation; any wider
+  -- loop is the tracked cycled outcome.
   IF node_key = ANY (visited) THEN
     IF (
       SELECT bool_and(split_part(v, ':', 1) = ot
@@ -107,7 +111,7 @@ BEGIN
       USING ERRCODE = 'YF100';
   END IF;
 
-  -- Precomputed PathExists prune (M05): plain false, no flag.
+  -- Precomputed PathExists prune: plain false, no flag.
   IF NOT EXISTS (
     SELECT FROM fga.model_reachable mr
     WHERE mr.store = store_id AND mr.model_id = _check_node.model_id
@@ -179,9 +183,9 @@ BEGIN
   END LOOP;
 
   -- Userset expansion: a union over dispatches, with the deferred
-  -- error re-raise of M01 and the dispatch-only depth charge.
+  -- error re-raise and the dispatch-only depth charge.
   -- Condition errors follow upstream's filtered-iterator rule
-  -- (M40, internal/iterator/filter.go at the pin): the held
+  -- (internal/iterator/filter.go at the pin): the held
   -- error is scoped per edge — per (subject type, subject
   -- relation) group — and dropped when ANY row of that group
   -- passes its condition filter, even if the passing row's
@@ -277,7 +281,7 @@ BEGIN
       st, sid, srel, s_wild, ctx, req_ctx, depth, visited);
 
   ELSIF rw ? 'computed_userset' THEN
-    -- Same object, other relation: no dispatch, no depth (M01).
+    -- Same object, other relation: no dispatch, no depth.
     RETURN fga._check_node(
       store_id, model_id,
       ot, oid, rw -> 'computed_userset' ->> 'relation',
@@ -311,7 +315,7 @@ BEGIN
   ELSIF rw ? 'intersection' THEN
     -- Model order; the first false-or-cycled operand decides and
     -- propagates its flag; a false sibling swallows an operand
-    -- error, a true one never does (M01, M11).
+    -- error, a true one never does.
     FOR child IN
       SELECT * FROM jsonb_array_elements(
         rw -> 'intersection' -> 'child')
@@ -364,7 +368,7 @@ $$;
 -- Exclusion, sequentially: a false-or-cycled base decides first, a
 -- true-or-cycled subtrahend refuses, and an operand error
 -- re-raises only when the other side did not produce the
--- swallowing answer (M01, M04).
+-- swallowing answer.
 CREATE OR REPLACE FUNCTION fga._check_difference(
   store_id uuid, model_id uuid,
   ot text, oid uuid, rel text,
@@ -426,7 +430,7 @@ $$;
 
 -- TTU: dispatch the computed relation on every linked parent. A
 -- parent whose type does not define the computed relation is
--- skipped — the one asymmetric undefined-relation case (M06).
+-- skipped — the one asymmetric undefined-relation case.
 -- Conditioned tupleset rows evaluate before dispatch.
 CREATE OR REPLACE FUNCTION fga._check_ttu(
   store_id uuid, model_id uuid,
@@ -457,8 +461,8 @@ DECLARE
   grp_valid boolean := false;
 BEGIN
   -- Condition errors on tupleset tuples follow the same
-  -- per-edge filtered-iterator rule as usersets (M40), grouped
-  -- by the parent's type.
+  -- per-edge filtered-iterator rule as usersets (see
+  -- _check_direct), grouped by the parent's type.
   FOR u IN
     SELECT * FROM fga._read_tupleset(
       store_id, model_id, ot, oid, tupleset_rel, ctx)
@@ -555,7 +559,7 @@ BEGIN
   mid := fga._resolve_model(
     store_id, request ->> 'authorization_model_id');
 
-  -- Request-key validation in the measured order (M10).
+  -- Request-key validation in the measured order.
   SELECT * INTO s FROM fga._parse_subject(user_s);
   IF NOT s.ok THEN
     RAISE EXCEPTION
@@ -634,7 +638,7 @@ BEGIN
   END IF;
 
   -- Contextual tuples: write-grade validation, refused as
-  -- invalid_tuple (M10 step 3).
+  -- invalid_tuple.
   FOR tkj IN
     SELECT * FROM jsonb_array_elements(coalesce(
       request -> 'contextual_tuples' -> 'tuple_keys',
@@ -661,7 +665,8 @@ BEGIN
 END;
 $$;
 
--- Batch check (measured contract, M34): at most 50 items and
+-- Batch check (measured contract; re-verified by
+-- conformance/probe_batch_test.go): at most 50 items and
 -- unique correlation ids are request-level refusals; an item's own
 -- validation failure is captured per item under its correlation
 -- id, never failing the batch. One SQL statement means one

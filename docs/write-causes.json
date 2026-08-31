@@ -24,7 +24,7 @@
       "file": "internal/condition/condition.go",
       "message": "expected a bool condition expression output, but got '%s'",
       "disposition": "pinned",
-      "note": "accepting-at-model-write divergence: no declared-variable type check; a non-bool condition refuses at evaluation instead (docs/CONFORMANCE.md, M15)"
+      "note": "accepting-at-model-write divergence: no declared-variable type check; a non-bool condition refuses at evaluation instead (docs/CONFORMANCE.md)"
     },
     {
       "file": "internal/condition/condition.go",
@@ -36,7 +36,7 @@
       "file": "internal/condition/condition.go",
       "message": "failed to convert condition output to bool: %w",
       "disposition": "pinned",
-      "note": "same accepting-at-model-write family: eval-time refusal, scoped per API (M07/M24)"
+      "note": "same accepting-at-model-write family: eval-time refusal, scoped per API"
     },
     {
       "file": "internal/condition/condition.go",
@@ -60,7 +60,7 @@
       "file": "internal/condition/condition.go",
       "message": "failed to evaluate condition expression: %w",
       "disposition": "claimed",
-      "note": "evaluation errors scoped per measured contract: check drops for a granting sibling, list_objects count-gates, list_users immediate (M07/M24)"
+      "note": "evaluation errors scoped per measured contract: check drops for a granting sibling, list_objects count-gates, list_users immediate"
     },
     {
       "file": "internal/condition/condition.go",
@@ -78,13 +78,13 @@
       "file": "internal/validation/validation.go",
       "message": "condition is missing",
       "disposition": "claimed",
-      "note": "condition-binding facet gate, M38 split (TestWriteGateMatrix: condition missing)"
+      "note": "condition-binding facet gate (TestWriteGateMatrix: condition missing)"
     },
     {
       "file": "internal/validation/validation.go",
       "message": "condition name contains forbidden characters",
       "disposition": "n/a",
-      "note": "the proto name regex refuses first at the API boundary (measured M39); unreachable through gRPC"
+      "note": "the proto name regex refuses first at the API boundary (measured); unreachable through gRPC"
     },
     {
       "file": "internal/validation/validation.go",
@@ -150,7 +150,7 @@
       "file": "internal/validation/validation.go",
       "message": "type '%s' does not exist in the authorization model",
       "disposition": "claimed",
-      "note": "type lookup in fga._validate_tuple; code per API surface (M10/M37)"
+      "note": "type lookup in fga._validate_tuple; code per API surface"
     },
     {
       "file": "internal/validation/validation.go",
@@ -186,13 +186,13 @@
       "file": "pkg/server/commands/write.go",
       "message": "cannot write a tuple that is implicit",
       "disposition": "claimed",
-      "note": "write-only implicit refusal (TestWriteGateMatrix); accepted contextually, both halves per tsfga's pin"
+      "note": "write-only implicit refusal (TestWriteGateMatrix); accepted contextually; both halves asserted in TestWriteGateMatrix"
     },
     {
       "file": "pkg/server/commands/write.go",
       "message": "condition context size limit exceeded: %d bytes exceeds %d bytes",
       "disposition": "pinned",
-      "note": "different-boundary: 32768 jsonb-normalized text bytes vs 32768 proto bytes (PIN-CTX-1, M29)"
+      "note": "different-boundary: 32768 jsonb-normalized text bytes vs 32768 proto bytes (PIN-CTX-1)"
     },
     {
       "file": "pkg/server/commands/write.go",
@@ -246,7 +246,7 @@
       "file": "pkg/typesystem/typesystem.go",
       "message": "%w: %s does not appear as a relation in any of the directly related user types %s",
       "disposition": "pinned",
-      "note": "accepting-at-model-write: the engine stores such models; a TTU whose computed relation is undefined on the linked type answers false at resolution (measured phase 1); docs/CONFORMANCE.md"
+      "note": "accepting-at-model-write: the engine stores such models; a TTU whose computed relation is undefined on the linked type answers false at resolution (measured); docs/CONFORMANCE.md"
     },
     {
       "file": "pkg/typesystem/typesystem.go",
@@ -270,7 +270,7 @@
       "file": "pkg/typesystem/typesystem.go",
       "message": "could not find node with label: %s",
       "disposition": "n/a",
-      "note": "weighted-graph internal invariant; no weight machinery here (workspace decision 12)"
+      "note": "weighted-graph internal invariant; no weight machinery here"
     },
     {
       "file": "pkg/typesystem/typesystem.go",
@@ -324,7 +324,7 @@
       "file": "pkg/typesystem/typesystem.go",
       "message": "weighted graph is nil",
       "disposition": "n/a",
-      "note": "weighted-graph internal; no weight machinery (decision 12)"
+      "note": "weighted-graph internal; no weight machinery"
     }
   ]
 }

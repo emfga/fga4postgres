@@ -13,7 +13,7 @@ import (
 	"github.com/emfga/fga4postgres/internal/uuidmap"
 )
 
-// The imported upstream runners (workspace decision 5): the exact
+// The imported upstream runners: the exact
 // test code that gates the reference server, pointed at the
 // engine through the sqlclient adapter. The compile-time
 // assertion keeps the adapter honest against the pinned

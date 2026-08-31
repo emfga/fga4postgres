@@ -2,7 +2,7 @@
 --
 -- A store exists so every conformance test can run in a fresh
 -- namespace and so one install can serve several callers. It is not
--- multi-tenancy machinery (CLAUDE.md scope).
+-- multi-tenancy machinery (deliberately out of scope).
 --
 -- Ids are uuidv7() -- time-ordered like upstream's ULIDs, so
 -- "latest" queries stay index-backed. PostgreSQL 18 is the version
@@ -32,10 +32,10 @@ AS $$
 $$;
 
 -- Deleting a missing store is a no-op, matching upstream's
--- idempotent DeleteStore (measurements.md M00).
+-- idempotent DeleteStore (measured against the pinned oracle).
 --
--- Dependent rows go by explicit deletes, not FK cascades
--- (workspace decision 10): the tuple insert path stays free of
+-- Dependent rows go by explicit deletes, not FK cascades: the
+-- tuple insert path stays free of
 -- FK-check overhead, at the price of naming every dependent table
 -- here. The tables live in later install files — fine, because
 -- PL/pgSQL resolves them at call time, after the full install.

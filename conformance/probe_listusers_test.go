@@ -27,9 +27,10 @@ func userToString(u *openfgav1.User) string {
 	return "?"
 }
 
-// M17/M18/M23/M24 + the list_users depth boundary: the measured
-// contract phase 5 is built to (plan §1.6).
-func TestProbeM17To24ListUsers(t *testing.T) {
+// The measured list_users contract: filter arity, reflexive
+// emission, wildcard algebra, condition-error scoping, and the
+// depth boundary.
+func TestProbeListUsers(t *testing.T) {
 	client := oracle.Client(t)
 	ctx := context.Background()
 
@@ -77,7 +78,7 @@ func TestProbeM17To24ListUsers(t *testing.T) {
 		return out, 0
 	}
 
-	// Arity (M17) + reflexive + wildcard shape (M18).
+	// Arity + reflexive + wildcard shape.
 	store, model := setup(t, client, depthDSL, []*openfgav1.TupleKey{
 		tk("doc:1", "direct", "user:anne"),
 		tk("doc:1", "deep", "group:g1#member"),
@@ -99,7 +100,7 @@ func TestProbeM17To24ListUsers(t *testing.T) {
 	t.Logf("OBSERVED: reflexive self userset: users=%v code=%d",
 		users, code)
 
-	// Wildcards (M18) and the exclusion dance (M23).
+	// Wildcards and the exclusion dance.
 	wDSL := `model
   schema 1.1
 type user
@@ -134,7 +135,7 @@ type doc
 			n, len(users), code)
 	}
 
-	// Condition-error scoping (M24): a conditioned tuple with a
+	// Condition-error scoping: a conditioned tuple with a
 	// missing referenced param.
 	s4, m4 := setup(t, client, condDSL, []*openfgav1.TupleKey{
 		condTuple(nil),
