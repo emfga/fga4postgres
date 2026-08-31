@@ -10,8 +10,21 @@ suite red and demands this file change in the same commit.
 
 ## Status
 
-The engine is mid-implementation (plan phase: list_objects
+The engine is mid-implementation (plan phase: conditions
 complete). Current verified surface:
+
+- Conditions/ABAC: the whole `abac_tests.yaml` corpus passes
+  differentially for check and list_objects, and upstream's own
+  imported test runners (`tests/check`, `tests/listobjects` at the
+  pin — the YAML replays plus the generated matrix corpora, ~3000
+  assertions) run green against the engine through the SQL
+  adapter, with only the list_users sub-asserts skipped until that
+  API lands. Conditions evaluate through cel4postgres under the
+  `openfga` env (the `ipaddress` type and `in_cidr` registered via
+  its registries); typed parameters convert per upstream's
+  grammar; the tuple's condition context wins over the request
+  context; a missing referenced parameter refuses before
+  evaluation exactly as measured.
 
 - `check` and `batch_check`: every non-condition case of the
   upstream YAML corpus (`consolidated_1_1_tests.yaml` +
@@ -28,9 +41,9 @@ complete). Current verified surface:
   no deadline machinery, and it is verified that no corpus case
   depends on upstream's partial-results-on-deadline behaviour
   (different-shape property, measurements M21/M22).
-- Conditions/ABAC, `list_users`, `expand`, and `read` are not
-  implemented yet; every affected corpus case is a generated,
-  printed skip (no silent scope reduction).
+- `list_users`, `expand`, and `read` are not implemented yet;
+  every affected corpus case is a generated, printed skip (no
+  silent scope reduction).
 
 ## Exclusions (out of v1 scope)
 
@@ -52,12 +65,25 @@ sides refuse, at different limits.
 | PIN-ID-3 | The nil uuid is the wildcard storage sentinel and refused as an id | refusing | TestPinnedIDDomain |
 | PIN-ID-4 | Store/model ids are uuidv7; upstream-shaped ULID ids are refused as not-found, and ids never transfer between engines | refusing | TestPinnedULIDModelID |
 
+Condition-layer divergences (measured or by construction,
+measurements M15/M30/M31; none corpus-visible):
+
+- **Accepting at model write**: a condition with type errors (a
+  parse-clean expression misusing its parameters) is accepted at
+  `write_authorization_model` and refused at evaluation instead —
+  cel4postgres's checker has no declared-variable support.
+  Upstream's CEL cost-limit-100 write refusal is likewise not
+  reproduced (no interpreter cost accounting); cel4postgres's
+  100KB expression cap still applies. These are the only known
+  accepting-direction capability divergences, and they concern
+  which *models* are storable, never which authorization answers
+  are given.
+- **Inherited from cel4postgres**: `matches()` runs on POSIX ARE
+  rather than RE2; strings cannot contain U+0000 (a Postgres
+  substrate limit); plus its measured divergence list.
+
 Planned pins that land with their phases: the 32KiB
-condition-context boundary (different-boundary, phase 4),
-cel4postgres's inherited CEL limits (`matches()` on POSIX ARE, no
-U+0000, phase 4), the CEL cost limit (refusing, phase 4),
-no-deadline/complete-results semantics (different-shape, phase 3),
-breadth-limit invisibility (phase 2 benchmarks).
+condition-context write boundary (different-boundary, phase 6).
 
 ## Product properties beyond upstream
 

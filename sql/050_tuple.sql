@@ -87,6 +87,28 @@ BEGIN
 END;
 $$;
 
+-- Internal helpers whose signatures evolve between releases are
+-- dropped by name first: CREATE OR REPLACE cannot change a return
+-- type, and a changed argument list would otherwise leave a stale
+-- overload behind. Public entry points keep stable signatures and
+-- never need this.
+DO $$
+DECLARE
+  f record;
+BEGIN
+  FOR f IN
+    SELECT p.oid::regprocedure AS sig
+    FROM pg_proc p
+    JOIN pg_namespace n ON n.oid = p.pronamespace
+    WHERE n.nspname = 'fga'
+      AND p.proname IN ('_read_exact', '_read_usersets',
+                        '_read_tupleset', '_validate_tuple')
+  LOOP
+    EXECUTE 'DROP FUNCTION ' || f.sig;
+  END LOOP;
+END;
+$$;
+
 -- String-form parsers. They only split and grammar-check; the
 -- uuid gate and model checks belong to the validators, which know
 -- which error code their context demands.
@@ -136,14 +158,22 @@ $$;
 -- family when it is being written. Returns the parsed ids.
 --
 -- Deliberately not yet here (plan phase 6): the tupleset
--- direct-only rule, condition/facet binding, field length limits.
+-- direct-only rule and field length limits.
+-- errcode covers structural refusals (bad form, unknown type or
+-- relation, facet mismatch); cond_errcode covers condition-layer
+-- refusals (undefined condition, condition-binding mismatch). The
+-- split is measured: check wraps both as invalid_tuple, while
+-- list_objects reports the condition layer as validation_error
+-- (measurements M38).
 CREATE OR REPLACE FUNCTION fga._validate_tuple(
   store_id uuid,
   model_id uuid,
   obj text,
   rel text,
   subj text,
-  errcode text
+  cond text,
+  errcode text,
+  cond_errcode text
 )
 RETURNS TABLE (object_type text, object_id uuid, relation text,
                subject_type text, subject_id uuid,
@@ -212,8 +242,22 @@ BEGIN
       USING ERRCODE = errcode;
   END IF;
 
-  -- The type-restriction write gate (facet match; condition
-  -- binding joins in phase 4).
+  -- A named condition must exist in the model.
+  IF coalesce(cond, '') <> '' AND NOT EXISTS (
+    SELECT FROM fga.model_condition c
+    WHERE c.store = store_id
+      AND c.model_id = _validate_tuple.model_id
+      AND c.name = cond
+  ) THEN
+    RAISE EXCEPTION
+      'invalid tuple ''%#%@%'': undefined condition ''%''',
+      obj, rel, subj, cond USING ERRCODE = cond_errcode;
+  END IF;
+
+  -- The type-restriction write gate: facet match INCLUDING the
+  -- condition binding — an unconditioned tuple needs an
+  -- unconditioned restriction and vice versa (trap 5's
+  -- admissibility, applied before any condition evaluates).
   IF NOT EXISTS (
     SELECT FROM fga.model_type_restriction tr
     WHERE tr.store = store_id AND tr.model_id = _validate_tuple.model_id
@@ -221,7 +265,30 @@ BEGIN
       AND tr.subject_type = s.subject_type
       AND tr.subject_relation = s.subject_relation
       AND tr.is_wildcard = s.is_wildcard
+      AND tr.condition_name = coalesce(cond, '')
   ) THEN
+    -- The facet may exist with a different condition binding —
+    -- that is the condition layer, not a structural refusal.
+    IF EXISTS (
+      SELECT FROM fga.model_type_restriction tr
+      WHERE tr.store = store_id
+        AND tr.model_id = _validate_tuple.model_id
+        AND tr.type_name = o.object_type
+        AND tr.relation_name = rel
+        AND tr.subject_type = s.subject_type
+        AND tr.subject_relation = s.subject_relation
+        AND tr.is_wildcard = s.is_wildcard
+    ) THEN
+      IF coalesce(cond, '') = '' THEN
+        RAISE EXCEPTION
+          'invalid tuple ''%#%@%'': condition is missing',
+          obj, rel, subj USING ERRCODE = cond_errcode;
+      END IF;
+      RAISE EXCEPTION
+        'invalid tuple ''%#%@%'': invalid condition for type '
+        'restriction', obj, rel, subj
+        USING ERRCODE = cond_errcode;
+    END IF;
     RAISE EXCEPTION
       'invalid tuple ''%#%@%'': type ''%'' is not an allowed type '
       'restriction for ''%#%''',
@@ -302,7 +369,8 @@ BEGIN
     SELECT * INTO v FROM fga._validate_tuple(
       store_id, model_id,
       tkj ->> 'object', tkj ->> 'relation', tkj ->> 'user',
-      'YF100');
+      tkj -> 'condition' ->> 'name',
+      'YF100', 'YF100');
     BEGIN
       INSERT INTO fga.tuple (store, object_type, object_id,
         relation, subject_type, subject_id, subject_relation,
@@ -368,30 +436,37 @@ $$;
 -- filter — they were already write-grade validated against this
 -- very model at request time.
 
+-- Exact-key read: contextual rows REPLACE the stored row when any
+-- match (measured, M07); each returned row carries its condition
+-- for the caller to evaluate. Stored rows must be valid under the
+-- model including the condition binding of their facet.
 CREATE OR REPLACE FUNCTION fga._read_exact(
   store_id uuid, model_id uuid,
   ot text, oid uuid, rel text,
   st text, sid uuid, srel text,
   ctx fga._tuple_key[]
 )
-RETURNS boolean
+RETURNS TABLE (condition_name text, condition_context jsonb)
 LANGUAGE sql
 STABLE PARALLEL SAFE
 SET search_path = fga, pg_temp
 AS $$
-  SELECT EXISTS (
-    SELECT FROM unnest(ctx) c
-    WHERE c.object_type = ot AND c.object_id = oid
-      AND c.relation = rel AND c.subject_type = st
-      AND c.subject_id = sid AND c.subject_relation = srel
-  ) OR (
-    EXISTS (
-      SELECT FROM fga.tuple t
-      WHERE t.store = store_id
-        AND t.object_type = ot AND t.object_id = oid
-        AND t.relation = rel AND t.subject_type = st
-        AND t.subject_id = sid AND t.subject_relation = srel
-    )
+  WITH c AS (
+    SELECT x.condition_name, x.condition_context
+    FROM unnest(ctx) x
+    WHERE x.object_type = ot AND x.object_id = oid
+      AND x.relation = rel AND x.subject_type = st
+      AND x.subject_id = sid AND x.subject_relation = srel
+  )
+  SELECT * FROM c
+  UNION ALL
+  SELECT t.condition_name, t.condition_context
+  FROM fga.tuple t
+  WHERE NOT EXISTS (SELECT FROM c)
+    AND t.store = store_id
+    AND t.object_type = ot AND t.object_id = oid
+    AND t.relation = rel AND t.subject_type = st
+    AND t.subject_id = sid AND t.subject_relation = srel
     AND EXISTS (
       SELECT FROM fga.model_type_restriction tr
       WHERE tr.store = store_id
@@ -402,27 +477,33 @@ AS $$
         AND tr.is_wildcard
               = (sid = '00000000-0000-0000-0000-000000000000'
                  AND srel = '')
-    )
-  );
+        AND tr.condition_name = coalesce(t.condition_name, '')
+    );
 $$;
 
+-- Iterator read: contextual and stored rows CONCATENATE, no dedup
+-- (measured, M07). Condition columns ride along for per-row
+-- evaluation at the call site.
 CREATE OR REPLACE FUNCTION fga._read_usersets(
   store_id uuid, model_id uuid,
   ot text, oid uuid, rel text,
   ctx fga._tuple_key[]
 )
 RETURNS TABLE (subject_type text, subject_id uuid,
-               subject_relation text)
+               subject_relation text,
+               condition_name text, condition_context jsonb)
 LANGUAGE sql
 STABLE PARALLEL SAFE
 SET search_path = fga, pg_temp
 AS $$
-  SELECT c.subject_type, c.subject_id, c.subject_relation
+  SELECT c.subject_type, c.subject_id, c.subject_relation,
+         c.condition_name, c.condition_context
   FROM unnest(ctx) c
   WHERE c.object_type = ot AND c.object_id = oid
     AND c.relation = rel AND c.subject_relation <> ''
   UNION ALL
-  SELECT t.subject_type, t.subject_id, t.subject_relation
+  SELECT t.subject_type, t.subject_id, t.subject_relation,
+         t.condition_name, t.condition_context
   FROM fga.tuple t
   WHERE t.store = store_id
     AND t.object_type = ot AND t.object_id = oid
@@ -435,6 +516,7 @@ AS $$
         AND tr.subject_type = t.subject_type
         AND tr.subject_relation = t.subject_relation
         AND NOT tr.is_wildcard
+        AND tr.condition_name = coalesce(t.condition_name, '')
     );
 $$;
 
@@ -447,18 +529,21 @@ CREATE OR REPLACE FUNCTION fga._read_tupleset(
   ot text, oid uuid, rel text,
   ctx fga._tuple_key[]
 )
-RETURNS TABLE (subject_type text, subject_id uuid)
+RETURNS TABLE (subject_type text, subject_id uuid,
+               condition_name text, condition_context jsonb)
 LANGUAGE sql
 STABLE PARALLEL SAFE
 SET search_path = fga, pg_temp
 AS $$
-  SELECT c.subject_type, c.subject_id
+  SELECT c.subject_type, c.subject_id,
+         c.condition_name, c.condition_context
   FROM unnest(ctx) c
   WHERE c.object_type = ot AND c.object_id = oid
     AND c.relation = rel AND c.subject_relation = ''
     AND c.subject_id <> '00000000-0000-0000-0000-000000000000'
   UNION ALL
-  SELECT t.subject_type, t.subject_id
+  SELECT t.subject_type, t.subject_id,
+         t.condition_name, t.condition_context
   FROM fga.tuple t
   WHERE t.store = store_id
     AND t.object_type = ot AND t.object_id = oid
@@ -472,6 +557,7 @@ AS $$
         AND tr.subject_type = t.subject_type
         AND tr.subject_relation = ''
         AND NOT tr.is_wildcard
+        AND tr.condition_name = coalesce(t.condition_name, '')
     );
 $$;
 

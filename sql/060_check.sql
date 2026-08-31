@@ -4,9 +4,9 @@
 -- here cites a CLOSED measurements.md entry (workspace v1-design).
 --
 --   M01: depth is charged only on dispatch to another object
---        (userset expansion; TTU later). Computed usersets and
---        set operands cost nothing. 25 dispatches succeed; the
---        26th raises too-complex (YF102) — never a plain false.
+--        (userset expansion, TTU). Computed usersets and set
+--        operands cost nothing. 25 dispatches succeed; the 26th
+--        raises too-complex (YF102) — never a plain false.
 --   M01: a false sibling swallows an operand error in union and
 --        intersection; a true sibling never does. Implemented as
 --        deferred re-raise: operand errors of our own class are
@@ -14,19 +14,22 @@
 --        re-raised only if no sibling produced the swallowing
 --        answer.
 --   M04: a cycle is a tracked outcome (allowed=false,
---        cycled=true), threaded through every operator.
---   M05: the reachability prune answers plain false,
---        indistinguishable from an empty traversal.
---   M06: an undefined relation in the request errors (YF100); one
---        reached through a TTU link is skipped (phase 1b).
+--        cycled=true) — except a cycle confined to one
+--        self-recursive relation, which resolves to a plain
+--        false, decided by the visited-segment rule (workspace
+--        decision 11).
+--   M05: the reachability prune answers plain false.
+--   M06: an undefined relation in the request errors (YF100); a
+--        TTU parent whose type lacks the computed relation is
+--        skipped.
+--   M07: per-row conditions — the tuple's condition context wins
+--        over the request context per key; admissibility (facet
+--        + condition binding) is checked by the read helpers
+--        BEFORE anything evaluates; a condition error is held per
+--        read and dropped if any sibling grants (trap 6).
 --   M10: request validation order: user form, subject type,
 --        subject relation, object form, object type, request
 --        relation; contextual tuples last, refused as YF127.
---
--- Phase 1a implements this/computed_userset/union; intersection,
--- difference and tuple_to_userset raise a non-YF internal error
--- until phase 1b, so hitting one is loudly a harness bug, never a
--- swallowed operand.
 
 BEGIN;
 
@@ -39,11 +42,31 @@ EXCEPTION WHEN duplicate_object THEN
 END;
 $$;
 
+-- Drop evolving internal signatures (see 050 for why).
+DO $$
+DECLARE
+  f record;
+BEGIN
+  FOR f IN
+    SELECT p.oid::regprocedure AS sig
+    FROM pg_proc p
+    JOIN pg_namespace n ON n.oid = p.pronamespace
+    WHERE n.nspname = 'fga'
+      AND p.proname IN ('_check_node', '_check_direct',
+                        '_check_rewrite', '_check_difference',
+                        '_check_ttu')
+  LOOP
+    EXECUTE 'DROP FUNCTION ' || f.sig;
+  END LOOP;
+END;
+$$;
+
 CREATE OR REPLACE FUNCTION fga._check_node(
   store_id uuid, model_id uuid,
   ot text, oid uuid, rel text,
   st text, sid uuid, srel text, s_wild boolean,
   ctx fga._tuple_key[],
+  req_ctx jsonb,
   depth integer,
   visited text[]
 )
@@ -56,13 +79,7 @@ DECLARE
   node_key text := ot || ':' || oid::text || '#' || rel;
   rw jsonb;
 BEGIN
-  -- Cycle handling is resolver-shape-dependent at the pin (M04):
-  -- a cycle that stays inside one self-recursive relation resolves
-  -- to a plain false (upstream's recursive fast path deduplicates
-  -- without a cycle flag); any cycle crossing relations or types
-  -- carries the flag, which exclusion and intersection then refuse
-  -- on. The cycle segment is everything visited since the first
-  -- occurrence of this node's key.
+  -- Cycle handling per M04 / workspace decision 11.
   IF node_key = ANY (visited) THEN
     IF (
       SELECT bool_and(split_part(v, ':', 1) = ot
@@ -104,7 +121,7 @@ BEGIN
 
   RETURN fga._check_rewrite(
     store_id, model_id, ot, oid, rel,
-    st, sid, srel, s_wild, ctx, depth,
+    st, sid, srel, s_wild, ctx, req_ctx, depth,
     visited || node_key, rw);
 END;
 $$;
@@ -114,6 +131,7 @@ CREATE OR REPLACE FUNCTION fga._check_direct(
   ot text, oid uuid, rel text,
   st text, sid uuid, srel text, s_wild boolean,
   ctx fga._tuple_key[],
+  req_ctx jsonb,
   depth integer,
   visited text[]
 )
@@ -123,34 +141,56 @@ STABLE PARALLEL SAFE
 SET search_path = fga, pg_temp
 AS $$
 DECLARE
+  row record;
   u record;
+  ev record;
   r fga._check_result;
   cyc boolean := false;
+  cond_err text;
   caught_state text;
   caught_msg text;
 BEGIN
-  -- Exact probe. A userset subject is compared, never expanded.
-  IF fga._read_exact(store_id, model_id, ot, oid, rel,
-       st, sid, srel, ctx)
-  THEN
-    RETURN (true, false);
-  END IF;
-
-  -- Wildcard probe, for plain object subjects only: a userset
-  -- subject is never wildcard-matched, and a wildcard subject
-  -- only matches literal wildcard tuples (the exact probe above).
-  IF srel = '' AND NOT s_wild AND fga._read_exact(
-       store_id, model_id, ot, oid, rel, st,
-       '00000000-0000-0000-0000-000000000000', '', ctx)
-  THEN
-    RETURN (true, false);
-  END IF;
+  -- Exact probe (a userset subject is compared, never expanded),
+  -- then the wildcard probe for plain object subjects. Rows carry
+  -- their conditions; admissibility was already applied by the
+  -- read (facet + condition binding).
+  FOR row IN
+    SELECT * FROM fga._read_exact(
+      store_id, model_id, ot, oid, rel, st, sid, srel, ctx)
+    UNION ALL
+    SELECT * FROM fga._read_exact(
+      store_id, model_id, ot, oid, rel, st,
+      '00000000-0000-0000-0000-000000000000', '', ctx)
+    WHERE srel = '' AND NOT s_wild
+  LOOP
+    IF coalesce(row.condition_name, '') = '' THEN
+      RETURN (true, false);
+    END IF;
+    SELECT * INTO ev FROM fga._eval_condition(
+      store_id, model_id, row.condition_name,
+      row.condition_context, req_ctx);
+    IF ev.met THEN
+      RETURN (true, false);
+    END IF;
+    cond_err := coalesce(cond_err, ev.err);
+  END LOOP;
 
   -- Userset expansion: a union over dispatches, with the deferred
   -- error re-raise of M01 and the dispatch-only depth charge.
   FOR u IN
-    SELECT * FROM fga._read_usersets(store_id, model_id, ot, oid, rel, ctx)
+    SELECT * FROM fga._read_usersets(
+      store_id, model_id, ot, oid, rel, ctx)
   LOOP
+    IF coalesce(u.condition_name, '') <> '' THEN
+      SELECT * INTO ev FROM fga._eval_condition(
+        store_id, model_id, u.condition_name,
+        u.condition_context, req_ctx);
+      IF ev.err IS NOT NULL THEN
+        cond_err := coalesce(cond_err, ev.err);
+        CONTINUE;
+      END IF;
+      CONTINUE WHEN NOT ev.met;
+    END IF;
     BEGIN
       IF depth >= 25 THEN
         RAISE EXCEPTION 'resolution too complex: depth exceeded'
@@ -159,7 +199,7 @@ BEGIN
       r := fga._check_node(
         store_id, model_id,
         u.subject_type, u.subject_id, u.subject_relation,
-        st, sid, srel, s_wild, ctx, depth + 1, visited);
+        st, sid, srel, s_wild, ctx, req_ctx, depth + 1, visited);
       IF r.allowed THEN
         RETURN (true, false);
       END IF;
@@ -171,6 +211,12 @@ BEGIN
     END;
   END LOOP;
 
+  -- Nothing granted: a held condition error surfaces first (it
+  -- was encountered first in read order), then a deferred
+  -- dispatch error.
+  IF cond_err IS NOT NULL THEN
+    RAISE EXCEPTION '%', cond_err USING ERRCODE = 'YF100';
+  END IF;
   IF caught_state IS NOT NULL THEN
     RAISE EXCEPTION '%', caught_msg USING ERRCODE = caught_state;
   END IF;
@@ -183,6 +229,7 @@ CREATE OR REPLACE FUNCTION fga._check_rewrite(
   ot text, oid uuid, rel text,
   st text, sid uuid, srel text, s_wild boolean,
   ctx fga._tuple_key[],
+  req_ctx jsonb,
   depth integer,
   visited text[],
   rw jsonb
@@ -202,14 +249,14 @@ BEGIN
   IF rw ? 'this' THEN
     RETURN fga._check_direct(
       store_id, model_id, ot, oid, rel,
-      st, sid, srel, s_wild, ctx, depth, visited);
+      st, sid, srel, s_wild, ctx, req_ctx, depth, visited);
 
   ELSIF rw ? 'computed_userset' THEN
     -- Same object, other relation: no dispatch, no depth (M01).
     RETURN fga._check_node(
       store_id, model_id,
       ot, oid, rw -> 'computed_userset' ->> 'relation',
-      st, sid, srel, s_wild, ctx, depth, visited);
+      st, sid, srel, s_wild, ctx, req_ctx, depth, visited);
 
   ELSIF rw ? 'union' THEN
     FOR child IN
@@ -218,7 +265,8 @@ BEGIN
       BEGIN
         r := fga._check_rewrite(
           store_id, model_id, ot, oid, rel,
-          st, sid, srel, s_wild, ctx, depth, visited, child);
+          st, sid, srel, s_wild, ctx, req_ctx, depth,
+          visited, child);
         IF r.allowed THEN
           RETURN (true, false);
         END IF;
@@ -246,7 +294,8 @@ BEGIN
       BEGIN
         r := fga._check_rewrite(
           store_id, model_id, ot, oid, rel,
-          st, sid, srel, s_wild, ctx, depth, visited, child);
+          st, sid, srel, s_wild, ctx, req_ctx, depth,
+          visited, child);
         IF NOT r.allowed OR r.cycled THEN
           RETURN (false, r.cycled);
         END IF;
@@ -265,14 +314,14 @@ BEGIN
   ELSIF rw ? 'difference' THEN
     RETURN fga._check_difference(
       store_id, model_id, ot, oid, rel,
-      st, sid, srel, s_wild, ctx, depth, visited,
+      st, sid, srel, s_wild, ctx, req_ctx, depth, visited,
       rw -> 'difference' -> 'base',
       rw -> 'difference' -> 'subtract');
 
   ELSIF rw ? 'tuple_to_userset' THEN
     RETURN fga._check_ttu(
       store_id, model_id, ot, oid, rel,
-      st, sid, srel, s_wild, ctx, depth, visited,
+      st, sid, srel, s_wild, ctx, req_ctx, depth, visited,
       rw -> 'tuple_to_userset' -> 'tupleset' ->> 'relation',
       rw -> 'tuple_to_userset' -> 'computed_userset'
          ->> 'relation');
@@ -296,6 +345,7 @@ CREATE OR REPLACE FUNCTION fga._check_difference(
   ot text, oid uuid, rel text,
   st text, sid uuid, srel text, s_wild boolean,
   ctx fga._tuple_key[],
+  req_ctx jsonb,
   depth integer,
   visited text[],
   base jsonb,
@@ -317,7 +367,7 @@ BEGIN
   BEGIN
     base_r := fga._check_rewrite(
       store_id, model_id, ot, oid, rel,
-      st, sid, srel, s_wild, ctx, depth, visited, base);
+      st, sid, srel, s_wild, ctx, req_ctx, depth, visited, base);
     IF NOT base_r.allowed OR base_r.cycled THEN
       RETURN (false, base_r.cycled);
     END IF;
@@ -329,7 +379,8 @@ BEGIN
   BEGIN
     sub_r := fga._check_rewrite(
       store_id, model_id, ot, oid, rel,
-      st, sid, srel, s_wild, ctx, depth, visited, subtract);
+      st, sid, srel, s_wild, ctx, req_ctx, depth, visited,
+      subtract);
     IF sub_r.allowed OR sub_r.cycled THEN
       RETURN (false, sub_r.cycled);
     END IF;
@@ -351,11 +402,13 @@ $$;
 -- TTU: dispatch the computed relation on every linked parent. A
 -- parent whose type does not define the computed relation is
 -- skipped — the one asymmetric undefined-relation case (M06).
+-- Conditioned tupleset rows evaluate before dispatch.
 CREATE OR REPLACE FUNCTION fga._check_ttu(
   store_id uuid, model_id uuid,
   ot text, oid uuid, rel text,
   st text, sid uuid, srel text, s_wild boolean,
   ctx fga._tuple_key[],
+  req_ctx jsonb,
   depth integer,
   visited text[],
   tupleset_rel text,
@@ -368,8 +421,10 @@ SET search_path = fga, pg_temp
 AS $$
 DECLARE
   u record;
+  ev record;
   r fga._check_result;
   cyc boolean := false;
+  cond_err text;
   caught_state text;
   caught_msg text;
 BEGIN
@@ -386,6 +441,16 @@ BEGIN
     ) THEN
       CONTINUE;
     END IF;
+    IF coalesce(u.condition_name, '') <> '' THEN
+      SELECT * INTO ev FROM fga._eval_condition(
+        store_id, model_id, u.condition_name,
+        u.condition_context, req_ctx);
+      IF ev.err IS NOT NULL THEN
+        cond_err := coalesce(cond_err, ev.err);
+        CONTINUE;
+      END IF;
+      CONTINUE WHEN NOT ev.met;
+    END IF;
     BEGIN
       IF depth >= 25 THEN
         RAISE EXCEPTION 'resolution too complex: depth exceeded'
@@ -394,7 +459,7 @@ BEGIN
       r := fga._check_node(
         store_id, model_id,
         u.subject_type, u.subject_id, computed,
-        st, sid, srel, s_wild, ctx, depth + 1, visited);
+        st, sid, srel, s_wild, ctx, req_ctx, depth + 1, visited);
       IF r.allowed THEN
         RETURN (true, false);
       END IF;
@@ -406,6 +471,9 @@ BEGIN
     END;
   END LOOP;
 
+  IF cond_err IS NOT NULL THEN
+    RAISE EXCEPTION '%', cond_err USING ERRCODE = 'YF100';
+  END IF;
   IF caught_state IS NOT NULL THEN
     RAISE EXCEPTION '%', caught_msg USING ERRCODE = caught_state;
   END IF;
@@ -430,6 +498,7 @@ DECLARE
   user_s text := request -> 'tuple_key' ->> 'user';
   obj_s text := request -> 'tuple_key' ->> 'object';
   rel text := request -> 'tuple_key' ->> 'relation';
+  req_ctx jsonb := request -> 'context';
   s record;
   o record;
   sid uuid;
@@ -530,7 +599,8 @@ BEGIN
     SELECT * INTO v FROM fga._validate_tuple(
       store_id, mid,
       tkj ->> 'object', tkj ->> 'relation', tkj ->> 'user',
-      'YF127');
+      tkj -> 'condition' ->> 'name',
+      'YF127', 'YF127');
     ctx := ctx || (v.object_type, v.object_id, v.relation,
       v.subject_type, v.subject_id, v.subject_relation,
       tkj -> 'condition' ->> 'name',
@@ -541,7 +611,7 @@ BEGIN
     store_id, mid,
     o.object_type, oid, rel,
     s.subject_type, sid, s.subject_relation, s.is_wildcard,
-    ctx, 0, '{}');
+    ctx, req_ctx, 0, '{}');
 
   RETURN jsonb_build_object('allowed', r.allowed);
 END;

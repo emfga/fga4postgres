@@ -246,13 +246,31 @@ BEGIN
   WHERE r.store = store_id AND r.model_id = new_id
     AND n ? 'tuple_to_userset';
 
+  -- Conditions compile at write time under the openfga env; a
+  -- parse failure refuses the model. (Full result-type checking
+  -- needs declared-variable support upstream's cel-go has and
+  -- cel4postgres's checker does not; a non-bool condition is
+  -- refused at evaluation instead — measurements M15.)
   INSERT INTO fga.model_condition
   SELECT store_id, new_id, cond.key,
     cond.value ->> 'expression',
     cond.value -> 'parameters',
-    NULL
+    cel.parse(cond.value ->> 'expression', 'openfga')
   FROM jsonb_each(coalesce(request -> 'conditions', '{}'::jsonb))
     AS cond;
+
+  IF EXISTS (
+    SELECT FROM fga.model_condition c
+    WHERE c.store = store_id AND c.model_id = new_id
+      AND c.compiled_ast ? 'errors'
+  ) THEN
+    RAISE EXCEPTION 'failed to compile condition: %', (
+      SELECT c.compiled_ast -> 'errors' -> 0 ->> 'msg'
+      FROM fga.model_condition c
+      WHERE c.store = store_id AND c.model_id = new_id
+        AND c.compiled_ast ? 'errors' LIMIT 1
+    ) USING ERRCODE = 'YF100';
+  END IF;
 
   -- Reachability closure. Edges lead from a relation node
   -- (type, relation) to every node it can grant through:

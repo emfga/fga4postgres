@@ -9,10 +9,15 @@
 --        repaired: the BFS terminates on dedup alone and raises
 --        no too-complex error. (No corpus list_objects case
 --        asserts 2002.)
---   M10b: validation order — contextual tuples (invalid_tuple),
+--   M37: validation order — contextual tuples (invalid_tuple),
 --        then target type (type_not_found 2021), then target
 --        relation (relation_not_found 2022), then the subject
 --        (validation_error 2000).
+--   M07: per-row conditions evaluate during expansion with the
+--        merged context; condition errors are collected per
+--        candidate and raised only when the result count stays
+--        below the 1000 cap (upstream's scoping, doc 04 §5) —
+--        otherwise tolerated.
 --
 -- Candidates whose path crossed a relation containing
 -- intersection or difference carry a sticky taint and are
@@ -35,6 +40,21 @@ EXCEPTION WHEN duplicate_object THEN
 END;
 $$;
 
+DO $$
+BEGIN
+  CREATE TYPE fga._lo_cand AS (
+    ntype text,
+    nid uuid,
+    nrel text,
+    tainted boolean,
+    cond_name text,
+    cond_ctx jsonb
+  );
+EXCEPTION WHEN duplicate_object THEN
+  NULL;
+END;
+$$;
+
 CREATE OR REPLACE FUNCTION fga.list_objects(
   store_id uuid,
   request jsonb
@@ -49,6 +69,7 @@ DECLARE
   target_type text := request ->> 'type';
   target_rel text := request ->> 'relation';
   user_s text := request ->> 'user';
+  req_ctx jsonb := request -> 'context';
   s record;
   sid uuid;
   ctx fga._tuple_key[] := '{}';
@@ -56,18 +77,25 @@ DECLARE
   v record;
   frontier fga._lo_node[];
   next_frontier fga._lo_node[];
+  cands fga._lo_cand[];
   seen text[] := '{}';
-  found uuid[] := '{}';        -- ids already emitted or queued
-  clear_ids uuid[] := '{}';    -- results needing no check
-  tainted_ids uuid[] := '{}';  -- results pending forward check
+  found uuid[] := '{}';
+  clear_ids uuid[] := '{}';
+  tainted_ids uuid[] := '{}';
+  err_count integer := 0;
+  first_err text;
+  level_errs integer;
+  level_first text;
   r fga._check_result;
   cid uuid;
+  chk_state text;
+  chk_msg text;
   objects text[] := '{}';
 BEGIN
   mid := fga._resolve_model(
     store_id, request ->> 'authorization_model_id');
 
-  -- Validation, in the measured order (M10b).
+  -- Validation, in the measured order (M37).
   FOR tkj IN
     SELECT * FROM jsonb_array_elements(coalesce(
       request -> 'contextual_tuples' -> 'tuple_keys',
@@ -76,7 +104,8 @@ BEGIN
     SELECT * INTO v FROM fga._validate_tuple(
       store_id, mid,
       tkj ->> 'object', tkj ->> 'relation', tkj ->> 'user',
-      'YF127');
+      tkj -> 'condition' ->> 'name',
+      'YF127', 'YF100');
     ctx := ctx || (v.object_type, v.object_id, v.relation,
       v.subject_type, v.subject_id, v.subject_relation,
       tkj -> 'condition' ->> 'name',
@@ -165,13 +194,13 @@ BEGIN
           || CASE WHEN f.tainted THEN '@t' ELSE '@f' END), '{}')
       FROM unnest(frontier) f);
 
+    -- Discover candidate nodes with their row conditions.
     WITH f AS (SELECT * FROM unnest(frontier) AS f),
 
-    -- 1. Direct edges: tuples whose subject is a frontier node,
-    --    valid under this model's restrictions.
     direct_new AS (
       SELECT tr.type_name, t.object_id, tr.relation_name,
-             f.tainted OR mr.needs_check AS tainted
+             f.tainted OR mr.needs_check AS tainted,
+             t.cond_name, t.cond_ctx
       FROM f
       JOIN fga.model_type_restriction tr
         ON tr.store = store_id AND tr.model_id = mid
@@ -185,7 +214,8 @@ BEGIN
        AND mr.type_name = tr.type_name
        AND mr.relation_name = tr.relation_name
       JOIN LATERAL (
-        SELECT t.object_id
+        SELECT t.object_id, t.condition_name AS cond_name,
+               t.condition_context AS cond_ctx
         FROM fga.tuple t
         WHERE t.store = store_id
           AND t.subject_type = f.ntype
@@ -193,21 +223,26 @@ BEGIN
           AND t.subject_relation = f.nrel
           AND t.relation = tr.relation_name
           AND t.object_type = tr.type_name
+          AND tr.condition_name
+                = coalesce(t.condition_name, '')
         UNION ALL
-        SELECT c.object_id
+        SELECT c.object_id, c.condition_name,
+               c.condition_context
         FROM unnest(ctx) c
         WHERE c.subject_type = f.ntype
           AND c.subject_id = f.nid
           AND c.subject_relation = f.nrel
           AND c.relation = tr.relation_name
           AND c.object_type = tr.type_name
+          AND tr.condition_name
+                = coalesce(c.condition_name, '')
       ) t ON true
     ),
 
-    -- 2. Computed edges: same object, granting relation.
     computed_new AS (
       SELECT mc.type_name, f.nid AS object_id, mc.relation_name,
-             f.tainted OR mr.needs_check AS tainted
+             f.tainted OR mr.needs_check AS tainted,
+             NULL::text AS cond_name, NULL::jsonb AS cond_ctx
       FROM f
       JOIN fga.model_computed mc
         ON mc.store = store_id AND mc.model_id = mid
@@ -220,11 +255,10 @@ BEGIN
       WHERE f.nrel <> ''
     ),
 
-    -- 3. TTU edges: a frontier node holding the computed relation
-    --    on a parent grants through every tupleset link.
     ttu_new AS (
       SELECT mt.type_name, t.object_id, mt.relation_name,
-             f.tainted OR mr.needs_check AS tainted
+             f.tainted OR mr.needs_check AS tainted,
+             t.cond_name, t.cond_ctx
       FROM f
       JOIN fga.model_ttu mt
         ON mt.store = store_id AND mt.model_id = mid
@@ -234,7 +268,8 @@ BEGIN
        AND mr.type_name = mt.type_name
        AND mr.relation_name = mt.relation_name
       JOIN LATERAL (
-        SELECT t.object_id
+        SELECT t.object_id, t.condition_name AS cond_name,
+               t.condition_context AS cond_ctx
         FROM fga.tuple t
         WHERE t.store = store_id
           AND t.subject_type = f.ntype
@@ -250,9 +285,12 @@ BEGIN
               AND tr.subject_type = f.ntype
               AND tr.subject_relation = ''
               AND NOT tr.is_wildcard
+              AND tr.condition_name
+                    = coalesce(t.condition_name, '')
           )
         UNION ALL
-        SELECT c.object_id
+        SELECT c.object_id, c.condition_name,
+               c.condition_context
         FROM unnest(ctx) c
         WHERE c.subject_type = f.ntype
           AND c.subject_id = f.nid
@@ -261,34 +299,44 @@ BEGIN
           AND c.object_type = mt.type_name
       ) t ON true
       WHERE f.nrel <> ''
-    ),
-
-    all_new AS (
-      SELECT DISTINCT ntype, object_id, relation_name, tainted
-      FROM (
-        SELECT type_name AS ntype, object_id, relation_name,
-               tainted FROM direct_new
-        UNION ALL
-        SELECT type_name, object_id, relation_name, tainted
-        FROM computed_new
-        UNION ALL
-        SELECT type_name, object_id, relation_name, tainted
-        FROM ttu_new
-      ) u
     )
-    SELECT coalesce(array_agg(
-      (n.ntype, n.object_id, n.relation_name,
-       n.tainted)::fga._lo_node), '{}')
-    INTO next_frontier
-    FROM all_new n
+
+    SELECT coalesce(array_agg(DISTINCT
+      (u.type_name, u.object_id, u.relation_name, u.tainted,
+       u.cond_name, u.cond_ctx)::fga._lo_cand), '{}')
+    INTO cands
+    FROM (
+      SELECT * FROM direct_new
+      UNION ALL SELECT * FROM computed_new
+      UNION ALL SELECT * FROM ttu_new
+    ) AS u(type_name, object_id, relation_name, tainted,
+           cond_name, cond_ctx);
+
+    -- Evaluate row conditions; collect per-candidate errors with
+    -- upstream's scoping (raised later only if results stay under
+    -- the cap).
+    SELECT
+      coalesce(array_agg(
+        (c.ntype, c.nid, c.nrel, c.tainted)::fga._lo_node)
+        FILTER (WHERE coalesce(c.cond_name, '') = ''
+                      OR ev.met), '{}'),
+      count(*) FILTER (WHERE ev.err IS NOT NULL),
+      min(ev.err) FILTER (WHERE ev.err IS NOT NULL)
+    INTO next_frontier, level_errs, level_first
+    FROM unnest(cands) c
+    LEFT JOIN LATERAL fga._eval_condition(
+      store_id, mid, c.cond_name, c.cond_ctx, req_ctx) ev
+      ON coalesce(c.cond_name, '') <> ''
     WHERE NOT (
-      n.ntype || ':' || n.object_id || '#' || n.relation_name
-        || CASE WHEN n.tainted THEN '@t' ELSE '@f' END
+      c.ntype || ':' || c.nid || '#' || c.nrel
+        || CASE WHEN c.tainted THEN '@t' ELSE '@f' END
     ) = ANY (seen);
 
-    -- Collect results from the new nodes.
+    err_count := err_count + coalesce(level_errs, 0);
+    first_err := coalesce(first_err, level_first);
+
     SELECT coalesce(array_agg(DISTINCT nn.nid), '{}')
-    INTO STRICT clear_ids
+    INTO clear_ids
     FROM (
       SELECT unnest(clear_ids) AS nid
       UNION
@@ -298,7 +346,7 @@ BEGIN
         AND NOT nn.tainted
     ) nn;
     SELECT coalesce(array_agg(DISTINCT nn.nid), '{}')
-    INTO STRICT tainted_ids
+    INTO tainted_ids
     FROM (
       SELECT unnest(tainted_ids) AS nid
       UNION
@@ -314,17 +362,30 @@ BEGIN
   END LOOP;
 
   -- Confirm tainted candidates with the forward resolver, fresh
-  -- budget each (plan §1.5).
+  -- budget each; a refusal there joins the per-candidate error
+  -- pool under the same scoping.
   FOREACH cid IN ARRAY tainted_ids LOOP
     CONTINUE WHEN cid = ANY (clear_ids);
-    r := fga._check_node(
-      store_id, mid, target_type, cid, target_rel,
-      s.subject_type, sid, s.subject_relation, s.is_wildcard,
-      ctx, 0, '{}');
-    IF r.allowed THEN
-      clear_ids := clear_ids || cid;
-    END IF;
+    BEGIN
+      r := fga._check_node(
+        store_id, mid, target_type, cid, target_rel,
+        s.subject_type, sid, s.subject_relation, s.is_wildcard,
+        ctx, req_ctx, 0, '{}');
+      IF r.allowed THEN
+        clear_ids := clear_ids || cid;
+      END IF;
+    EXCEPTION WHEN SQLSTATE 'YF000' THEN
+      GET STACKED DIAGNOSTICS
+        chk_state = RETURNED_SQLSTATE, chk_msg = MESSAGE_TEXT;
+      err_count := err_count + 1;
+      first_err := coalesce(first_err, chk_msg);
+    END;
   END LOOP;
+
+  IF err_count > 0
+     AND coalesce(array_length(clear_ids, 1), 0) < 1000 THEN
+    RAISE EXCEPTION '%', first_err USING ERRCODE = 'YF100';
+  END IF;
 
   SELECT coalesce(array_agg(
     target_type || ':' || x.id), '{}')

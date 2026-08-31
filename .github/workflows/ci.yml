@@ -79,6 +79,21 @@ jobs:
             go run ./internal/cmd/confreport
           go run ./internal/cmd/skipgen < /tmp/gotest.json
 
+      # The imported upstream runners need a -skip for the
+      # list_users sub-asserts until plan phase 5 (no skip hook
+      # exists inside upstream's runner code); skipgen harvests
+      # the run-derived skip list from this run too.
+      - name: Imported upstream runners
+        env:
+          FGA_RUN_IMPORTED: "1"
+        run: |
+          go test -count=1 -timeout 20m -json \
+            -run 'TestImported' \
+            -skip '.*/.*/.*/.*/assertion_list_users_.*' \
+            ./conformance/ | tee /tmp/imported.json |
+            go run ./internal/cmd/confreport
+          go run ./internal/cmd/skipgen < /tmp/imported.json
+
       - name: Dump database logs
         if: failure()
         run: docker compose logs --no-color
