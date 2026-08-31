@@ -547,4 +547,80 @@ BEGIN
 END;
 $$;
 
+-- Batch check (measured contract, M34): at most 50 items and
+-- unique correlation ids are request-level refusals; an item's own
+-- validation failure is captured per item under its correlation
+-- id, never failing the batch. One SQL statement means one
+-- snapshot: batch answers are mutually consistent — stronger than
+-- upstream's concurrent goroutines, documented as a product
+-- property. Identical items (same tuple key, contextual tuples
+-- and context) are resolved once.
+CREATE OR REPLACE FUNCTION fga.batch_check(
+  store_id uuid,
+  request jsonb
+)
+RETURNS jsonb
+LANGUAGE plpgsql
+STABLE PARALLEL SAFE
+SET search_path = fga, pg_temp
+AS $$
+DECLARE
+  items jsonb := coalesce(request -> 'checks', '[]'::jsonb);
+  item jsonb;
+  corr text;
+  dedup_key text;
+  results jsonb := '{}'::jsonb;
+  memo jsonb := '{}'::jsonb;
+  one jsonb;
+  err_enum text;
+  err_msg text;
+  err_state text;
+BEGIN
+  IF jsonb_array_length(items) > 50 THEN
+    RAISE EXCEPTION
+      'batchCheck received % checks, the maximum allowed is 50',
+      jsonb_array_length(items) USING ERRCODE = 'YF100';
+  END IF;
+
+  FOR item IN SELECT * FROM jsonb_array_elements(items) LOOP
+    corr := item ->> 'correlation_id';
+    IF results ? corr THEN
+      RAISE EXCEPTION 'received duplicate correlation id: %',
+        corr USING ERRCODE = 'YF100';
+    END IF;
+
+    dedup_key := (item - 'correlation_id')::text;
+    one := memo -> dedup_key;
+    IF one IS NULL THEN
+      BEGIN
+        one := jsonb_build_object('allowed',
+          (fga.check(store_id, jsonb_build_object(
+             'tuple_key', item -> 'tuple_key',
+             'contextual_tuples', item -> 'contextual_tuples',
+             'context', item -> 'context',
+             'authorization_model_id',
+             request ->> 'authorization_model_id'
+           )) ->> 'allowed')::boolean);
+      EXCEPTION WHEN SQLSTATE 'YF000' THEN
+        GET STACKED DIAGNOSTICS
+          err_state = RETURNED_SQLSTATE,
+          err_msg = MESSAGE_TEXT;
+        err_enum := CASE err_state
+          WHEN 'YF102'
+            THEN 'authorization_model_resolution_too_complex'
+          WHEN 'YF127' THEN 'invalid_tuple'
+          ELSE 'validation_error'
+        END;
+        one := jsonb_build_object('error', jsonb_build_object(
+          'input_error', err_enum, 'message', err_msg));
+      END;
+      memo := memo || jsonb_build_object(dedup_key, one);
+    END IF;
+    results := results || jsonb_build_object(corr, one);
+  END LOOP;
+
+  RETURN jsonb_build_object('result', results);
+END;
+$$;
+
 COMMIT;

@@ -32,17 +32,30 @@ AS $$
 $$;
 
 -- Deleting a missing store is a no-op, matching upstream's
--- idempotent DeleteStore. Dependent rows (models, tuples) do not
--- exist yet; the cascade mechanism -- FKs with ON DELETE CASCADE vs
--- explicit deletes -- is decided in plan phase 1, when t.Cleanup
--- makes its cost visible to the suite.
+-- idempotent DeleteStore (measurements.md M00).
+--
+-- Dependent rows go by explicit deletes, not FK cascades
+-- (workspace decision 10): the tuple insert path stays free of
+-- FK-check overhead, at the price of naming every dependent table
+-- here. The tables live in later install files — fine, because
+-- PL/pgSQL resolves them at call time, after the full install.
 CREATE OR REPLACE FUNCTION fga.delete_store(store_id uuid)
 RETURNS void
-LANGUAGE sql
+LANGUAGE plpgsql
 VOLATILE
 SET search_path = fga, pg_temp
 AS $$
-  DELETE FROM fga.store WHERE store.id = store_id;
+BEGIN
+  DELETE FROM fga.tuple WHERE store = store_id;
+  DELETE FROM fga.model_reachable WHERE store = store_id;
+  DELETE FROM fga.model_condition WHERE store = store_id;
+  DELETE FROM fga.model_ttu WHERE store = store_id;
+  DELETE FROM fga.model_type_restriction WHERE store = store_id;
+  DELETE FROM fga.model_relation WHERE store = store_id;
+  DELETE FROM fga.model_type WHERE store = store_id;
+  DELETE FROM fga.model WHERE store = store_id;
+  DELETE FROM fga.store WHERE id = store_id;
+END;
 $$;
 
 COMMIT;
