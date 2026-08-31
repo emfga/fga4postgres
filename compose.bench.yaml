@@ -1,0 +1,62 @@
+# The benchmark database stack. Deliberately self-contained
+# rather than an override of compose.yaml: compose file merging
+# APPENDS sequence keys, so an override could add a volume but
+# never remove the base file's tmpfs mount — and a benchmark
+# database that silently lived in RAM would be a lie at 10M+
+# rows. Duplicating ~30 lines buys honest semantics.
+#
+#   docker compose -f compose.bench.yaml up -d --wait
+#
+# Differences from compose.yaml, all intentional:
+#   - PGDATA is a named docker volume, so fixtures survive
+#     restarts and 10M/100M loads are measured against disk.
+#     `docker volume rm fga4postgres-bench-pgdata` discards them.
+#   - cluster_name identifies this stack, so the bench tooling
+#     can record `storage: volume` in result metadata.
+#   - No OpenFGA oracle and no test runner: benchmarks call
+#     neither.
+# The bench stack and the default stack are not run together —
+# the host port would collide, and the suites assume exclusive
+# use anyway.
+name: ${PREFIX:-fga4postgres}-bench
+
+services:
+  postgres:
+    command:
+      - -c
+      - cluster_name=fga4postgres-bench
+    container_name: ${PREFIX:-fga4postgres}-bench-postgres
+    environment:
+      PGDATA: /var/lib/postgresql/data
+      POSTGRES_DB: ${POSTGRES_DB:-fga}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-password}
+      POSTGRES_USER: ${POSTGRES_USER:-fga}
+    # Readiness means installed, not merely listening — same
+    # rationale as compose.yaml. On a restart with an existing
+    # volume initdb does not re-run; the bench tooling reinstalls
+    # the engine unconditionally before measuring, so a stale
+    # schema can never be measured either way.
+    healthcheck:
+      interval: 2s
+      retries: 30
+      start_period: 20s
+      test:
+        - CMD-SHELL
+        - >-
+          pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB} -q &&
+          psql -U $${POSTGRES_USER} -d $${POSTGRES_DB} -tAc
+          'SELECT cel.version(), fga.version()' >/dev/null
+      timeout: 5s
+    image: postgres:18-alpine@sha256:d3e1620b530c944afa6e887d22eb899824da68e19c52024bf98f5220c88a65b2
+    ports:
+      - ${POSTGRES_PORT:-5432}:5432
+    restart: unless-stopped
+    volumes:
+      - fga4postgres-bench-pgdata:/var/lib/postgresql/data
+      - ./docker:/docker-entrypoint-initdb.d:ro
+      - ./sql:/sql:ro
+      - ./vendor:/vendor:ro
+
+volumes:
+  fga4postgres-bench-pgdata:
+    name: fga4postgres-bench-pgdata

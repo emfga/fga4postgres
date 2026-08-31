@@ -11,3 +11,7 @@
 
 # Release artifacts are built by scripts/build-release.sh.
 dist/
+
+# Benchmark results; the default -results directory. Curated
+# baselines are committed under docs/benchmarks/ instead.
+bench-results/
