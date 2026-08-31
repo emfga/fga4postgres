@@ -17,7 +17,7 @@ TRUNCATE fga.schema_version;
 -- The version lives here and only here; the release build and the
 -- workflows sed it out of this file rather than keeping a copy.
 INSERT INTO fga.schema_version
-VALUES ('0.1.0');
+VALUES ('0.0.1');
 
 -- STABLE, not IMMUTABLE: it reads a table.
 CREATE OR REPLACE FUNCTION fga.version()
