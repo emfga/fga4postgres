@@ -116,10 +116,17 @@ $$;
 -- ok=false marks a string that does not even have the shape;
 -- id_text carries the raw id segment for the gate.
 
+-- ROWS 1 on both parsers: they always return exactly one row,
+-- and the SRF default estimate of 1000 prices a parser cross
+-- join at a million rows -- expensive enough to cross
+-- jit_above_cost and LLVM-compile the delete loop's statement
+-- on every execution (~34ms per delete on stock settings).
+
 CREATE OR REPLACE FUNCTION fga._parse_object(s text)
 RETURNS TABLE (object_type text, id_text text, ok boolean)
 LANGUAGE sql
 IMMUTABLE PARALLEL SAFE
+ROWS 1
 SET search_path = fga, pg_temp
 AS $$
   SELECT split_part(s, ':', 1),
@@ -133,6 +140,7 @@ RETURNS TABLE (subject_type text, id_text text,
                ok boolean)
 LANGUAGE sql
 IMMUTABLE PARALLEL SAFE
+ROWS 1
 SET search_path = fga, pg_temp
 AS $$
   WITH split AS (
