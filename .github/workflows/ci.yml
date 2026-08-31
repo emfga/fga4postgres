@@ -42,9 +42,6 @@ jobs:
       # oracle gates on its own grpc health probe.
       - run: docker compose up -d --wait
 
-      # Until the Go harness exists this is the whole suite: prove the
-      # install answers and the oracle serves. setup-go, gofmt, vet and
-      # `go test ./...` return here with the first harness commit.
       - name: Verify installed schema and oracle
         run: |
           psql "postgres://$POSTGRES_USER:$POSTGRES_PASSWORD@$POSTGRES_HOST:$POSTGRES_PORT/$POSTGRES_DB" \
@@ -52,6 +49,35 @@ jobs:
             -c "SELECT cel.version(), fga.version()" \
             -c "SELECT cel.evaluate('1 + 2 == 3', '{}', 'standard')"
           curl -fsS http://localhost:8080/healthz
+
+      # Every script is idempotent (CREATE OR REPLACE, IF NOT
+      # EXISTS), so re-running the by-hand install loop against the
+      # live database is the upgrade path -- prove it on every run.
+      - name: Idempotent reinstall
+        run: |
+          DB="postgres://$POSTGRES_USER:$POSTGRES_PASSWORD@$POSTGRES_HOST:$POSTGRES_PORT/$POSTGRES_DB"
+          psql -v ON_ERROR_STOP=1 -q -f vendor/cel4postgres--*.sql "$DB"
+          for f in sql/*.sql; do
+            psql -v ON_ERROR_STOP=1 -q -f "$f" "$DB"
+          done
+
+      - uses: actions/setup-go@4dc6199c7b1a012772edbd06daecab0f50d2b87a # v6.0.0
+        with:
+          go-version-file: go.mod
+
+      - name: gofmt
+        run: test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
+
+      - run: go vet ./...
+
+      # -json feeds the run-derived skip list and the conformance
+      # report; confreport exits non-zero when any test failed, so
+      # nothing is lost to the pipe.
+      - name: Test
+        run: |
+          go test -count=1 -json ./... | tee /tmp/gotest.json |
+            go run ./internal/cmd/confreport
+          go run ./internal/cmd/skipgen < /tmp/gotest.json
 
       - name: Dump database logs
         if: failure()
