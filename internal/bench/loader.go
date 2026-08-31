@@ -157,6 +157,46 @@ func (s *copySource) Next() bool {
 func (s *copySource) Values() ([]any, error) { return s.cur, nil }
 func (s *copySource) Err() error             { return s.done }
 
+// LookupManifest resolves an already-loaded fixture without
+// touching it — the -skip-load path. A missing or mismatched
+// manifest is an error: measuring an unknown fixture would
+// produce numbers nothing can interpret.
+func LookupManifest(
+	ctx context.Context, pool *pgxpool.Pool,
+	s Scenario, size Size, seed uint64,
+) (LoadResult, error) {
+	var (
+		gen int
+		res LoadResult
+		sd  int64
+	)
+	err := pool.QueryRow(ctx, `
+		SELECT m.seed, m.generator_version, m.store::text,
+		       m.model_id::text, m.tuples, m.load_seconds
+		FROM fga_bench.manifest m
+		WHERE m.scenario = $1 AND m.size_name = $2`,
+		s.Name(), size.Name,
+	).Scan(&sd, &gen, &res.Store, &res.ModelID,
+		&res.Rows, &res.Seconds)
+	if err != nil {
+		return LoadResult{}, fmt.Errorf(
+			"no loaded fixture for %s/%s (drop -skip-load, "+
+				"or load first): %w",
+			s.Name(), size.Name, err)
+	}
+	if uint64(sd) != seed || gen != GeneratorVersion ||
+		res.Rows != int64(size.Tuples) {
+		return LoadResult{}, fmt.Errorf(
+			"fixture %s/%s was loaded with seed %d / "+
+				"generator %d; this run wants seed %d / "+
+				"generator %d — reload without -skip-load",
+			s.Name(), size.Name, sd, gen, seed,
+			GeneratorVersion)
+	}
+	res.Skipped = true
+	return res, nil
+}
+
 // Load ensures the fixture for one scenario × size exists,
 // loading it when the manifest does not already record an
 // identical one. progress receives human-oriented status lines
