@@ -438,4 +438,41 @@ AS $$
     );
 $$;
 
+-- Tupleset read for TTU resolution: the linked parent objects.
+-- Userset and wildcard subjects are skipped — a tupleset is
+-- direct-only at write time, and stranded rows from older models
+-- are filtered like everywhere else.
+CREATE OR REPLACE FUNCTION fga._read_tupleset(
+  store_id uuid, model_id uuid,
+  ot text, oid uuid, rel text,
+  ctx fga._tuple_key[]
+)
+RETURNS TABLE (subject_type text, subject_id uuid)
+LANGUAGE sql
+STABLE PARALLEL SAFE
+SET search_path = fga, pg_temp
+AS $$
+  SELECT c.subject_type, c.subject_id
+  FROM unnest(ctx) c
+  WHERE c.object_type = ot AND c.object_id = oid
+    AND c.relation = rel AND c.subject_relation = ''
+    AND c.subject_id <> '00000000-0000-0000-0000-000000000000'
+  UNION ALL
+  SELECT t.subject_type, t.subject_id
+  FROM fga.tuple t
+  WHERE t.store = store_id
+    AND t.object_type = ot AND t.object_id = oid
+    AND t.relation = rel AND t.subject_relation = ''
+    AND t.subject_id <> '00000000-0000-0000-0000-000000000000'
+    AND EXISTS (
+      SELECT FROM fga.model_type_restriction tr
+      WHERE tr.store = store_id
+        AND tr.model_id = _read_tupleset.model_id
+        AND tr.type_name = ot AND tr.relation_name = rel
+        AND tr.subject_type = t.subject_type
+        AND tr.subject_relation = ''
+        AND NOT tr.is_wildcard
+    );
+$$;
+
 COMMIT;

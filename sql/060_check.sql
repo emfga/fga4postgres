@@ -56,7 +56,22 @@ DECLARE
   node_key text := ot || ':' || oid::text || '#' || rel;
   rw jsonb;
 BEGIN
+  -- Cycle handling is resolver-shape-dependent at the pin (M04):
+  -- a cycle that stays inside one self-recursive relation resolves
+  -- to a plain false (upstream's recursive fast path deduplicates
+  -- without a cycle flag); any cycle crossing relations or types
+  -- carries the flag, which exclusion and intersection then refuse
+  -- on. The cycle segment is everything visited since the first
+  -- occurrence of this node's key.
   IF node_key = ANY (visited) THEN
+    IF (
+      SELECT bool_and(split_part(v, ':', 1) = ot
+                      AND split_part(v, '#', 2) = rel)
+      FROM unnest(
+        visited[array_position(visited, node_key):]) AS v
+    ) THEN
+      RETURN (false, false);
+    END IF;
     RETURN (false, true);
   END IF;
 
@@ -220,14 +235,181 @@ BEGIN
     END IF;
     RETURN (false, cyc);
 
+  ELSIF rw ? 'intersection' THEN
+    -- Model order; the first false-or-cycled operand decides and
+    -- propagates its flag; a false sibling swallows an operand
+    -- error, a true one never does (M01, M11).
+    FOR child IN
+      SELECT * FROM jsonb_array_elements(
+        rw -> 'intersection' -> 'child')
+    LOOP
+      BEGIN
+        r := fga._check_rewrite(
+          store_id, model_id, ot, oid, rel,
+          st, sid, srel, s_wild, ctx, depth, visited, child);
+        IF NOT r.allowed OR r.cycled THEN
+          RETURN (false, r.cycled);
+        END IF;
+      EXCEPTION WHEN SQLSTATE 'YF000' THEN
+        GET STACKED DIAGNOSTICS
+          caught_state = RETURNED_SQLSTATE,
+          caught_msg = MESSAGE_TEXT;
+      END;
+    END LOOP;
+    IF caught_state IS NOT NULL THEN
+      RAISE EXCEPTION '%', caught_msg
+        USING ERRCODE = caught_state;
+    END IF;
+    RETURN (true, false);
+
+  ELSIF rw ? 'difference' THEN
+    RETURN fga._check_difference(
+      store_id, model_id, ot, oid, rel,
+      st, sid, srel, s_wild, ctx, depth, visited,
+      rw -> 'difference' -> 'base',
+      rw -> 'difference' -> 'subtract');
+
+  ELSIF rw ? 'tuple_to_userset' THEN
+    RETURN fga._check_ttu(
+      store_id, model_id, ot, oid, rel,
+      st, sid, srel, s_wild, ctx, depth, visited,
+      rw -> 'tuple_to_userset' -> 'tupleset' ->> 'relation',
+      rw -> 'tuple_to_userset' -> 'computed_userset'
+         ->> 'relation');
+
   ELSE
-    -- Not the YF class on purpose: reaching an unimplemented
-    -- operator is a harness/phase bug and must never be swallowed
-    -- as an operand error.
+    -- Not the YF class on purpose: reaching an unknown operator
+    -- is a harness bug and must never be swallowed as an operand
+    -- error.
     RAISE EXCEPTION
-      'fga4postgres: rewrite operator not implemented yet '
-      '(plan phase 1b): %', rw;
+      'fga4postgres: unknown rewrite operator: %', rw;
   END IF;
+END;
+$$;
+
+-- Exclusion, sequentially: a false-or-cycled base decides first, a
+-- true-or-cycled subtrahend refuses, and an operand error
+-- re-raises only when the other side did not produce the
+-- swallowing answer (M01, M04).
+CREATE OR REPLACE FUNCTION fga._check_difference(
+  store_id uuid, model_id uuid,
+  ot text, oid uuid, rel text,
+  st text, sid uuid, srel text, s_wild boolean,
+  ctx fga._tuple_key[],
+  depth integer,
+  visited text[],
+  base jsonb,
+  subtract jsonb
+)
+RETURNS fga._check_result
+LANGUAGE plpgsql
+STABLE PARALLEL SAFE
+SET search_path = fga, pg_temp
+AS $$
+DECLARE
+  base_r fga._check_result;
+  sub_r fga._check_result;
+  base_state text;
+  base_msg text;
+  sub_state text;
+  sub_msg text;
+BEGIN
+  BEGIN
+    base_r := fga._check_rewrite(
+      store_id, model_id, ot, oid, rel,
+      st, sid, srel, s_wild, ctx, depth, visited, base);
+    IF NOT base_r.allowed OR base_r.cycled THEN
+      RETURN (false, base_r.cycled);
+    END IF;
+  EXCEPTION WHEN SQLSTATE 'YF000' THEN
+    GET STACKED DIAGNOSTICS
+      base_state = RETURNED_SQLSTATE, base_msg = MESSAGE_TEXT;
+  END;
+
+  BEGIN
+    sub_r := fga._check_rewrite(
+      store_id, model_id, ot, oid, rel,
+      st, sid, srel, s_wild, ctx, depth, visited, subtract);
+    IF sub_r.allowed OR sub_r.cycled THEN
+      RETURN (false, sub_r.cycled);
+    END IF;
+  EXCEPTION WHEN SQLSTATE 'YF000' THEN
+    GET STACKED DIAGNOSTICS
+      sub_state = RETURNED_SQLSTATE, sub_msg = MESSAGE_TEXT;
+  END;
+
+  IF base_state IS NOT NULL THEN
+    RAISE EXCEPTION '%', base_msg USING ERRCODE = base_state;
+  END IF;
+  IF sub_state IS NOT NULL THEN
+    RAISE EXCEPTION '%', sub_msg USING ERRCODE = sub_state;
+  END IF;
+  RETURN (true, false);
+END;
+$$;
+
+-- TTU: dispatch the computed relation on every linked parent. A
+-- parent whose type does not define the computed relation is
+-- skipped — the one asymmetric undefined-relation case (M06).
+CREATE OR REPLACE FUNCTION fga._check_ttu(
+  store_id uuid, model_id uuid,
+  ot text, oid uuid, rel text,
+  st text, sid uuid, srel text, s_wild boolean,
+  ctx fga._tuple_key[],
+  depth integer,
+  visited text[],
+  tupleset_rel text,
+  computed text
+)
+RETURNS fga._check_result
+LANGUAGE plpgsql
+STABLE PARALLEL SAFE
+SET search_path = fga, pg_temp
+AS $$
+DECLARE
+  u record;
+  r fga._check_result;
+  cyc boolean := false;
+  caught_state text;
+  caught_msg text;
+BEGIN
+  FOR u IN
+    SELECT * FROM fga._read_tupleset(
+      store_id, model_id, ot, oid, tupleset_rel, ctx)
+  LOOP
+    IF NOT EXISTS (
+      SELECT FROM fga.model_relation mr
+      WHERE mr.store = store_id
+        AND mr.model_id = _check_ttu.model_id
+        AND mr.type_name = u.subject_type
+        AND mr.relation_name = computed
+    ) THEN
+      CONTINUE;
+    END IF;
+    BEGIN
+      IF depth >= 25 THEN
+        RAISE EXCEPTION 'resolution too complex: depth exceeded'
+          USING ERRCODE = 'YF102';
+      END IF;
+      r := fga._check_node(
+        store_id, model_id,
+        u.subject_type, u.subject_id, computed,
+        st, sid, srel, s_wild, ctx, depth + 1, visited);
+      IF r.allowed THEN
+        RETURN (true, false);
+      END IF;
+      cyc := cyc OR r.cycled;
+    EXCEPTION WHEN SQLSTATE 'YF000' THEN
+      GET STACKED DIAGNOSTICS
+        caught_state = RETURNED_SQLSTATE,
+        caught_msg = MESSAGE_TEXT;
+    END;
+  END LOOP;
+
+  IF caught_state IS NOT NULL THEN
+    RAISE EXCEPTION '%', caught_msg USING ERRCODE = caught_state;
+  END IF;
+  RETURN (false, cyc);
 END;
 $$;
 

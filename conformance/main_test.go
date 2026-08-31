@@ -22,7 +22,7 @@ const phase = 1
 
 // phase1b flips when the resolver grows intersection, difference
 // and TTU (the plan's interior 1a/1b gate).
-const phase1b = false
+const phase1b = true
 
 // suiteSeed drives every shuffle; printed on every run so any
 // failure reproduces with FGA_SEED.
