@@ -116,9 +116,15 @@ jobs:
             -e POSTGRES_PASSWORD=pw \
             -v "$PWD/dist/fga4postgres--$version.sql:$init:ro" \
             "$image" >/dev/null
+          # -h 127.0.0.1: over the socket, psql reaches initdb's
+          # temporary server while the init script is still
+          # running, and fga.version() answers as soon as 010's
+          # transaction commits -- mid-install. Only the final
+          # server listens on TCP, and it starts after initdb.
           got=
           for _ in $(seq 60); do
-            got=$(docker exec relcheck psql -U fga -d fga -tAc \
+            got=$(docker exec relcheck psql -h 127.0.0.1 \
+              -U fga -d fga -tAc \
               'SELECT fga.version()' 2>/dev/null) && break
             sleep 2
           done
@@ -167,9 +173,11 @@ jobs:
             -e POSTGRES_PASSWORD=pw \
             -v "$PWD/wrapped.sql:/wrapped.sql:ro" \
             pgtle -c shared_preload_libraries=pg_tle >/dev/null
+          # -h 127.0.0.1 for the same reason as above: socket
+          # readiness can be initdb's temporary server.
           for _ in $(seq 60); do
-            docker exec tle pg_isready -U fga -d fga -q \
-              2>/dev/null && break
+            docker exec tle pg_isready -h 127.0.0.1 \
+              -U fga -d fga -q 2>/dev/null && break
             sleep 2
           done
           docker exec tle psql -U fga -d fga -v ON_ERROR_STOP=1 \
