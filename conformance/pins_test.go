@@ -6,6 +6,7 @@ import (
 
 	openfgav1 "github.com/openfga/api/proto/openfga/v1"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/types/known/structpb"
 
 	"github.com/emfga/fga4postgres/internal/oracle"
 	"github.com/emfga/fga4postgres/internal/sqlclient"
@@ -124,5 +125,154 @@ func TestPinnedULIDModelID(t *testing.T) {
 		"viewer", "user:33333333-3333-7333-8333-333333333333")
 	if code != 2001 {
 		t.Errorf("ULID model id: engine code %d, want 2001", code)
+	}
+}
+
+// PIN-READ-1: a continuation token reused under a CHANGED filter.
+// Upstream's token is positional and silently continues at that
+// offset under the new filter (measured M27); the engine binds
+// the token to its filter and refuses 2007. Refusing direction.
+func TestPinnedReadTokenFilter(t *testing.T) {
+	ctx := context.Background()
+	eng := sqlclient.New(testdb.Pool(t), nil)
+	ora := oracle.Client(t)
+
+	run := func(name string, c gateClient) (int, int) {
+		tuples := []*openfgav1.TupleKey{
+			tk("doc:11111111-1111-7111-8111-111111111111",
+				"viewer",
+				"user:22222222-2222-7222-8222-222222222222"),
+			tk("doc:11111111-1111-7111-8111-111111111111",
+				"viewer",
+				"user:33333333-3333-7333-8333-333333333333"),
+			tk("doc:44444444-4444-7444-8444-444444444444",
+				"viewer",
+				"user:22222222-2222-7222-8222-222222222222"),
+		}
+		store, _ := setup(t, c, plainDSL, tuples)
+		page1, err := c.Read(ctx, &openfgav1.ReadRequest{
+			StoreId: store,
+			TupleKey: &openfgav1.ReadRequestTupleKey{
+				Object: "doc:11111111-1111-7111-8111-" +
+					"111111111111"},
+			PageSize: wrapInt32(1),
+		})
+		if err != nil {
+			t.Fatalf("%s page 1: %v", name, err)
+		}
+		tok := page1.GetContinuationToken()
+		if tok == "" {
+			t.Fatalf("%s: no continuation token", name)
+		}
+		_, err = c.Read(ctx, &openfgav1.ReadRequest{
+			StoreId: store,
+			TupleKey: &openfgav1.ReadRequestTupleKey{
+				Object: "doc:44444444-4444-7444-8444-" +
+					"444444444444"},
+			PageSize:          wrapInt32(1),
+			ContinuationToken: tok,
+		})
+		changed := 0
+		if err != nil {
+			s, _ := status.FromError(err)
+			changed = int(s.Code())
+		}
+		_, err = c.Read(ctx, &openfgav1.ReadRequest{
+			StoreId: store,
+			TupleKey: &openfgav1.ReadRequestTupleKey{
+				Object: "doc:11111111-1111-7111-8111-" +
+					"111111111111"},
+			PageSize:          wrapInt32(1),
+			ContinuationToken: tok,
+		})
+		same := 0
+		if err != nil {
+			s, _ := status.FromError(err)
+			same = int(s.Code())
+		}
+		return changed, same
+	}
+
+	engChanged, engSame := run("engine", eng)
+	oraChanged, oraSame := run("oracle", ora)
+	if engChanged != 2007 {
+		t.Errorf("engine side of the pin moved: changed-filter "+
+			"token gave %d, want 2007 — update "+
+			"docs/CONFORMANCE.md", engChanged)
+	}
+	if oraChanged != 0 {
+		t.Errorf("oracle side of the pin moved: changed-filter "+
+			"token gave %d, want silent acceptance — the "+
+			"divergence may have closed; update "+
+			"docs/CONFORMANCE.md", oraChanged)
+	}
+	if engSame != 0 || oraSame != 0 {
+		t.Errorf("same-filter token must work on both: engine "+
+			"%d oracle %d", engSame, oraSame)
+	}
+}
+
+// PIN-CTX-1: the condition-context write boundary is 32768 bytes
+// on BOTH sides, but measured over different encodings (proto
+// bytes upstream, jsonb-normalized text here) — a
+// different-boundary pin (measured M29). protojson 1e300 is a
+// short literal and an 8-byte proto double; Postgres numeric
+// prints it as 301 digits, so a list of 2500 such doubles is
+// under the proto limit and far over the jsonb one.
+func TestPinnedContextBoundary(t *testing.T) {
+	ctx := context.Background()
+	eng := sqlclient.New(testdb.Pool(t), nil)
+	ora := oracle.Client(t)
+
+	dsl := `model
+  schema 1.1
+type user
+type doc
+  relations
+    define viewer: [user with lcond]
+
+condition lcond(xs: list<double>) {
+  xs.size() > 0
+}
+`
+	write := func(c probeClient) int {
+		store, model := setup(t, c, dsl, nil)
+		vals := make([]any, 2500)
+		for i := range vals {
+			vals[i] = 1e300
+		}
+		v, err := structpb.NewStruct(map[string]any{"xs": vals})
+		if err != nil {
+			t.Fatalf("struct: %v", err)
+		}
+		tuple := tk("doc:11111111-1111-7111-8111-111111111111",
+			"viewer",
+			"user:22222222-2222-7222-8222-222222222222")
+		tuple.Condition = &openfgav1.RelationshipCondition{
+			Name: "lcond", Context: v}
+		_, err = c.Write(ctx, &openfgav1.WriteRequest{
+			StoreId:              store,
+			AuthorizationModelId: model,
+			Writes: &openfgav1.WriteRequestWrites{
+				TupleKeys: []*openfgav1.TupleKey{tuple}},
+		})
+		if err == nil {
+			return 0
+		}
+		s, _ := status.FromError(err)
+		return int(s.Code())
+	}
+
+	engCode := write(eng)
+	oraCode := write(ora)
+	if engCode != 2000 {
+		t.Errorf("engine side of the pin moved: got %d, want "+
+			"2000 (jsonb text over 32768) — update "+
+			"docs/CONFORMANCE.md", engCode)
+	}
+	if oraCode != 0 {
+		t.Errorf("oracle side of the pin moved: got %d, want "+
+			"acceptance (proto bytes under 32768) — update "+
+			"docs/CONFORMANCE.md", oraCode)
 	}
 }

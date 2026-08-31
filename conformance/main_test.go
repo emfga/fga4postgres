@@ -18,7 +18,7 @@ import (
 // generated skip decisions below and is bumped exactly when a
 // phase's exit criterion holds — the only hand-maintained input to
 // the skip machinery.
-const phase = 5
+const phase = 6
 
 // phase1b flips when the resolver grows intersection, difference
 // and TTU (the plan's interior 1a/1b gate).

@@ -325,13 +325,114 @@ BEGIN
 END;
 $$;
 
+-- Control-character scan over a condition context: keys and
+-- string values at any depth (a tab counts) refuse before
+-- anything else looks at the context — measured ordering, M39.
+CREATE OR REPLACE FUNCTION fga._ctx_scan(ctx jsonb)
+RETURNS void
+LANGUAGE plpgsql
+IMMUTABLE PARALLEL SAFE
+SET search_path = fga, pg_temp
+AS $$
+DECLARE
+  k text;
+  v jsonb;
+BEGIN
+  CASE jsonb_typeof(ctx)
+  WHEN 'object' THEN
+    FOR k, v IN SELECT * FROM jsonb_each(ctx) LOOP
+      IF k ~ '[\x01-\x1F\x7F]' THEN
+        RAISE EXCEPTION
+          'context key % contains forbidden characters',
+          to_json(k) USING ERRCODE = 'YF100';
+      END IF;
+      PERFORM fga._ctx_scan(v);
+    END LOOP;
+  WHEN 'array' THEN
+    FOR v IN SELECT * FROM jsonb_array_elements(ctx) LOOP
+      PERFORM fga._ctx_scan(v);
+    END LOOP;
+  WHEN 'string' THEN
+    IF (ctx #>> '{}') ~ '[\x01-\x1F\x7F]' THEN
+      RAISE EXCEPTION
+        'context value % contains forbidden characters',
+        ctx USING ERRCODE = 'YF100';
+    END IF;
+  ELSE
+    NULL;
+  END CASE;
+END;
+$$;
+
+-- Write-time condition-context gates (M29/M39): control chars,
+-- the 32KiB jsonb-text boundary (pinned different-boundary
+-- against upstream's 32768 proto bytes), undeclared parameters,
+-- and declared-type coercibility. Write only — checks accept
+-- undeclared keys.
+CREATE OR REPLACE FUNCTION fga._validate_write_context(
+  store_id uuid, model_id uuid,
+  cond text, ctx jsonb,
+  tuple_repr text
+)
+RETURNS void
+LANGUAGE plpgsql
+STABLE PARALLEL SAFE
+SET search_path = fga, pg_temp
+AS $$
+DECLARE
+  params jsonb;
+  k text;
+  v jsonb;
+BEGIN
+  IF ctx IS NULL OR ctx = '{}'::jsonb THEN
+    RETURN;
+  END IF;
+  PERFORM fga._ctx_scan(ctx);
+  IF octet_length(ctx::text) > 32768 THEN
+    RAISE EXCEPTION
+      'invalid tuple ''%'': condition context size limit '
+      'exceeded: % bytes exceeds 32768 bytes '
+      '(jsonb-normalized; fga4postgres boundary)',
+      tuple_repr, octet_length(ctx::text)
+      USING ERRCODE = 'YF100';
+  END IF;
+  SELECT c.parameters INTO params
+  FROM fga.model_condition c
+  WHERE c.store = store_id
+    AND c.model_id = _validate_write_context.model_id
+    AND c.name = cond;
+  FOR k, v IN SELECT * FROM jsonb_each(ctx) LOOP
+    IF params IS NULL OR NOT params ? k THEN
+      RAISE EXCEPTION
+        'invalid tuple ''%'': found invalid context '
+        'parameter: %', tuple_repr, k USING ERRCODE = 'YF100';
+    END IF;
+    -- Coercibility to the declared type. _param_value raises YF
+    -- for grammar refusals; substrate conversion errors (bad
+    -- numeric syntax and the like) wrap here so the write path
+    -- surfaces one code.
+    BEGIN
+      PERFORM fga._param_value(params -> k, v);
+    EXCEPTION
+      WHEN SQLSTATE 'YF000' THEN
+        RAISE;
+      WHEN OTHERS THEN
+        RAISE EXCEPTION
+          'invalid tuple ''%'': parameter type error on context '
+          'parameter ''%'': %', tuple_repr, k, SQLERRM
+          USING ERRCODE = 'YF100';
+    END;
+  END LOOP;
+END;
+$$;
+
 -- The single tuple write path (CLAUDE.md decision 8: every
 -- mutation goes through here, so a changelog is addable without
--- rework). Request is upstream's WriteRequest JSON shape.
---
--- Deferred to plan phase 6: exact upstream error codes for each
--- refusal, on_duplicate/on_missing ignore semantics, the full
--- 40-rule gate matrix.
+-- rework). Request is upstream's WriteRequest JSON shape,
+-- including writes.on_duplicate / deletes.on_missing (measured
+-- M35): "ignore" tolerates the identical duplicate and the
+-- missing delete, but a same-key row holding a DIFFERENT
+-- condition aborts (gRPC 10) even under ignore.
 CREATE OR REPLACE FUNCTION fga.write(
   store_id uuid,
   request jsonb
@@ -347,23 +448,62 @@ DECLARE
     request -> 'writes' -> 'tuple_keys', '[]'::jsonb);
   deletes jsonb := coalesce(
     request -> 'deletes' -> 'tuple_keys', '[]'::jsonb);
+  on_dup text := coalesce(
+    request -> 'writes' ->> 'on_duplicate', '');
+  on_miss text := coalesce(
+    request -> 'deletes' ->> 'on_missing', '');
   tkj jsonb;
   v record;
   d record;
   n integer;
+  seen text[] := '{}';
+  key text;
+  cond_name text;
+  cond_ctx jsonb;
+  old record;
 BEGIN
   model_id := fga._resolve_model(
     store_id, request ->> 'authorization_model_id');
 
+  IF on_dup NOT IN ('', 'error', 'ignore') THEN
+    RAISE EXCEPTION 'invalid on_duplicate option: %', on_dup
+      USING ERRCODE = 'YF100';
+  END IF;
+  IF on_miss NOT IN ('', 'error', 'ignore') THEN
+    RAISE EXCEPTION 'invalid on_missing option: %', on_miss
+      USING ERRCODE = 'YF100';
+  END IF;
+
   n := jsonb_array_length(writes) + jsonb_array_length(deletes);
   IF n = 0 THEN
-    RAISE EXCEPTION 'a write request must contain writes or '
-      'deletes' USING ERRCODE = 'YF100';
+    RAISE EXCEPTION 'Invalid input. Make sure you provide at '
+      'least one write, or at least one delete'
+      USING ERRCODE = 'YF103';
   END IF;
   IF n > 100 THEN
-    RAISE EXCEPTION 'a write request cannot exceed 100 tuples, '
-      'got %', n USING ERRCODE = 'YF100';
+    RAISE EXCEPTION 'The number of write operations exceeds the '
+      'allowed limit of 100' USING ERRCODE = 'YF153';
   END IF;
+
+  -- Request-level dedup across BOTH lists, before any row lands
+  -- (measured M35: the same key twice in writes, or once in
+  -- writes and once in deletes, refuses as 2004).
+  FOR tkj IN
+    SELECT * FROM jsonb_array_elements(writes)
+    UNION ALL
+    SELECT * FROM jsonb_array_elements(deletes)
+  LOOP
+    key := (tkj ->> 'object') || '#' || (tkj ->> 'relation')
+      || '@' || (tkj ->> 'user');
+    IF key = ANY (seen) THEN
+      RAISE EXCEPTION
+        'duplicate tuple in write: user: ''%'', relation: '
+        '''%'', object: ''%''', tkj ->> 'user',
+        tkj ->> 'relation', tkj ->> 'object'
+        USING ERRCODE = 'YF104';
+    END IF;
+    seen := seen || key;
+  END LOOP;
 
   FOR tkj IN SELECT * FROM jsonb_array_elements(writes) LOOP
     SELECT * INTO v FROM fga._validate_tuple(
@@ -371,20 +511,76 @@ BEGIN
       tkj ->> 'object', tkj ->> 'relation', tkj ->> 'user',
       tkj -> 'condition' ->> 'name',
       'YF100', 'YF100');
-    BEGIN
+
+    -- Implicit tuples are a write-only refusal — the same shape
+    -- is accepted contextually (measured M39; pinned both halves
+    -- in tsfga's inventory).
+    IF v.subject_type = v.object_type
+       AND v.subject_id = v.object_id
+       AND v.subject_relation = v.relation THEN
+      RAISE EXCEPTION
+        'invalid tuple ''%#%@%'': cannot write a tuple that is '
+        'implicit', tkj ->> 'object', tkj ->> 'relation',
+        tkj ->> 'user' USING ERRCODE = 'YF100';
+    END IF;
+
+    cond_name := tkj -> 'condition' ->> 'name';
+    cond_ctx := tkj -> 'condition' -> 'context';
+    IF coalesce(cond_name, '') <> '' THEN
+      PERFORM fga._validate_write_context(
+        store_id, model_id, cond_name, cond_ctx,
+        (tkj ->> 'object') || '#' || (tkj ->> 'relation')
+          || '@' || (tkj ->> 'user'));
+    END IF;
+
+    IF on_dup = 'ignore' THEN
       INSERT INTO fga.tuple (store, object_type, object_id,
         relation, subject_type, subject_id, subject_relation,
         condition_name, condition_context, ulid)
       VALUES (store_id, v.object_type, v.object_id, v.relation,
         v.subject_type, v.subject_id, v.subject_relation,
-        tkj -> 'condition' ->> 'name',
-        tkj -> 'condition' -> 'context',
-        fga._ulid());
-    EXCEPTION WHEN unique_violation THEN
-      RAISE EXCEPTION
-        'cannot write a tuple which already exists: %', tkj
-        USING ERRCODE = 'YF117';
-    END;
+        cond_name, cond_ctx, fga._ulid())
+      ON CONFLICT (store, object_type, object_id, relation,
+        subject_type, subject_id, subject_relation)
+      DO NOTHING;
+      IF NOT FOUND THEN
+        SELECT t.condition_name, t.condition_context INTO old
+        FROM fga.tuple t
+        WHERE t.store = store_id
+          AND t.object_type = v.object_type
+          AND t.object_id = v.object_id
+          AND t.relation = v.relation
+          AND t.subject_type = v.subject_type
+          AND t.subject_id = v.subject_id
+          AND t.subject_relation = v.subject_relation;
+        IF coalesce(old.condition_name, '')
+             IS DISTINCT FROM coalesce(cond_name, '')
+           OR coalesce(old.condition_context, '{}'::jsonb)
+             IS DISTINCT FROM coalesce(cond_ctx, '{}'::jsonb)
+        THEN
+          RAISE EXCEPTION
+            'transactional write failed due to conflict: '
+            'attempted to write a tuple which already exists '
+            'with a different condition: user: ''%'', relation: '
+            '''%'', object: ''%''', tkj ->> 'user',
+            tkj ->> 'relation', tkj ->> 'object'
+            USING ERRCODE = 'YFG10';
+        END IF;
+      END IF;
+    ELSE
+      BEGIN
+        INSERT INTO fga.tuple (store, object_type, object_id,
+          relation, subject_type, subject_id, subject_relation,
+          condition_name, condition_context, ulid)
+        VALUES (store_id, v.object_type, v.object_id, v.relation,
+          v.subject_type, v.subject_id, v.subject_relation,
+          cond_name, cond_ctx, fga._ulid());
+      EXCEPTION WHEN unique_violation THEN
+        RAISE EXCEPTION
+          'cannot write a tuple which already exists: %', tkj
+          USING ERRCODE = 'YF117';
+      END;
+    END IF;
   END LOOP;
 
   -- Deletes are validated syntactically only — never against the
@@ -413,7 +609,7 @@ BEGIN
       AND t.subject_type = d.subject_type
       AND t.subject_id = d.sid
       AND t.subject_relation = d.subject_relation;
-    IF NOT FOUND THEN
+    IF NOT FOUND AND on_miss <> 'ignore' THEN
       RAISE EXCEPTION
         'cannot delete a tuple which does not exist: %', tkj
         USING ERRCODE = 'YF117';
@@ -422,6 +618,186 @@ BEGIN
 
   RETURN '{}'::jsonb;
 END;
+$$;
+
+-- Filtered tuple listing with keyset pagination (plan §1.8):
+-- deliberately UNFILTERED by the model — the maintenance escape
+-- hatch that can see rows a model change stranded. The token is
+-- bound to its filter (upstream's positional token silently
+-- misaligns under a changed filter — measured M27; refusing
+-- here) and pages by ulid keyset, so a page boundary never
+-- loses or repeats a row.
+CREATE OR REPLACE FUNCTION fga.read(
+  store_id uuid,
+  request jsonb
+)
+RETURNS jsonb
+LANGUAGE plpgsql
+STABLE PARALLEL SAFE
+SET search_path = fga, pg_temp
+AS $$
+DECLARE
+  tkey jsonb := request -> 'tuple_key';
+  o record;
+  s record;
+  f_otype text := '';
+  f_oid uuid;
+  f_rel text := '';
+  f_stype text := '';
+  f_sid uuid;
+  f_srel text := '';
+  f_swild boolean := false;
+  have_user boolean := false;
+  page integer := coalesce((request ->> 'page_size')::integer,
+                           50);
+  token text := coalesce(
+    request ->> 'continuation_token', '');
+  fhash text;
+  after text := '';
+  tok jsonb;
+  rows jsonb;
+  last_ulid text;
+  cnt integer;
+BEGIN
+  IF page < 1 OR page > 100 THEN
+    RAISE EXCEPTION
+      'page_size must be inside range [1, 100], got %', page
+      USING ERRCODE = 'YF100';
+  END IF;
+
+  IF tkey IS NOT NULL AND tkey <> '{}'::jsonb THEN
+    -- Measured filter rule (M26): object TYPE is required, and
+    -- object id or user must be present.
+    SELECT * INTO o FROM fga._parse_object(
+      coalesce(tkey ->> 'object', ''));
+    IF o.object_type = ''
+       OR (o.id_text = ''
+           AND coalesce(tkey ->> 'user', '') = '') THEN
+      RAISE EXCEPTION
+        'the ''tuple_key'' field was provided but the object '
+        'type field is required and both the object id and user '
+        'cannot be empty' USING ERRCODE = 'YF100';
+    END IF;
+    f_otype := o.object_type;
+    IF o.id_text <> '' THEN
+      f_oid := fga._uuid_or_null(o.id_text);
+      IF f_oid IS NULL THEN
+        RAISE EXCEPTION
+          'invalid object id ''%'': not a canonical uuid '
+          '(fga4postgres id domain)', o.id_text
+          USING ERRCODE = 'YF100';
+      END IF;
+    END IF;
+    f_rel := coalesce(tkey ->> 'relation', '');
+    IF coalesce(tkey ->> 'user', '') <> '' THEN
+      SELECT * INTO s FROM fga._parse_subject(tkey ->> 'user');
+      IF NOT s.ok THEN
+        RAISE EXCEPTION 'invalid user filter ''%''',
+          tkey ->> 'user' USING ERRCODE = 'YF100';
+      END IF;
+      have_user := true;
+      f_stype := s.subject_type;
+      f_srel := s.subject_relation;
+      f_swild := s.is_wildcard;
+      IF s.is_wildcard THEN
+        f_sid := '00000000-0000-0000-0000-000000000000';
+      ELSE
+        f_sid := fga._uuid_or_null(s.id_text);
+        IF f_sid IS NULL THEN
+          RAISE EXCEPTION
+            'invalid user id ''%'': not a canonical uuid '
+            '(fga4postgres id domain)', s.id_text
+            USING ERRCODE = 'YF100';
+        END IF;
+      END IF;
+    END IF;
+  END IF;
+
+  fhash := md5(concat_ws('|', f_otype, f_oid::text, f_rel,
+    f_stype, f_sid::text, f_srel, f_swild::text));
+
+  IF token <> '' THEN
+    BEGIN
+      tok := convert_from(
+        decode(translate(token, '-_', '+/'), 'base64'),
+        'utf8')::jsonb;
+    EXCEPTION WHEN OTHERS THEN
+      RAISE EXCEPTION 'Invalid continuation token'
+        USING ERRCODE = 'YF107';
+    END;
+    IF tok ->> 'f' IS DISTINCT FROM fhash
+       OR tok ->> 'u' IS NULL THEN
+      RAISE EXCEPTION 'Invalid continuation token'
+        USING ERRCODE = 'YF107';
+    END IF;
+    after := tok ->> 'u';
+  END IF;
+
+  SELECT coalesce(jsonb_agg(x.j), '[]'::jsonb),
+         max(x.ulid), count(*)
+    INTO rows, last_ulid, cnt
+  FROM (
+    SELECT t.ulid, jsonb_build_object(
+      'key', jsonb_build_object(
+        'object', t.object_type || ':' || t.object_id::text,
+        'relation', t.relation,
+        'user', t.subject_type || ':'
+          || CASE WHEN t.subject_id =
+                '00000000-0000-0000-0000-000000000000'
+              AND t.subject_relation = ''
+             THEN '*' ELSE t.subject_id::text END
+          || CASE WHEN t.subject_relation <> ''
+             THEN '#' || t.subject_relation ELSE '' END)
+        || CASE WHEN coalesce(t.condition_name, '') <> ''
+           THEN jsonb_build_object('condition',
+             jsonb_strip_nulls(jsonb_build_object(
+               'name', t.condition_name,
+               'context', t.condition_context)))
+           ELSE '{}'::jsonb END,
+      'timestamp', fga._ulid_time(t.ulid)) AS j
+    FROM fga.tuple t
+    WHERE t.store = store_id
+      AND (f_otype = '' OR t.object_type = f_otype)
+      AND (f_oid IS NULL OR t.object_id = f_oid)
+      AND (f_rel = '' OR t.relation = f_rel)
+      AND (NOT have_user OR (
+        t.subject_type = f_stype
+        AND t.subject_id = f_sid
+        AND t.subject_relation = f_srel))
+      AND (after = '' OR t.ulid > after)
+    ORDER BY t.ulid
+    LIMIT page
+  ) x;
+
+  RETURN jsonb_build_object(
+    'tuples', rows,
+    'continuation_token',
+    -- URL-safe base64: the proto token pattern admits only
+    -- [A-Za-z0-9-_] plus padding.
+    CASE WHEN cnt = page THEN
+      translate(replace(encode(convert_to(jsonb_build_object(
+        'u', last_ulid, 'f', fhash)::text, 'utf8'), 'base64'),
+        E'\n', ''), '+/', '-_')
+    ELSE '' END);
+END;
+$$;
+
+-- The RFC 3339 write timestamp a ulid's leading 48 bits encode.
+CREATE OR REPLACE FUNCTION fga._ulid_time(u text)
+RETURNS text
+LANGUAGE sql
+IMMUTABLE PARALLEL SAFE
+SET search_path = fga, pg_temp
+AS $$
+  SELECT to_char(
+    to_timestamp((
+      SELECT sum(
+        (strpos('0123456789ABCDEFGHJKMNPQRSTVWXYZ',
+                substr(u, i, 1)) - 1)::bigint
+        << ((10 - i) * 5))
+      FROM generate_series(1, 10) i
+    )::double precision / 1000) AT TIME ZONE 'UTC',
+    'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"');
 $$;
 
 -- Overlay reads (plan §1.4). With conditions out of play until

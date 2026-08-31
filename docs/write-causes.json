@@ -1,0 +1,330 @@
+{
+  "pin": "v1.19.0",
+  "files": [
+    "internal/validation/validation.go",
+    "pkg/tuple/tuple.go",
+    "pkg/server/commands/write.go",
+    "pkg/typesystem/typesystem.go",
+    "internal/condition/condition.go"
+  ],
+  "causes": [
+    {
+      "file": "internal/condition/condition.go",
+      "message": "condition expression construction: %w",
+      "disposition": "claimed",
+      "note": "model write compiles via cel.parse; failure refuses 2056 (TestModelGateMatrix)"
+    },
+    {
+      "file": "internal/condition/condition.go",
+      "message": "expected CEL type conversion to return native Go bool",
+      "disposition": "n/a",
+      "note": "cel-go internal invariant; cel4postgres evaluates through its own layer"
+    },
+    {
+      "file": "internal/condition/condition.go",
+      "message": "expected a bool condition expression output, but got '%s'",
+      "disposition": "pinned",
+      "note": "accepting-at-model-write divergence: no declared-variable type check; a non-bool condition refuses at evaluation instead (docs/CONFORMANCE.md, M15)"
+    },
+    {
+      "file": "internal/condition/condition.go",
+      "message": "failed to construct condition partial vars: %w",
+      "disposition": "n/a",
+      "note": "partial-evaluation machinery; the engine evaluates unchecked with the merged context"
+    },
+    {
+      "file": "internal/condition/condition.go",
+      "message": "failed to convert condition output to bool: %w",
+      "disposition": "pinned",
+      "note": "same accepting-at-model-write family: eval-time refusal, scoped per API (M07/M24)"
+    },
+    {
+      "file": "internal/condition/condition.go",
+      "message": "failed to convert context parameter '%s': %w",
+      "disposition": "claimed",
+      "note": "write: uncoercible parameter refuses 2000 (TestWriteGateMatrix); eval: condition-error scoping"
+    },
+    {
+      "file": "internal/condition/condition.go",
+      "message": "failed to decode condition parameter type '%s': %w",
+      "disposition": "n/a",
+      "note": "proto decode layer; the engine stores jsonb parameter declarations verbatim"
+    },
+    {
+      "file": "internal/condition/condition.go",
+      "message": "failed to decode parameter type for parameter '%s': %w",
+      "disposition": "n/a",
+      "note": "proto decode layer"
+    },
+    {
+      "file": "internal/condition/condition.go",
+      "message": "failed to evaluate condition expression: %w",
+      "disposition": "claimed",
+      "note": "evaluation errors scoped per measured contract: check drops for a granting sibling, list_objects count-gates, list_users immediate (M07/M24)"
+    },
+    {
+      "file": "internal/condition/condition.go",
+      "message": "no parameters defined for the condition",
+      "disposition": "claimed",
+      "note": "context against a parameterless condition refuses as an undeclared parameter at write (TestWriteGateMatrix)"
+    },
+    {
+      "file": "internal/validation/validation.go",
+      "message": "'%s#%s' is not an allowed type restriction for '%s#%s'",
+      "disposition": "claimed",
+      "note": "facet gate in fga._validate_tuple (TestWriteGateMatrix: subject not admitted)"
+    },
+    {
+      "file": "internal/validation/validation.go",
+      "message": "condition is missing",
+      "disposition": "claimed",
+      "note": "condition-binding facet gate, M38 split (TestWriteGateMatrix: condition missing)"
+    },
+    {
+      "file": "internal/validation/validation.go",
+      "message": "condition name contains forbidden characters",
+      "disposition": "n/a",
+      "note": "the proto name regex refuses first at the API boundary (measured M39); unreachable through gRPC"
+    },
+    {
+      "file": "internal/validation/validation.go",
+      "message": "context key %q contains forbidden characters",
+      "disposition": "claimed",
+      "note": "fga._ctx_scan (TestWriteGateMatrix: newline in context key)"
+    },
+    {
+      "file": "internal/validation/validation.go",
+      "message": "context value %q contains forbidden characters",
+      "disposition": "claimed",
+      "note": "fga._ctx_scan (TestWriteGateMatrix: tab in context string value)"
+    },
+    {
+      "file": "internal/validation/validation.go",
+      "message": "found invalid context parameter: %s",
+      "disposition": "claimed",
+      "note": "undeclared-parameter write gate (TestWriteGateMatrix)"
+    },
+    {
+      "file": "internal/validation/validation.go",
+      "message": "invalid 'object' field format",
+      "disposition": "claimed",
+      "note": "fga._parse_object gate (TestWriteGateMatrix)"
+    },
+    {
+      "file": "internal/validation/validation.go",
+      "message": "invalid condition for type restriction",
+      "disposition": "claimed",
+      "note": "condition-binding facet gate (TestWriteGateMatrix)"
+    },
+    {
+      "file": "internal/validation/validation.go",
+      "message": "the 'object' field cannot reference a typed wildcard",
+      "disposition": "claimed",
+      "note": "the uuid id gate refuses '*' as an object id with the same code (TestWriteGateMatrix)"
+    },
+    {
+      "file": "internal/validation/validation.go",
+      "message": "the 'relation' field is malformed",
+      "disposition": "claimed",
+      "note": "relation regex in fga._validate_tuple (TestWriteGateMatrix)"
+    },
+    {
+      "file": "internal/validation/validation.go",
+      "message": "the 'user' field is malformed",
+      "disposition": "claimed",
+      "note": "fga._parse_subject gate (TestWriteGateMatrix: wildcard-with-relation, trailing hash, type-only user)"
+    },
+    {
+      "file": "internal/validation/validation.go",
+      "message": "the 'user' field must be an object (e.g. document:1) or an 'object#relation' or a typed wildcard (e.g. group:*)",
+      "disposition": "claimed",
+      "note": "same subject parse gate"
+    },
+    {
+      "file": "internal/validation/validation.go",
+      "message": "the typed wildcard '%s' is not an allowed type restriction for '%s#%s'",
+      "disposition": "claimed",
+      "note": "facet gate with is_wildcard"
+    },
+    {
+      "file": "internal/validation/validation.go",
+      "message": "type '%s' does not exist in the authorization model",
+      "disposition": "claimed",
+      "note": "type lookup in fga._validate_tuple; code per API surface (M10/M37)"
+    },
+    {
+      "file": "internal/validation/validation.go",
+      "message": "type '%s' is not an allowed type restriction for '%s#%s'",
+      "disposition": "claimed",
+      "note": "facet gate"
+    },
+    {
+      "file": "internal/validation/validation.go",
+      "message": "undefined condition",
+      "disposition": "claimed",
+      "note": "condition lookup in fga._validate_tuple (TestWriteGateMatrix)"
+    },
+    {
+      "file": "internal/validation/validation.go",
+      "message": "unexpected rewrite encountered with tupleset relation '%s#%s'",
+      "disposition": "claimed",
+      "note": "CONFIG tupleset-not-direct refuses at model write (TestModelGateMatrix), so the read-path guard cannot fire"
+    },
+    {
+      "file": "internal/validation/validation.go",
+      "message": "unexpected user '%s' with tupleset relation '%s#%s'",
+      "disposition": "claimed",
+      "note": "CONFIG tupleset-admits-userset refuses at model write; _read_tupleset reads plain parents only"
+    },
+    {
+      "file": "internal/validation/validation.go",
+      "message": "unexpected wildcard relationship with tupleset relation '%s#%s'",
+      "disposition": "claimed",
+      "note": "CONFIG tupleset-admits-wildcard refuses at model write"
+    },
+    {
+      "file": "pkg/server/commands/write.go",
+      "message": "cannot write a tuple that is implicit",
+      "disposition": "claimed",
+      "note": "write-only implicit refusal (TestWriteGateMatrix); accepted contextually, both halves per tsfga's pin"
+    },
+    {
+      "file": "pkg/server/commands/write.go",
+      "message": "condition context size limit exceeded: %d bytes exceeds %d bytes",
+      "disposition": "pinned",
+      "note": "different-boundary: 32768 jsonb-normalized text bytes vs 32768 proto bytes (PIN-CTX-1, M29)"
+    },
+    {
+      "file": "pkg/server/commands/write.go",
+      "message": "invalid on_duplicate option: %s",
+      "disposition": "claimed",
+      "note": "TestWriteGateMatrix: bogus on_duplicate"
+    },
+    {
+      "file": "pkg/server/commands/write.go",
+      "message": "invalid on_missing option: %s",
+      "disposition": "claimed",
+      "note": "same gate in fga.write"
+    },
+    {
+      "file": "pkg/server/commands/write.go",
+      "message": "the 'user' field is malformed",
+      "disposition": "claimed",
+      "note": "subject parse gate"
+    },
+    {
+      "file": "pkg/tuple/tuple.go",
+      "message": "expected at least one '#' separating the object and relation",
+      "disposition": "n/a",
+      "note": "string-form tuple parsing for CLI and test helpers; the gRPC write path consumes structured TupleKeys"
+    },
+    {
+      "file": "pkg/tuple/tuple.go",
+      "message": "expected at least one '@' separating the relation and user",
+      "disposition": "n/a",
+      "note": "string-form tuple parsing helper"
+    },
+    {
+      "file": "pkg/tuple/tuple.go",
+      "message": "invalid tuple 'object' field format",
+      "disposition": "claimed",
+      "note": "object parse gate"
+    },
+    {
+      "file": "pkg/tuple/tuple.go",
+      "message": "invalid tuple 'relation' field format",
+      "disposition": "claimed",
+      "note": "relation regex gate"
+    },
+    {
+      "file": "pkg/tuple/tuple.go",
+      "message": "invalid tuple 'user' field format",
+      "disposition": "claimed",
+      "note": "subject parse gate"
+    },
+    {
+      "file": "pkg/typesystem/typesystem.go",
+      "message": "%w: %s does not appear as a relation in any of the directly related user types %s",
+      "disposition": "pinned",
+      "note": "accepting-at-model-write: the engine stores such models; a TTU whose computed relation is undefined on the linked type answers false at resolution (measured phase 1); docs/CONFORMANCE.md"
+    },
+    {
+      "file": "pkg/typesystem/typesystem.go",
+      "message": "%w: '%s#%s' as intersection has less than 2 children",
+      "disposition": "claimed",
+      "note": "CONFIG rule in fga._validate_model (TestModelGateMatrix)"
+    },
+    {
+      "file": "pkg/typesystem/typesystem.go",
+      "message": "%w: '%s#%s' as union has less than 2 children",
+      "disposition": "claimed",
+      "note": "CONFIG rule in fga._validate_model (TestModelGateMatrix)"
+    },
+    {
+      "file": "pkg/typesystem/typesystem.go",
+      "message": "condition key '%s' does not match condition name '%s'",
+      "disposition": "claimed",
+      "note": "CONFIG rule in fga._validate_model (TestModelGateMatrix)"
+    },
+    {
+      "file": "pkg/typesystem/typesystem.go",
+      "message": "could not find node with label: %s",
+      "disposition": "n/a",
+      "note": "weighted-graph internal invariant; no weight machinery here (workspace decision 12)"
+    },
+    {
+      "file": "pkg/typesystem/typesystem.go",
+      "message": "hasEntrypoints unknown rewrite %s for '%s#%s'",
+      "disposition": "n/a",
+      "note": "internal invariant of upstream's entrypoint analysis"
+    },
+    {
+      "file": "pkg/typesystem/typesystem.go",
+      "message": "no outgoing edges from node: %s",
+      "disposition": "n/a",
+      "note": "weighted-graph internal invariant"
+    },
+    {
+      "file": "pkg/typesystem/typesystem.go",
+      "message": "the '%s#%s' relation is referenced in at least one tupleset and thus must be a direct relation",
+      "disposition": "claimed",
+      "note": "CONFIG tupleset-not-direct (TestModelGateMatrix)"
+    },
+    {
+      "file": "pkg/typesystem/typesystem.go",
+      "message": "the type name of a type definition cannot be an empty string",
+      "disposition": "claimed",
+      "note": "type-name grammar in fga._validate_model; the proto pattern also refuses at the adapter"
+    },
+    {
+      "file": "pkg/typesystem/typesystem.go",
+      "message": "type '%s' defines a relation with an empty string for a name",
+      "disposition": "claimed",
+      "note": "relation-name grammar in fga._validate_model"
+    },
+    {
+      "file": "pkg/typesystem/typesystem.go",
+      "message": "undefined type definition for '%s#%s'",
+      "disposition": "claimed",
+      "note": "restriction/rewrite reference rules in fga._validate_model (TestModelGateMatrix)"
+    },
+    {
+      "file": "pkg/typesystem/typesystem.go",
+      "message": "unexpected userset rewrite type encountered",
+      "disposition": "n/a",
+      "note": "internal invariant; the engine raises a non-YF error on an unknown operator, surfacing as a bug rather than a refusal"
+    },
+    {
+      "file": "pkg/typesystem/typesystem.go",
+      "message": "unsupported rewrite %s",
+      "disposition": "n/a",
+      "note": "internal invariant"
+    },
+    {
+      "file": "pkg/typesystem/typesystem.go",
+      "message": "weighted graph is nil",
+      "disposition": "n/a",
+      "note": "weighted-graph internal; no weight machinery (decision 12)"
+    }
+  ]
+}

@@ -264,13 +264,16 @@ BEGIN
     WHERE c.store = store_id AND c.model_id = new_id
       AND c.compiled_ast ? 'errors'
   ) THEN
-    RAISE EXCEPTION 'failed to compile condition: %', (
+    RAISE EXCEPTION 'failed to compile expression on condition: %',
+    (
       SELECT c.compiled_ast -> 'errors' -> 0 ->> 'msg'
       FROM fga.model_condition c
       WHERE c.store = store_id AND c.model_id = new_id
         AND c.compiled_ast ? 'errors' LIMIT 1
-    ) USING ERRCODE = 'YF100';
+    ) USING ERRCODE = 'YF156';
   END IF;
+
+  PERFORM fga._validate_model(store_id, new_id, request);
 
   -- Reachability closure. Edges lead from a relation node
   -- (type, relation) to every node it can grant through:
@@ -321,6 +324,264 @@ BEGIN
 
   RETURN jsonb_build_object('authorization_model_id',
                             new_id::text);
+END;
+$$;
+
+-- The CONFIG-* model validation rules (plan phase 6), every one
+-- measured against the oracle (measurements M16) and refused with
+-- YF156 (2056 invalid_authorization_model). Whole-model atomic
+-- validation (CLAUDE.md decision 3) closes the forward-reference
+-- gaps a per-relation gate cannot decide.
+--
+-- Deliberately absent (accepting-direction divergences, in
+-- docs/CONFORMANCE.md): upstream's whole-model entrypoint
+-- analysis ("no entrypoints defined") and condition
+-- result-type/cost checking (M15).
+CREATE OR REPLACE FUNCTION fga._validate_model(
+  store_id uuid,
+  new_id uuid,
+  request jsonb
+)
+RETURNS void
+LANGUAGE plpgsql
+STABLE PARALLEL SAFE
+SET search_path = fga, pg_temp
+AS $$
+DECLARE
+  r record;
+BEGIN
+  IF coalesce(request ->> 'schema_version', '1.1') <> '1.1' THEN
+    RAISE EXCEPTION 'invalid schema version'
+      USING ERRCODE = 'YF156';
+  END IF;
+
+  -- Names: grammar and the reserved keywords.
+  FOR r IN
+    SELECT t.type_name FROM fga.model_type t
+    WHERE t.store = store_id AND t.model_id = new_id
+      AND (t.type_name !~ '^[^:#@\s]{1,254}$'
+           OR t.type_name IN ('self', 'this'))
+  LOOP
+    RAISE EXCEPTION 'the definition of type ''%'' is invalid',
+      r.type_name USING ERRCODE = 'YF156';
+  END LOOP;
+  FOR r IN
+    SELECT mr.type_name, mr.relation_name
+    FROM fga.model_relation mr
+    WHERE mr.store = store_id AND mr.model_id = new_id
+      AND (mr.relation_name !~ '^[^:#@\s]{1,50}$'
+           OR mr.relation_name IN ('self', 'this'))
+  LOOP
+    RAISE EXCEPTION
+      'the definition of relation ''%'' in object type ''%'' is '
+      'invalid: self and this are reserved keywords',
+      r.relation_name, r.type_name USING ERRCODE = 'YF156';
+  END LOOP;
+  FOR r IN
+    SELECT c.name FROM fga.model_condition c
+    WHERE c.store = store_id AND c.model_id = new_id
+      AND c.name !~ '^[^:#@\s]{1,50}$'
+  LOOP
+    RAISE EXCEPTION 'invalid condition name ''%''', r.name
+      USING ERRCODE = 'YF156';
+  END LOOP;
+
+  -- Restrictions must reference defined types, relations and
+  -- conditions.
+  FOR r IN
+    SELECT tr.type_name, tr.relation_name, tr.subject_type,
+           tr.subject_relation, tr.condition_name
+    FROM fga.model_type_restriction tr
+    WHERE tr.store = store_id AND tr.model_id = new_id
+  LOOP
+    IF NOT EXISTS (
+      SELECT FROM fga.model_type t
+      WHERE t.store = store_id AND t.model_id = new_id
+        AND t.type_name = r.subject_type
+    ) OR (r.subject_relation <> '' AND NOT EXISTS (
+      SELECT FROM fga.model_relation mr
+      WHERE mr.store = store_id AND mr.model_id = new_id
+        AND mr.type_name = r.subject_type
+        AND mr.relation_name = r.subject_relation
+    )) THEN
+      RAISE EXCEPTION
+        'the relation type ''%'' on ''%'' in object type ''%'' '
+        'is not valid',
+        r.subject_type || CASE WHEN r.subject_relation <> ''
+          THEN '#' || r.subject_relation ELSE '' END,
+        r.relation_name, r.type_name USING ERRCODE = 'YF156';
+    END IF;
+    IF r.condition_name <> '' AND NOT EXISTS (
+      SELECT FROM fga.model_condition c
+      WHERE c.store = store_id AND c.model_id = new_id
+        AND c.name = r.condition_name
+    ) THEN
+      RAISE EXCEPTION
+        'condition % is undefined for relation %',
+        r.condition_name, r.relation_name
+        USING ERRCODE = 'YF156';
+    END IF;
+  END LOOP;
+
+  -- An assignable relation must admit at least one restriction;
+  -- rewrites must name defined same-type relations; intersections
+  -- need two operands.
+  FOR r IN
+    SELECT mr.type_name, mr.relation_name, mr.rewrite,
+           mr.is_assignable
+    FROM fga.model_relation mr
+    WHERE mr.store = store_id AND mr.model_id = new_id
+  LOOP
+    IF EXISTS (
+      SELECT FROM fga._rewrite_nodes(r.rewrite) n
+      WHERE n ? 'this'
+    ) AND NOT r.is_assignable THEN
+      RAISE EXCEPTION
+        'the assignable relation ''%'' in object type ''%'' '
+        'must contain at least one relation type',
+        r.relation_name, r.type_name USING ERRCODE = 'YF156';
+    END IF;
+    IF EXISTS (
+      SELECT FROM fga._rewrite_nodes(r.rewrite) n
+      WHERE n ? 'intersection'
+        AND coalesce(jsonb_array_length(
+              n -> 'intersection' -> 'child'), 0) < 2
+    ) THEN
+      RAISE EXCEPTION
+        'invalid relation: ''%#%'' as intersection has less '
+        'than 2 children', r.type_name, r.relation_name
+        USING ERRCODE = 'YF156';
+    END IF;
+    IF EXISTS (
+      SELECT FROM fga._rewrite_nodes(r.rewrite) n
+      WHERE n ? 'union'
+        AND coalesce(jsonb_array_length(
+              n -> 'union' -> 'child'), 0) < 2
+    ) THEN
+      RAISE EXCEPTION
+        'invalid relation: ''%#%'' as union has less '
+        'than 2 children', r.type_name, r.relation_name
+        USING ERRCODE = 'YF156';
+    END IF;
+  END LOOP;
+
+  -- A conditions-map key must name its condition.
+  FOR r IN
+    SELECT cond.key AS k, cond.value ->> 'name' AS n
+    FROM jsonb_each(coalesce(
+      request -> 'conditions', '{}'::jsonb)) cond
+    WHERE coalesce(cond.value ->> 'name', cond.key) <> cond.key
+  LOOP
+    RAISE EXCEPTION
+      'condition key ''%'' does not match condition name ''%''',
+      r.k, r.n USING ERRCODE = 'YF156';
+  END LOOP;
+  FOR r IN
+    SELECT mc.type_name, mc.relation_name, mc.computed_relation
+    FROM fga.model_computed mc
+    WHERE mc.store = store_id AND mc.model_id = new_id
+      AND NOT EXISTS (
+        SELECT FROM fga.model_relation mr
+        WHERE mr.store = store_id AND mr.model_id = new_id
+          AND mr.type_name = mc.type_name
+          AND mr.relation_name = mc.computed_relation)
+  LOOP
+    RAISE EXCEPTION '''%#%'' relation is undefined',
+      r.type_name, r.computed_relation USING ERRCODE = 'YF156';
+  END LOOP;
+
+  -- Same-object rewrite cycles over computed-userset edges (the
+  -- walk upstream does — direct assignment and TTUs are not
+  -- followed). Depth-1 carries its own upstream message.
+  FOR r IN
+    SELECT mc.type_name, mc.relation_name
+    FROM fga.model_computed mc
+    WHERE mc.store = store_id AND mc.model_id = new_id
+      AND mc.computed_relation = mc.relation_name
+  LOOP
+    RAISE EXCEPTION
+      'the definition of relation ''%'' in object type ''%'' is '
+      'invalid: invalid userset rewrite definition',
+      r.relation_name, r.type_name USING ERRCODE = 'YF156';
+  END LOOP;
+  FOR r IN
+    WITH RECURSIVE walk AS (
+      SELECT mc.type_name, mc.relation_name AS origin,
+             mc.computed_relation AS at, 1 AS n
+      FROM fga.model_computed mc
+      WHERE mc.store = store_id AND mc.model_id = new_id
+      UNION ALL
+      SELECT w.type_name, w.origin, mc.computed_relation,
+             w.n + 1
+      FROM walk w
+      JOIN fga.model_computed mc
+        ON mc.store = store_id AND mc.model_id = new_id
+       AND mc.type_name = w.type_name
+       AND mc.relation_name = w.at
+      WHERE w.n < 60 AND w.at <> w.origin
+    )
+    SELECT DISTINCT w.type_name, w.origin FROM walk w
+    WHERE w.at = w.origin
+  LOOP
+    RAISE EXCEPTION
+      'the definition of relation ''%'' in object type ''%'' is '
+      'invalid: potential loop',
+      r.origin, r.type_name USING ERRCODE = 'YF156';
+  END LOOP;
+
+  -- The three tupleset rules: the tupleset relation must exist,
+  -- be purely direct, and admit neither usersets nor wildcards.
+  FOR r IN
+    SELECT DISTINCT t.type_name, t.relation_name,
+           t.tupleset_relation
+    FROM fga.model_ttu t
+    WHERE t.store = store_id AND t.model_id = new_id
+  LOOP
+    IF NOT EXISTS (
+      SELECT FROM fga.model_relation mr
+      WHERE mr.store = store_id AND mr.model_id = new_id
+        AND mr.type_name = r.type_name
+        AND mr.relation_name = r.tupleset_relation
+    ) THEN
+      RAISE EXCEPTION '''%#%'' relation is undefined',
+        r.type_name, r.tupleset_relation USING ERRCODE = 'YF156';
+    END IF;
+    IF EXISTS (
+      SELECT FROM fga.model_relation mr,
+                  fga._rewrite_nodes(mr.rewrite) n
+      WHERE mr.store = store_id AND mr.model_id = new_id
+        AND mr.type_name = r.type_name
+        AND mr.relation_name = r.tupleset_relation
+        AND NOT n ? 'this'
+    ) THEN
+      RAISE EXCEPTION
+        'the ''%#%'' relation is referenced in at least one '
+        'tupleset and thus must be a direct relation',
+        r.type_name, r.tupleset_relation USING ERRCODE = 'YF156';
+    END IF;
+    IF EXISTS (
+      SELECT FROM fga.model_type_restriction tr
+      WHERE tr.store = store_id AND tr.model_id = new_id
+        AND tr.type_name = r.type_name
+        AND tr.relation_name = r.tupleset_relation
+        AND (tr.subject_relation <> '' OR tr.is_wildcard)
+    ) THEN
+      RAISE EXCEPTION
+        'the relation type ''%'' on ''%'' in object type ''%'' '
+        'is not valid', (
+          SELECT tr.subject_type
+            || CASE WHEN tr.is_wildcard THEN ''
+               WHEN tr.subject_relation <> ''
+               THEN '#' || tr.subject_relation ELSE '' END
+          FROM fga.model_type_restriction tr
+          WHERE tr.store = store_id AND tr.model_id = new_id
+            AND tr.type_name = r.type_name
+            AND tr.relation_name = r.tupleset_relation
+            AND (tr.subject_relation <> '' OR tr.is_wildcard)
+          LIMIT 1),
+        r.tupleset_relation, r.type_name USING ERRCODE = 'YF156';
+    END IF;
+  END LOOP;
 END;
 $$;
 

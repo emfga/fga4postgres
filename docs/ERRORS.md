@@ -32,11 +32,13 @@ derived mechanically so new allocations never need judgment:
 
 - upstream `ErrorCode` 2000+nn (nn < 100)  → `YF1` + nn zero-padded
 - upstream `NotFoundErrorCode` 5000+nn     → `YF5` + nn zero-padded
+- a plain gRPC status code nn (no domain
+  code — upstream raises the bare status)  → `YFG` + nn zero-padded
 
 The conformance harness inverts the same rule: SQLSTATE `YF1nn`
-maps back to gRPC status code 2000+nn, `YF5nn` to 5000+nn — the
-numbers upstream carries as the gRPC status code and the corpus
-asserts with `errorCode:`.
+maps back to gRPC status code 2000+nn, `YF5nn` to 5000+nn, and
+`YFGnn` to the bare code nn — the numbers upstream carries as the
+gRPC status code and the corpus asserts with `errorCode:`.
 
 ## Initial allocations
 
@@ -50,6 +52,12 @@ asserts with `errorCode:`.
 | YF121 | 2021 | type_not_found |
 | YF122 | 2022 | relation_not_found |
 | YF127 | 2027 | invalid_tuple |
+| YF103 | 2003 | invalid_write_input |
+| YF104 | 2004 | cannot_allow_duplicate_tuples_in_one_request |
+| YF107 | 2007 | invalid_continuation_token |
+| YF153 | 2053 | exceeded_entity_limit |
+| YF156 | 2056 | invalid_authorization_model |
+| YFG10 | gRPC 10 | Aborted (transactional write conflict) |
 | YF502 | 5002 | store_id_not_found |
 
 The v1.19.0 corpus asserts 2000, 2002, 2021, 2022 and 2027; the

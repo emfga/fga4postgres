@@ -77,6 +77,8 @@ func translate(err error) error {
 		return status.Error(codes.Code(2000+nn), pgErr.Message)
 	case '5':
 		return status.Error(codes.Code(5000+nn), pgErr.Message)
+	case 'G':
+		return status.Error(codes.Code(nn), pgErr.Message)
 	}
 	return err
 }
@@ -104,6 +106,8 @@ func validate(in proto.Message) error {
 			m.AuthorizationModelId = dummyULID
 		}
 	case *openfgav1.WriteAuthorizationModelRequest:
+		m.StoreId = dummyULID
+	case *openfgav1.ReadRequest:
 		m.StoreId = dummyULID
 	case *openfgav1.ListObjectsRequest:
 		m.StoreId = dummyULID
@@ -134,7 +138,7 @@ func (c *Client) mapObject(s string) string {
 		return s
 	}
 	typ, id, ok := strings.Cut(s, ":")
-	if !ok || typ == "" || id == "" {
+	if !ok || typ == "" || id == "" || id == "*" {
 		return s
 	}
 	return typ + ":" + c.ids.ID(id)
@@ -268,6 +272,58 @@ func (c *Client) Write(
 		return nil, translate(err)
 	}
 	return &openfgav1.WriteResponse{}, nil
+}
+
+func (c *Client) Read(
+	ctx context.Context,
+	in *openfgav1.ReadRequest,
+	_ ...grpc.CallOption,
+) (*openfgav1.ReadResponse, error) {
+	if err := validate(in); err != nil {
+		return nil, err
+	}
+	mapped := proto.Clone(in).(*openfgav1.ReadRequest)
+	if tk := mapped.GetTupleKey(); tk != nil {
+		tk.Object = c.mapObject(tk.GetObject())
+		tk.User = c.mapUser(tk.GetUser())
+	}
+	req, err := marshal.Marshal(mapped)
+	if err != nil {
+		return nil, err
+	}
+	var out []byte
+	err = c.pool.QueryRow(ctx,
+		"SELECT fga.read($1, $2)", in.GetStoreId(), req,
+	).Scan(&out)
+	if err != nil {
+		return nil, translate(err)
+	}
+	resp := &openfgav1.ReadResponse{}
+	if err := protojson.Unmarshal(out, resp); err != nil {
+		return nil, err
+	}
+	if c.ids != nil {
+		for _, tup := range resp.GetTuples() {
+			key := tup.GetKey()
+			if key == nil {
+				continue
+			}
+			if typ, id, ok := strings.Cut(
+				key.GetObject(), ":"); ok {
+				key.Object = typ + ":" + c.ids.Back(id)
+			}
+			rest, rel, hasRel := strings.Cut(key.GetUser(), "#")
+			if typ, id, ok := strings.Cut(rest, ":"); ok &&
+				id != "*" {
+				back := typ + ":" + c.ids.Back(id)
+				if hasRel {
+					back += "#" + rel
+				}
+				key.User = back
+			}
+		}
+	}
+	return resp, nil
 }
 
 func (c *Client) Check(
