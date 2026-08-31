@@ -109,6 +109,11 @@ func validate(in proto.Message) error {
 		m.StoreId = dummyULID
 	case *openfgav1.ReadRequest:
 		m.StoreId = dummyULID
+	case *openfgav1.ExpandRequest:
+		m.StoreId = dummyULID
+		if m.AuthorizationModelId != "" {
+			m.AuthorizationModelId = dummyULID
+		}
 	case *openfgav1.ListObjectsRequest:
 		m.StoreId = dummyULID
 		if m.AuthorizationModelId != "" {
@@ -272,6 +277,95 @@ func (c *Client) Write(
 		return nil, translate(err)
 	}
 	return &openfgav1.WriteResponse{}, nil
+}
+
+func (c *Client) Expand(
+	ctx context.Context,
+	in *openfgav1.ExpandRequest,
+	_ ...grpc.CallOption,
+) (*openfgav1.ExpandResponse, error) {
+	if err := validate(in); err != nil {
+		return nil, err
+	}
+	mapped := proto.Clone(in).(*openfgav1.ExpandRequest)
+	if tk := mapped.GetTupleKey(); tk != nil {
+		tk.Object = c.mapObject(tk.GetObject())
+	}
+	for i, tk := range mapped.GetContextualTuples().GetTupleKeys() {
+		mapped.ContextualTuples.TupleKeys[i] = c.mapTuple(tk)
+	}
+	req, err := marshal.Marshal(mapped)
+	if err != nil {
+		return nil, err
+	}
+	var out []byte
+	err = c.pool.QueryRow(ctx,
+		"SELECT fga.expand($1, $2)", in.GetStoreId(), req,
+	).Scan(&out)
+	if err != nil {
+		return nil, translate(err)
+	}
+	resp := &openfgav1.ExpandResponse{}
+	if err := protojson.Unmarshal(out, resp); err != nil {
+		return nil, err
+	}
+	if c.ids != nil {
+		backTree(resp.GetTree().GetRoot(), c.ids)
+	}
+	return resp, nil
+}
+
+// backTree maps every engine id in an expand tree back to the
+// corpus original: node names, leaf users, computed usersets and
+// TTU tupleset/computed references all carry "type:id[#rel]"
+// strings.
+func backTree(n *openfgav1.UsersetTree_Node, ids interface {
+	Back(string) string
+}) {
+	if n == nil {
+		return
+	}
+	back := func(s string) string {
+		rest, rel, hasRel := strings.Cut(s, "#")
+		typ, id, ok := strings.Cut(rest, ":")
+		if !ok || id == "*" {
+			return s
+		}
+		out := typ + ":" + ids.Back(id)
+		if hasRel {
+			out += "#" + rel
+		}
+		return out
+	}
+	n.Name = back(n.GetName())
+	switch v := n.GetValue().(type) {
+	case *openfgav1.UsersetTree_Node_Leaf:
+		switch l := v.Leaf.GetValue().(type) {
+		case *openfgav1.UsersetTree_Leaf_Users:
+			for i, u := range l.Users.GetUsers() {
+				l.Users.Users[i] = back(u)
+			}
+		case *openfgav1.UsersetTree_Leaf_Computed:
+			l.Computed.Userset = back(l.Computed.GetUserset())
+		case *openfgav1.UsersetTree_Leaf_TupleToUserset:
+			l.TupleToUserset.Tupleset = back(
+				l.TupleToUserset.GetTupleset())
+			for _, cu := range l.TupleToUserset.GetComputed() {
+				cu.Userset = back(cu.GetUserset())
+			}
+		}
+	case *openfgav1.UsersetTree_Node_Union:
+		for _, k := range v.Union.GetNodes() {
+			backTree(k, ids)
+		}
+	case *openfgav1.UsersetTree_Node_Intersection:
+		for _, k := range v.Intersection.GetNodes() {
+			backTree(k, ids)
+		}
+	case *openfgav1.UsersetTree_Node_Difference:
+		backTree(v.Difference.GetBase(), ids)
+		backTree(v.Difference.GetSubtract(), ids)
+	}
 }
 
 func (c *Client) Read(

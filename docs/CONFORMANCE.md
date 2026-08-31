@@ -10,8 +10,7 @@ suite red and demands this file change in the same commit.
 
 ## Status
 
-The engine is mid-implementation (plan phase: write gates
-complete). Current verified surface:
+All planned v1 APIs are implemented. Current verified surface:
 
 - Conditions/ABAC: the whole `abac_tests.yaml` corpus passes
   differentially for check, list_objects and list_users, and
@@ -81,8 +80,27 @@ complete). Current verified surface:
   (default page 50, max 100), and the invalid-token refusal
   (2007) match upstream; the token-to-filter binding is a pinned
   refusing divergence (below).
-- `expand` is not implemented yet; every affected corpus case is
-  a generated, printed skip (no silent scope reduction).
+- `expand`: no upstream corpus exists; the differential suite
+  (`TestExpandDifferential`) covers every operator tree shape,
+  wildcard and userset leaves, TTU fan-out, contextual tuples,
+  the measured no-condition-evaluation property (an unmet-able
+  conditioned tuple still appears — M20), and the all-2000 error
+  surface including undefined type/relation (M19 — unlike
+  check's 2021/2022). Users lists compare order-insensitively:
+  upstream's TTU computed list follows tuple order, the engine's
+  ulid order.
+- Real-world sweep: 38 production-shaped models (the openfga
+  sample stores plus tsfga's large fixtures — theopenlane is
+  1054 DSL lines) are written to both engines and swept with a
+  seeded differential sample of checks and list_objects per
+  fixture (`TestRealWorldModels`), refusals compared as
+  outcomes.
+- Condition-error scoping follows upstream's filtered-iterator
+  rule, from source and probes at the pin (M40): a held
+  condition error is scoped per model-graph edge and dropped
+  when any row of that edge passes its filter; list_objects
+  walks only the subgraph between the user and the target, so
+  conditions on unreachable edges never evaluate.
 
 ## Exclusions (out of v1 scope)
 
@@ -106,6 +124,7 @@ sides refuse, at different limits.
 | PIN-ID-4 | Store/model ids are uuidv7; upstream-shaped ULID ids are refused as not-found, and ids never transfer between engines | refusing | TestPinnedULIDModelID |
 | PIN-READ-1 | A read continuation token reused under a changed filter is refused (2007); upstream's positional token silently continues at that offset under the new filter | refusing | TestPinnedReadTokenFilter |
 | PIN-CTX-1 | The condition-context write boundary is 32768 bytes of jsonb-normalized text; upstream's is 32768 proto bytes — number-heavy contexts refuse here and pass there, near-boundary strings flip at slightly different lengths | different-boundary | TestPinnedContextBoundary |
+| PIN-DEPTH-1 | Deep recursive negatives near the depth boundary are strategy-dependent upstream (M41): the engine implements the documented budget (25 dispatches resolve, the 26th refuses 2002); upstream may answer false at any depth (recursive fast path) or refuse 2002 one dispatch early depending on model and store shape. The disagreement class is only false-vs-2002, never true-vs-false; positives agree exactly on the boundary | different-boundary | TestPinnedDeepRecursionStrategy |
 
 Condition-layer divergences (measured or by construction,
 measurements M15/M30/M31; none corpus-visible):

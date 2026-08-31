@@ -1,0 +1,6 @@
+- user: user:alice
+  relation: member
+  object: team:writers
+- user: team:writers#member
+  relation: editor
+  object: document:meeting_notes

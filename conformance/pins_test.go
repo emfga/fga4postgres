@@ -2,6 +2,7 @@ package conformance
 
 import (
 	"context"
+	"path/filepath"
 	"testing"
 
 	openfgav1 "github.com/openfga/api/proto/openfga/v1"
@@ -11,6 +12,7 @@ import (
 	"github.com/emfga/fga4postgres/internal/oracle"
 	"github.com/emfga/fga4postgres/internal/sqlclient"
 	"github.com/emfga/fga4postgres/internal/testdb"
+	"github.com/emfga/fga4postgres/internal/uuidmap"
 )
 
 // Pinned divergences, asserted from BOTH sides (tsfga's pattern,
@@ -274,5 +276,78 @@ condition lcond(xs: list<double>) {
 		t.Errorf("oracle side of the pin moved: got %d, want "+
 			"acceptance (proto bytes under 32768) — update "+
 			"docs/CONFORMANCE.md", oraCode)
+	}
+}
+
+// PIN-DEPTH-1: near the depth boundary, deep recursive negatives
+// are strategy-dependent upstream (M41): on the snowflake
+// fixture's full store, upstream refuses 2002 at 25 tuple hops
+// for an absent user where the engine — which implements the
+// documented budget (25 dispatches resolve, the 26th refuses) —
+// answers false. On a minimal store with only the role chain,
+// upstream's recursive fast path answers false at ANY depth
+// instead. Positives agree exactly on the boundary; the
+// disagreement class is only false-vs-2002, never true-vs-false.
+// The real-world sweep tolerates exactly this class.
+func TestPinnedDeepRecursionStrategy(t *testing.T) {
+	dsl, tuples := loadRealWorld(t, filepath.Join(
+		"testdata", "realworld", "snowflake"))
+
+	// These clients carry uuid maps: the fixture's corpus-style
+	// ids are not the point of this pin.
+	eng := sqlclient.New(testdb.Pool(t),
+		uuidmap.New("pin/depth"))
+	ora := oracle.Client(t)
+	engStore, engModel := setup(t, eng, dsl, tuples)
+	oraStore, oraModel := setup(t, ora, dsl, tuples)
+
+	engCheck := func(object string) (bool, int) {
+		return checkOn(t, eng, engStore, engModel,
+			object, "member", "user_c3s:dan")
+	}
+	oraCheck := func(object string) (bool, int) {
+		return checkOn(t, ora, oraStore, oraModel,
+			object, "member", "user_c3s:dan")
+	}
+
+	// 25 hops (r05 -> r30), absent-from-chain user.
+	_, engCode := engCheck("role_c3s:r05")
+	_, oraCode := oraCheck("role_c3s:r05")
+	if engCode != 0 {
+		t.Errorf("engine side of the pin moved: got code %d, "+
+			"want allowed=false at 25 hops — update "+
+			"docs/CONFORMANCE.md", engCode)
+	}
+	if oraCode != 2002 {
+		t.Errorf("oracle side of the pin moved: got code %d, "+
+			"want 2002 at 25 hops on the full fixture store — "+
+			"the divergence may have closed; update "+
+			"docs/CONFORMANCE.md", oraCode)
+	}
+
+	// The positive boundary agrees exactly on both sides: alice
+	// sits at r30; 25 hops resolve, 26 refuse.
+	alice := func(c probeClient, store, model, object string,
+	) (bool, int) {
+		return checkOn(t, c, store, model, object, "member",
+			"user_c3s:alice")
+	}
+	for _, tc := range []struct {
+		object      string
+		wantAllowed bool
+		wantCode    int
+	}{
+		{"role_c3s:r05", true, 0},
+		{"role_c3s:r04", false, 2002},
+	} {
+		ea, ec := alice(eng, engStore, engModel, tc.object)
+		oa, oc := alice(ora, oraStore, oraModel, tc.object)
+		if ea != tc.wantAllowed || ec != tc.wantCode ||
+			oa != tc.wantAllowed || oc != tc.wantCode {
+			t.Errorf("positive boundary at %s: engine (%v,%d) "+
+				"oracle (%v,%d), want (%v,%d) on both",
+				tc.object, ea, ec, oa, oc,
+				tc.wantAllowed, tc.wantCode)
+		}
 	}
 }

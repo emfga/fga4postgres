@@ -1,0 +1,6 @@
+- user: user:bob
+  relation: viewer
+  object: trip:europe
+- user: user:alice
+  relation: owner
+  object: trip:europe

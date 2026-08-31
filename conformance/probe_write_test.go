@@ -679,3 +679,165 @@ func wrapInt32(v int32) *wrapperspb.Int32Value {
 // keep the DSL parser import honest for model-shaped probes that
 // may grow here.
 var _ = parser.TransformDSLToProto
+
+// M40 — condition evaluation laziness in check and list_objects:
+// is a conditioned tuple's condition evaluated when the branch it
+// gates cannot grant anyway?
+func TestProbeM40LazyConditions(t *testing.T) {
+	client := oracle.Client(t)
+	ctx := context.Background()
+
+	dsl := `model
+  schema 1.1
+type user
+type group
+  relations
+    define member: [user]
+type doc
+  relations
+    define viewer: [user, user with ncond, group#member with ncond]
+
+condition ncond(now: timestamp, expires_at: timestamp) {
+  now < expires_at
+}
+`
+	cond := &openfgav1.RelationshipCondition{Name: "ncond"}
+	gIn := tk("doc:1", "viewer", "group:has#member")
+	gIn.Condition = cond
+	gOut := tk("doc:2", "viewer", "group:hasnot#member")
+	gOut.Condition = cond
+	direct := tk("doc:3", "viewer", "user:bob")
+	direct.Condition = cond
+	store, model := setup(t, client, dsl, []*openfgav1.TupleKey{
+		tk("group:has", "member", "user:anne"),
+		gIn, gOut, direct,
+	})
+
+	check := func(label, object, user string) {
+		resp, err := client.Check(ctx, &openfgav1.CheckRequest{
+			StoreId: store, AuthorizationModelId: model,
+			TupleKey: &openfgav1.CheckRequestTupleKey{
+				Object: object, Relation: "viewer", User: user},
+		})
+		if err != nil {
+			s, _ := status.FromError(err)
+			t.Logf("OBSERVED: %s: code=%d msg=%q", label,
+				int(s.Code()), truncate(s.Message(), 100))
+			return
+		}
+		t.Logf("OBSERVED: %s: allowed=%v", label,
+			resp.GetAllowed())
+	}
+	// anne IS in group:has — conditioned userset row is on a
+	// granting path; condition errors (missing now).
+	check("userset row, member, missing param",
+		"doc:1", "user:anne")
+	// anne is NOT in group:hasnot.
+	check("userset row, non-member, missing param",
+		"doc:2", "user:anne")
+	// bob's own conditioned direct row.
+	check("direct row, matching user, missing param",
+		"doc:3", "user:bob")
+	// carl has no rows at all on doc:3 — the conditioned row is
+	// for bob.
+	check("direct row, other user, missing param",
+		"doc:3", "user:carl")
+
+	lo := func(label, user string) {
+		resp, err := client.ListObjects(ctx,
+			&openfgav1.ListObjectsRequest{
+				StoreId: store, AuthorizationModelId: model,
+				Type: "doc", Relation: "viewer", User: user,
+			})
+		if err != nil {
+			s, _ := status.FromError(err)
+			t.Logf("OBSERVED: %s: code=%d msg=%q", label,
+				int(s.Code()), truncate(s.Message(), 100))
+			return
+		}
+		t.Logf("OBSERVED: %s: objects=%v", label,
+			resp.GetObjects())
+	}
+	lo("LO anne (member of has only)", "user:anne")
+	lo("LO bob (conditioned direct row)", "user:bob")
+	lo("LO carl (no rows)", "user:carl")
+
+	// Subject type that no relation admits.
+	resp, err := client.ListObjects(ctx,
+		&openfgav1.ListObjectsRequest{
+			StoreId: store, AuthorizationModelId: model,
+			Type: "doc", Relation: "viewer", User: "group:has",
+		})
+	if err != nil {
+		s, _ := status.FromError(err)
+		t.Logf("OBSERVED: LO plain-object unrelated subject: "+
+			"code=%d msg=%q", int(s.Code()),
+			truncate(s.Message(), 100))
+	} else {
+		t.Logf("OBSERVED: LO plain-object unrelated subject: "+
+			"objects=%v", resp.GetObjects())
+	}
+}
+
+// M40b — sibling mix: one clean (false) row beside one
+// condition-errored row, exactly the shape the saas fixture
+// exposed.
+func TestProbeM40SiblingMix(t *testing.T) {
+	client := oracle.Client(t)
+	ctx := context.Background()
+
+	dsl := `model
+  schema 1.1
+type user
+type group
+  relations
+    define member: [user]
+type doc
+  relations
+    define viewer: [user, group#member, group#member with ncond, user with ncond]
+
+condition ncond(now: timestamp, expires_at: timestamp) {
+  now < expires_at
+}
+`
+	withCtx := func(object, user string) *openfgav1.TupleKey {
+		x := tk(object, "viewer", user)
+		v, _ := structpb.NewStruct(map[string]any{
+			"expires_at": "2027-01-01T00:00:00Z"})
+		x.Condition = &openfgav1.RelationshipCondition{
+			Name: "ncond", Context: v}
+		return x
+	}
+	store, model := setup(t, client, dsl, []*openfgav1.TupleKey{
+		tk("group:staff", "member", "user:anne"),
+		// doc:1 — clean userset row + conditioned userset row
+		// (missing 'now' at eval), like saas subscriber.
+		tk("doc:1", "viewer", "group:staff#member"),
+		withCtx("doc:1", "group:contractors#member"),
+		// doc:2 — clean non-matching direct row + conditioned
+		// direct row for the checked user.
+		tk("doc:2", "viewer", "user:bob"),
+		withCtx("doc:2", "user:carl"),
+	})
+
+	check := func(label, object, user string) {
+		resp, err := client.Check(ctx, &openfgav1.CheckRequest{
+			StoreId: store, AuthorizationModelId: model,
+			TupleKey: &openfgav1.CheckRequestTupleKey{
+				Object: object, Relation: "viewer", User: user},
+		})
+		if err != nil {
+			s, _ := status.FromError(err)
+			t.Logf("OBSERVED: %s: code=%d msg=%q", label,
+				int(s.Code()), truncate(s.Message(), 110))
+			return
+		}
+		t.Logf("OBSERVED: %s: allowed=%v", label,
+			resp.GetAllowed())
+	}
+	check("mix: dave in neither group", "doc:1", "user:dave")
+	check("mix: anne in clean group", "doc:1", "user:anne")
+	check("mix direct: carl's own conditioned row",
+		"doc:2", "user:carl")
+	check("mix direct: dave no rows", "doc:2", "user:dave")
+}

@@ -1,0 +1,316 @@
+# TheOpenLane "Acme Corp" test scenario
+# UUID prefix: c200
+
+# === Self-referencing tuples ===
+- user: user:alice
+  relation: _self
+  object: user:alice
+- user: service:svc_api
+  relation: _self
+  object: service:svc_api
+
+# === Organization: acme ===
+- user: user:alice
+  relation: owner
+  object: organization:acme
+- user: user:bob
+  relation: admin
+  object: organization:acme
+- user: user:charlie
+  relation: member
+  object: organization:acme
+- user: user:grace
+  relation: member
+  object: organization:acme
+# access via email_domains_allowed condition
+- user: organization:acme#member
+  relation: access
+  object: organization:acme
+  condition:
+    name: email_domains_allowed
+    context:
+      allowed_domains:
+        - "acme.com"
+# service direct
+- user: service:svc_api
+  relation: can_edit
+  object: organization:acme
+- user: service:svc_api
+  relation: can_delete
+  object: organization:acme
+# alice as audit_log_viewer
+- user: user:alice
+  relation: audit_log_viewer
+  object: organization:acme
+# alice as trust_center_admin
+- user: user:alice
+  relation: trust_center_admin
+  object: organization:acme
+# group-based creator roles
+- user: group:editors_grp#member
+  relation: standard_creator
+  object: organization:acme
+- user: group:editors_grp#member
+  relation: group_creator
+  object: organization:acme
+# time-based access for alice
+- user: user:alice
+  relation: can_view
+  object: organization:acme
+  condition:
+    name: time_based_grant
+    context:
+      grant_time: "2025-01-01T00:00:00Z"
+      grant_duration: "3600s"
+
+# === Organization: subsidiary (parent = acme) ===
+- user: organization:acme
+  relation: parent
+  object: organization:subsidiary
+
+# === System: sys_main ===
+- user: user:alice
+  relation: system_admin
+  object: system:sys_main
+- user: service:svc_api
+  relation: system_admin
+  object: system:sys_main
+
+# === Feature: feat_sso ===
+- user: organization:acme
+  relation: enabled
+  object: feature:feat_sso
+
+# === Groups ===
+# engineering group
+- user: user:eve
+  relation: member
+  object: group:engineering
+- user: user:frank
+  relation: member
+  object: group:engineering
+- user: user:alice
+  relation: admin
+  object: group:engineering
+- user: organization:acme
+  relation: parent
+  object: group:engineering
+  condition:
+    name: public_group
+    context:
+      public: true
+- user: organization:acme#owner
+  relation: parent_admin
+  object: group:engineering
+# editors group
+- user: user:charlie
+  relation: member
+  object: group:editors_grp
+# auditors group
+- user: user:henry
+  relation: member
+  object: group:auditors_grp
+
+# === Program: prog_compliance ===
+- user: user:grace
+  relation: admin
+  object: program:prog_compliance
+- user: organization:acme
+  relation: parent
+  object: program:prog_compliance
+- user: group:engineering#member
+  relation: editor
+  object: program:prog_compliance
+- user: user:frank
+  relation: blocked
+  object: program:prog_compliance
+- user: service:svc_api
+  relation: can_edit
+  object: program:prog_compliance
+
+# === Control: ctrl_soc2 ===
+- user: program:prog_compliance
+  relation: parent
+  object: control:ctrl_soc2
+- user: group:engineering#member
+  relation: owner
+  object: control:ctrl_soc2
+- user: group:auditors_grp#member
+  relation: delegate
+  object: control:ctrl_soc2
+- user: system:sys_main
+  relation: system
+  object: control:ctrl_soc2
+
+# === Subcontrol: sub_access ===
+- user: control:ctrl_soc2
+  relation: parent
+  object: subcontrol:sub_access
+
+# === Internal policy: policy_data ===
+- user: organization:acme
+  relation: parent
+  object: internal_policy:policy_data
+- user: user:alice
+  relation: admin
+  object: internal_policy:policy_data
+- user: group:engineering#member
+  relation: editor
+  object: internal_policy:policy_data
+- user: group:auditors_grp#member
+  relation: approver
+  object: internal_policy:policy_data
+- user: user:frank
+  relation: blocked
+  object: internal_policy:policy_data
+
+# === Contact: contact_vendor ===
+- user: organization:acme
+  relation: parent
+  object: contact:contact_vendor
+- user: user:alice
+  relation: can_view
+  object: contact:contact_vendor
+- user: user:bob
+  relation: can_view
+  object: contact:contact_vendor
+- user: group:engineering#member
+  relation: editor
+  object: contact:contact_vendor
+- user: user:frank
+  relation: blocked
+  object: contact:contact_vendor
+
+# === Task: task_review ===
+- user: control:ctrl_soc2
+  relation: parent
+  object: task:task_review
+- user: user:eve
+  relation: assignee
+  object: task:task_review
+- user: user:grace
+  relation: assigner
+  object: task:task_review
+
+# === Note: note_ctrl ===
+- user: control:ctrl_soc2
+  relation: parent
+  object: note:note_ctrl
+- user: user:grace
+  relation: owner
+  object: note:note_ctrl
+
+# === Evidence: evidence_doc ===
+- user: program:prog_compliance
+  relation: parent
+  object: evidence:evidence_doc
+- user: group:engineering#member
+  relation: editor
+  object: evidence:evidence_doc
+- user: user:frank
+  relation: blocked
+  object: evidence:evidence_doc
+
+# === Standard: std_iso ===
+- user: organization:acme
+  relation: parent
+  object: standard:std_iso
+- user: user:alice
+  relation: editor
+  object: standard:std_iso
+- user: user:*
+  relation: can_view
+  object: standard:std_iso
+
+# === Trust center: tc_acme ===
+- user: organization:acme
+  relation: parent
+  object: trust_center:tc_acme
+- user: user:diana
+  relation: nda_signed
+  object: trust_center:tc_acme
+- user: group:engineering#member
+  relation: editor
+  object: trust_center:tc_acme
+- user: system:sys_main
+  relation: system
+  object: trust_center:tc_acme
+
+# === Trust center docs ===
+- user: trust_center:tc_acme
+  relation: parent
+  object: trust_center_doc:tc_doc_public
+- user: trust_center:tc_acme
+  relation: parent
+  object: trust_center_doc:tc_doc_private
+- user: user:*
+  relation: can_view
+  object: trust_center_doc:tc_doc_public
+- user: service:*
+  relation: can_view
+  object: trust_center_doc:tc_doc_public
+
+# === File: file_logo (public, org-parented) ===
+- user: organization:acme
+  relation: parent
+  object: file:file_logo
+- user: user:*
+  relation: can_view
+  object: file:file_logo
+
+# === File: file_ctrl (control-parented + tc_doc chain) ===
+- user: control:ctrl_soc2
+  relation: parent
+  object: file:file_ctrl
+- user: trust_center_doc:tc_doc_private
+  relation: tc_doc_parent
+  object: file:file_ctrl
+
+# === Export: export_data ===
+- user: system:sys_main
+  relation: system
+  object: export:export_data
+- user: service:svc_api
+  relation: can_edit
+  object: export:export_data
+
+# === Workflow definition: wf_def ===
+- user: organization:acme
+  relation: parent
+  object: workflow_definition:wf_def
+- user: user:bob
+  relation: admin
+  object: workflow_definition:wf_def
+
+# === Workflow instance: wf_instance ===
+- user: workflow_definition:wf_def
+  relation: parent
+  object: workflow_instance:wf_instance
+- user: service:svc_api
+  relation: can_view
+  object: workflow_instance:wf_instance
+
+# === Assessment: assess_q1 ===
+- user: organization:acme
+  relation: parent
+  object: assessment:assess_q1
+- user: user:grace
+  relation: owner
+  object: assessment:assess_q1
+- user: user:eve
+  relation: delegate
+  object: assessment:assess_q1
+- user: user:frank
+  relation: blocked
+  object: assessment:assess_q1
+
+# === Campaign: camp_onboard ===
+- user: organization:acme
+  relation: parent
+  object: campaign:camp_onboard
+- user: group:engineering#member
+  relation: editor
+  object: campaign:camp_onboard
+- user: user:frank
+  relation: blocked
+  object: campaign:camp_onboard

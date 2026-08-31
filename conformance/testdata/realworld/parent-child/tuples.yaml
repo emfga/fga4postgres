@@ -1,0 +1,9 @@
+- user: user:bob
+  relation: editor
+  object: folder:notes
+- user: folder:notes
+  relation: parent
+  object: document:meeting_notes
+- user: user:alice
+  relation: editor
+  object: document:meeting_notes

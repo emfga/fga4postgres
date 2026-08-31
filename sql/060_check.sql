@@ -149,6 +149,9 @@ DECLARE
   cond_err text;
   caught_state text;
   caught_msg text;
+  grp_key text;
+  grp_err text;
+  grp_valid boolean := false;
 BEGIN
   -- Exact probe (a userset subject is compared, never expanded),
   -- then the wildcard probe for plain object subjects. Rows carry
@@ -177,20 +180,37 @@ BEGIN
 
   -- Userset expansion: a union over dispatches, with the deferred
   -- error re-raise of M01 and the dispatch-only depth charge.
+  -- Condition errors follow upstream's filtered-iterator rule
+  -- (M40, internal/iterator/filter.go at the pin): the held
+  -- error is scoped per edge — per (subject type, subject
+  -- relation) group — and dropped when ANY row of that group
+  -- passes its condition filter, even if the passing row's
+  -- branch later resolves false.
   FOR u IN
     SELECT * FROM fga._read_usersets(
       store_id, model_id, ot, oid, rel, ctx)
+    ORDER BY subject_type, subject_relation
   LOOP
+    IF grp_key IS DISTINCT FROM
+       (u.subject_type || '#' || u.subject_relation) THEN
+      IF NOT grp_valid THEN
+        cond_err := coalesce(cond_err, grp_err);
+      END IF;
+      grp_key := u.subject_type || '#' || u.subject_relation;
+      grp_err := NULL;
+      grp_valid := false;
+    END IF;
     IF coalesce(u.condition_name, '') <> '' THEN
       SELECT * INTO ev FROM fga._eval_condition(
         store_id, model_id, u.condition_name,
         u.condition_context, req_ctx);
       IF ev.err IS NOT NULL THEN
-        cond_err := coalesce(cond_err, ev.err);
+        grp_err := coalesce(grp_err, ev.err);
         CONTINUE;
       END IF;
       CONTINUE WHEN NOT ev.met;
     END IF;
+    grp_valid := true;
     BEGIN
       IF depth >= 25 THEN
         RAISE EXCEPTION 'resolution too complex: depth exceeded'
@@ -210,6 +230,11 @@ BEGIN
         caught_msg = MESSAGE_TEXT;
     END;
   END LOOP;
+
+  -- Close the last userset group.
+  IF NOT grp_valid THEN
+    cond_err := coalesce(cond_err, grp_err);
+  END IF;
 
   -- Nothing granted: a held condition error surfaces first (it
   -- was encountered first in read order), then a deferred
@@ -427,11 +452,26 @@ DECLARE
   cond_err text;
   caught_state text;
   caught_msg text;
+  grp_key text;
+  grp_err text;
+  grp_valid boolean := false;
 BEGIN
+  -- Condition errors on tupleset tuples follow the same
+  -- per-edge filtered-iterator rule as usersets (M40), grouped
+  -- by the parent's type.
   FOR u IN
     SELECT * FROM fga._read_tupleset(
       store_id, model_id, ot, oid, tupleset_rel, ctx)
+    ORDER BY subject_type
   LOOP
+    IF grp_key IS DISTINCT FROM u.subject_type THEN
+      IF NOT grp_valid THEN
+        cond_err := coalesce(cond_err, grp_err);
+      END IF;
+      grp_key := u.subject_type;
+      grp_err := NULL;
+      grp_valid := false;
+    END IF;
     IF NOT EXISTS (
       SELECT FROM fga.model_relation mr
       WHERE mr.store = store_id
@@ -446,11 +486,12 @@ BEGIN
         store_id, model_id, u.condition_name,
         u.condition_context, req_ctx);
       IF ev.err IS NOT NULL THEN
-        cond_err := coalesce(cond_err, ev.err);
+        grp_err := coalesce(grp_err, ev.err);
         CONTINUE;
       END IF;
       CONTINUE WHEN NOT ev.met;
     END IF;
+    grp_valid := true;
     BEGIN
       IF depth >= 25 THEN
         RAISE EXCEPTION 'resolution too complex: depth exceeded'
@@ -471,6 +512,9 @@ BEGIN
     END;
   END LOOP;
 
+  IF NOT grp_valid THEN
+    cond_err := coalesce(cond_err, grp_err);
+  END IF;
   IF cond_err IS NOT NULL THEN
     RAISE EXCEPTION '%', cond_err USING ERRCODE = 'YF100';
   END IF;

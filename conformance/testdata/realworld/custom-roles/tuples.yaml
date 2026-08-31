@@ -1,0 +1,12 @@
+- user: user:anne
+  relation: assignee
+  object: role:media_manager
+- user: user:beth
+  relation: assignee
+  object: role:media_viewer
+- user: role:media_manager#assignee
+  relation: editor
+  object: asset-category:logos
+- user: role:media_viewer#assignee
+  relation: viewer
+  object: asset-category:logos

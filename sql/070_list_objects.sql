@@ -310,7 +310,23 @@ BEGIN
       UNION ALL SELECT * FROM computed_new
       UNION ALL SELECT * FROM ttu_new
     ) AS u(type_name, object_id, relation_name, tainted,
-           cond_name, cond_ctx);
+           cond_name, cond_ctx)
+    -- Target pruning: upstream's reverse expansion only walks
+    -- the subgraph between the user and the target relation
+    -- (M40 — edges that cannot lead to the target are never
+    -- read, so their conditions never evaluate, let alone
+    -- error). A candidate node survives if it IS the target or
+    -- the target can grant through it.
+    WHERE (u.type_name = target_type
+           AND u.relation_name = target_rel)
+       OR EXISTS (
+        SELECT FROM fga.model_reachable mr
+        WHERE mr.store = store_id AND mr.model_id = mid
+          AND mr.type_name = target_type
+          AND mr.relation_name = target_rel
+          AND mr.subject_type = u.type_name
+          AND mr.subject_relation = u.relation_name
+      );
 
     -- Evaluate row conditions; collect per-candidate errors with
     -- upstream's scoping (raised later only if results stay under
