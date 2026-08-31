@@ -26,9 +26,12 @@ func loadFixture(
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := Install(ctx, pool, root); err != nil {
-		t.Fatalf("reinstall: %v", err)
-	}
+	// Deliberately no Install here: the compose stack installed
+	// the engine, and a reinstall's internal-helper DROPs race
+	// the conformance packages running in parallel (measured:
+	// "cache lookup failed for function"). The bench CLI still
+	// reinstalls unconditionally — it owns its database
+	// exclusively, which the shared suite database is not.
 	res, err := Load(ctx, pool, root, s, size100k, 1,
 		t.Logf)
 	if err != nil {
