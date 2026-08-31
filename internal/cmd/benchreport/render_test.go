@@ -72,6 +72,29 @@ func TestRenderDelta(t *testing.T) {
 	}
 }
 
+// A committed baseline bundles one result per scenario as a
+// JSON array; the candidate matches by scenario.
+func TestArrayBaseline(t *testing.T) {
+	base, err := os.ReadFile("testdata/baseline.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	arr := "[" + string(base) + "]"
+	path := t.TempDir() + "/baseline.json"
+	if err := os.WriteFile(
+		path, []byte(arr), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	got, err := render(
+		[]string{"testdata/candidate.json"}, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(got, "Δ ops/s") {
+		t.Error("array baseline produced no deltas")
+	}
+}
+
 func TestRenderRefusals(t *testing.T) {
 	// A baseline over a different fixture is a refusal, not a
 	// warning: the numbers would not be comparable.

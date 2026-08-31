@@ -32,13 +32,6 @@ func main() {
 			"benchreport: no result files given")
 		os.Exit(1)
 	}
-	if *baseline != "" && flag.NArg() != 1 {
-		fmt.Fprintln(os.Stderr,
-			"benchreport: -baseline compares against exactly "+
-				"one result file")
-		os.Exit(1)
-	}
-
 	report, err := render(flag.Args(), *baseline)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "benchreport:", err)

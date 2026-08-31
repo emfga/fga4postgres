@@ -34,13 +34,41 @@ func load(path string) (*bench.Result, error) {
 	return &r, nil
 }
 
+// loadBaseline reads a baseline file: either one result object
+// or an array of them (one per scenario — a bench invocation
+// writes one file per scenario, and a committed baseline bundles
+// them).
+func loadBaseline(path string) ([]*bench.Result, error) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var many []*bench.Result
+	if err := json.Unmarshal(b, &many); err == nil {
+		for _, r := range many {
+			if r.SchemaVersion != bench.ResultSchemaVersion {
+				return nil, fmt.Errorf(
+					"%s: result schema %d, this benchreport "+
+						"reads %d", path, r.SchemaVersion,
+					bench.ResultSchemaVersion)
+			}
+		}
+		return many, nil
+	}
+	one, err := load(path)
+	if err != nil {
+		return nil, err
+	}
+	return []*bench.Result{one}, nil
+}
+
 func render(paths []string, baselinePath string) (
 	string, error,
 ) {
-	var base *bench.Result
+	var bases []*bench.Result
 	if baselinePath != "" {
 		var err error
-		base, err = load(baselinePath)
+		bases, err = loadBaseline(baselinePath)
 		if err != nil {
 			return "", err
 		}
@@ -52,9 +80,20 @@ func render(paths []string, baselinePath string) (
 		if err != nil {
 			return "", err
 		}
-		if base != nil {
-			if base.Scenario != r.Scenario ||
-				base.Size != r.Size ||
+		var base *bench.Result
+		if bases != nil {
+			for _, cand := range bases {
+				if cand.Scenario == r.Scenario {
+					base = cand
+					break
+				}
+			}
+			if base == nil {
+				return "", fmt.Errorf(
+					"baseline has no entry for scenario %q",
+					r.Scenario)
+			}
+			if base.Size != r.Size ||
 				base.Seed != r.Seed ||
 				base.GeneratorVersion !=
 					r.GeneratorVersion {

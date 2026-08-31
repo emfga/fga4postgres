@@ -134,9 +134,10 @@ small regressions; quiet-machine-grade comparison happens
 locally.
 
 A committed baseline lives at
-`docs/benchmarks/baseline-<size>.json`, produced by a
-workflow_dispatch run on a GitHub-hosted runner so CI deltas
-compare like hardware. Committing or refreshing one is a
+`docs/benchmarks/baseline-<size>.json` — a JSON array bundling
+the run's per-scenario result files (a single result object also
+works) — produced by a workflow_dispatch run on a GitHub-hosted
+runner so CI deltas compare like hardware. Committing or refreshing one is a
 deliberate, by-hand act, with the commit body saying why the
 numbers moved. Until the first baseline is committed, CI
 summaries show absolute numbers only — deliberate, not an
