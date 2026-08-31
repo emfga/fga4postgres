@@ -1,0 +1,44 @@
+{
+  "schema_version": 1,
+  "started_at": "2026-08-30T12:00:00Z",
+  "finished_at": "2026-08-30T12:05:00Z",
+  "scenario": "direct",
+  "size": "100k",
+  "seed": 1,
+  "generator_version": 1,
+  "env": {
+    "engine_version": "0.1.0",
+    "pg_version": "18.6",
+    "pg_settings": {
+      "shared_buffers": "16384",
+      "work_mem": "8192"
+    },
+    "os": "linux",
+    "arch": "amd64",
+    "cpu_model": "Example CPU",
+    "cpu_count": 8,
+    "governor": "performance",
+    "storage": "tmpfs",
+    "go_version": "go1.25.7",
+    "git_commit": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "git_dirty": false,
+    "n_dead_tup_start": 0,
+    "n_dead_tup_end": 400
+  },
+  "load": {"rows": 100000, "seconds": 0.8, "skipped": false},
+  "cases": [
+    {
+      "feature": "check", "variant": "hit-shallow",
+      "warmup_ops": 480, "ops": 10000, "seconds": 30.0,
+      "latency_us": {"min": 190, "p50": 310, "p95": 700,
+                     "p99": 950, "max": 4100, "mean": 355}
+    },
+    {
+      "feature": "list_users", "variant": "many",
+      "warmup_ops": 4, "ops": 40, "seconds": 30.4,
+      "latency_us": {"min": 510000, "p50": 720000,
+                     "p95": 820000, "p99": 830000,
+                     "max": 840000, "mean": 715000}
+    }
+  ]
+}
