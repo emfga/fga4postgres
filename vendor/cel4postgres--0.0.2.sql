@@ -6,11 +6,13 @@
 -- the cel schema. Nothing here requires superuser, a filesystem, or
 -- a server restart: see CLAUDE.md, "Installation and privileges".
 --
--- Run with:  psql -v ON_ERROR_STOP=1 -f sql/000_install.sql
+-- Run with:  psql -v ON_ERROR_STOP=1 -1 -f sql/000_install.sql
 -- followed by the other sql/ scripts in numbered order (or use a
 -- release artifact, which bundles them already ordered).
-
-BEGIN;
+--
+-- No script opens a transaction of its own. The caller decides:
+-- psql -1 (--single-transaction) per file, a migration tool's
+-- transaction around a whole bundle, or pg_tle's CREATE EXTENSION.
 
 CREATE SCHEMA IF NOT EXISTS cel;
 
@@ -24,7 +26,7 @@ CREATE TABLE IF NOT EXISTS cel.schema_version (
 );
 
 INSERT INTO cel.schema_version (version)
-VALUES ('0.0.1')
+VALUES ('0.0.2')
 ON CONFLICT (version) DO NOTHING;
 
 -- The installed schema version. IMMUTABLE is deliberately wrong for
@@ -42,8 +44,6 @@ AS $$
   LIMIT 1;
 $$;
 
-COMMIT;
-
 -- ---- sql/010_registry.sql ----
 
 -- cel4postgres -- the four registries.
@@ -53,8 +53,6 @@ COMMIT;
 -- through them (seeded by 030_parse.sql and 060_stdlib.sql) -- if the
 -- core could reach anything the registry cannot describe, the
 -- registry would stop being the extension mechanism.
-
-BEGIN;
 
 -- Custom and well-known types: name resolution, construction,
 -- equality and conversion hooks. Every row visible in an env also
@@ -231,16 +229,12 @@ INSERT INTO cel.env (name, flags) VALUES
   ('network', '{}')
 ON CONFLICT (name) DO NOTHING;
 
-COMMIT;
-
 -- ---- sql/020_values.sql ----
 
 -- cel4postgres -- value helpers.
 --
 -- Run after 000_install.sql. Everything here is a pure function over
 -- tagged jsonb values or their scalar payloads; nothing reads a table.
-
-BEGIN;
 
 -- Renders a finite double the way CEL's string(double) must: cel-go
 -- delegates to Go's %g (common/types/double.go:141, pinned v0.32.0).
@@ -364,10 +358,6 @@ BEGIN
   RETURN neg || '0.' || repeat('0', -e - 1) || digits;
 END;
 $$;
-
-COMMIT;
-
-BEGIN;
 
 -- Tagged-value primitives. The kind tag carries type identity;
 -- these helpers are the single place equality, ordering and payload
@@ -702,10 +692,6 @@ BEGIN
 END;
 $$;
 
-COMMIT;
-
-BEGIN;
-
 -- Exact float8 -> numeric. The built-in cast goes through the
 -- shortest decimal text, which identifies the double uniquely but is
 -- NOT its exact binary value (36028797018963968::float8::numeric
@@ -744,8 +730,6 @@ BEGIN
 END;
 $$;
 
-COMMIT;
-
 -- ---- sql/030_parse.sql ----
 
 -- cel4postgres -- lexer, parser, macro engine.
@@ -759,8 +743,6 @@ COMMIT;
 -- The reference grammar is cel-go's parser/gen/CEL.g4 (v0.32.0);
 -- lexical rules follow it exactly, including the newline
 -- normalization applied to every literal form.
-
-BEGIN;
 
 -- Lexes one string or bytes literal. pos points at the opening quote
 -- (prefixes r/R/b/B already consumed by the caller). Returns the
@@ -1178,10 +1160,6 @@ BEGIN
 END;
 $$;
 
-COMMIT;
-
-BEGIN;
-
 -- Line/column (both 0-based line, 0-based col) for an offset, for
 -- parse error reporting. Conformance never string-matches parse
 -- errors; this exists for humans.
@@ -1370,10 +1348,6 @@ BEGIN
 END;
 $$;
 
-COMMIT;
-
-BEGIN;
-
 -- Hex digits to numeric (uint64-sized values overflow bigint).
 CREATE OR REPLACE FUNCTION cel._p_hex(h text)
 RETURNS numeric
@@ -1521,10 +1495,6 @@ BEGIN
   nid := x.next_id_out;
 END;
 $$;
-
-COMMIT;
-
-BEGIN;
 
 -- The recursive grammar. Every function shares one signature:
 --   (tk, p, id, d, mac, fl) -> (node, np, nid, err, ep)
@@ -2097,10 +2067,6 @@ BEGIN
 END;
 $$;
 
-COMMIT;
-
-BEGIN;
-
 -- List literal: '[' consumed. Trailing comma allowed. '?e' elements
 -- (optionals extension) record their indices under "opt".
 CREATE OR REPLACE FUNCTION cel._p_list(
@@ -2499,10 +2465,6 @@ BEGIN
   np := np + 1;
 END;
 $$;
-
-COMMIT;
-
-BEGIN;
 
 -- Macro expanders. Each has the registry signature
 --   (target jsonb, args jsonb, next_id bigint)
@@ -2929,8 +2891,6 @@ BEGIN
 END;
 $$;
 
-COMMIT;
-
 -- ---- sql/040_check.sql ----
 
 -- cel4postgres -- type checker.
@@ -2950,8 +2910,6 @@ COMMIT;
 -- jsonb text.
 -- Errors fail fast: conformance asserts on check-failure existence,
 -- never on collecting several.
-
-BEGIN;
 
 -- Type formatting for error messages (checker/format.go, loosely).
 CREATE OR REPLACE FUNCTION cel._t_fmt(t jsonb)
@@ -3381,10 +3339,6 @@ BEGIN
 END;
 $$;
 
-COMMIT;
-
-BEGIN;
-
 -- Fresh type variables and parameter instantiation.
 CREATE OR REPLACE FUNCTION cel._ck_collect_params(t jsonb)
 RETURNS text[]
@@ -3697,10 +3651,6 @@ BEGIN
   END LOOP;
 END;
 $$;
-
-COMMIT;
-
-BEGIN;
 
 -- Literal kinds to checker types.
 CREATE OR REPLACE FUNCTION cel._ck_lit_type(v jsonb)
@@ -4283,8 +4233,6 @@ AS $$
   SELECT cel.check(ast, env, NULL);
 $$;
 
-COMMIT;
-
 -- ---- sql/050_eval.sql ----
 
 -- cel4postgres -- evaluator core.
@@ -4298,8 +4246,6 @@ COMMIT;
 -- because their semantics control argument evaluation or belong to
 -- the attribute machinery, everything else EXECUTEs the row's impl.
 -- No CASE on a function name anywhere -- day-one invariant 1.
-
-BEGIN;
 
 -- Signature match for runtime overload selection: does an evaluated
 -- argument satisfy a declared argument type? Parameterized and
@@ -5146,8 +5092,6 @@ BEGIN
 END;
 $$;
 
-COMMIT;
-
 -- ---- sql/060_stdlib.sql ----
 
 -- cel4postgres -- standard library, part 1.
@@ -5163,8 +5107,6 @@ COMMIT;
 -- arithmetic with overflow sentinels, IEEE-754 double arithmetic
 -- with the three non-finite sentinels, Go-style truncated division
 -- and remainder.
-
-BEGIN;
 
 -- Integer (int64) checked arithmetic. Postgres numeric is exact, so
 -- overflow is a range check, not a wraparound.
@@ -5728,10 +5670,6 @@ AS $$
   SELECT args[1];
 $$;
 
-COMMIT;
-
-BEGIN;
-
 -- Overload rows. Ids are cel-go's exactly (common/overloads); the
 -- checker binds them and conformance's type_deduction output depends
 -- on them. The absorbed ids carry NULL impls -- the evaluator core
@@ -5953,10 +5891,6 @@ ON CONFLICT DO NOTHING;
 INSERT INTO cel.env_item (env, kind, ref)
 SELECT 'standard', 'type', name FROM cel.type
 ON CONFLICT DO NOTHING;
-
-COMMIT;
-
-BEGIN;
 
 -- Part 2: type conversions and string functions. Conversion
 -- semantics are cel-go's exactly (common/types + overflow.go,
@@ -6434,8 +6368,6 @@ INSERT INTO cel.env_item (env, kind, ref)
 SELECT 'standard', 'overload', id FROM cel.overload
 ON CONFLICT DO NOTHING;
 
-COMMIT;
-
 -- ---- sql/070_wkt.sql ----
 
 -- Well-known types: timestamps, durations, the wrapper types,
@@ -6447,8 +6379,6 @@ COMMIT;
 -- "tz": fixed offset minutes}; durations are total nanoseconds.
 -- Semantics are cel-go v0.32.0's (common/types/timestamp.go,
 -- duration.go, overflow.go), confirmed by conformance runs.
-
-BEGIN;
 
 -- Range-checked constructors ------------------------------------------
 
@@ -6971,10 +6901,6 @@ AS $$
     trunc((args[1] ->> 'v')::numeric / 1000000) % 1000);
 $$;
 
-COMMIT;
-
-BEGIN;
-
 -- Construction impls ---------------------------------------------------
 -- Each receives the evaluated fields as a jsonb object of tagged
 -- values (050_eval.sql struct branch). Wrappers unwrap to their
@@ -7322,8 +7248,6 @@ INSERT INTO cel.env_item (env, kind, ref)
 SELECT 'standard', 'overload', id FROM cel.overload
 ON CONFLICT DO NOTHING;
 
-COMMIT;
-
 -- ---- sql/100_ext_comprehensions.sql ----
 
 -- The two-variable comprehensions extension (cel-go
@@ -7337,8 +7261,6 @@ COMMIT;
 -- Extension scripts live at the top of sql/ with a 1xx prefix
 -- because initdb runs only the directory's top level; a
 -- subdirectory would silently not install.
-
-BEGIN;
 
 -- Extracts and validates the two iteration variables
 -- (ext/comprehensions.go extractIterVars).
@@ -7684,8 +7606,6 @@ INSERT INTO cel.env_item (env, kind, ref) VALUES
   ('two_var_comprehensions', 'overload', '@mapInsert_map_map')
 ON CONFLICT DO NOTHING;
 
-COMMIT;
-
 -- ---- sql/110_ext_optionals.sql ----
 
 -- The optionals extension, part one: the optional_type opaque type
@@ -7700,8 +7620,6 @@ COMMIT;
 --     {"p": <present?>, "v": <value when present>}}
 -- (day-one invariant 3: extension types are registry rows over the
 -- opaque kind, never new core kinds).
-
-BEGIN;
 
 CREATE OR REPLACE FUNCTION cel._opt_of(v jsonb)
 RETURNS jsonb
@@ -7842,10 +7760,6 @@ INSERT INTO cel.env_item (env, kind, ref) VALUES
   ('optionals', 'overload', 'optional_value'),
   ('optionals', 'overload', 'optional_hasValue')
 ON CONFLICT DO NOTHING;
-
-COMMIT;
-
-BEGIN;
 
 -- Part two: the optional-syntax operators, or/orValue, and the
 -- optMap/optFlatMap macros (cel/library.go optionals block,
@@ -8184,8 +8098,6 @@ INSERT INTO cel.env_item (env, kind, ref) VALUES
   ('optionals', 'macro', 'optFlatMap/2/1')
 ON CONFLICT DO NOTHING;
 
-COMMIT;
-
 -- ---- sql/120_ext_strings.sql ----
 
 -- The strings extension (cel-go ext/strings.go at the pinned
@@ -8199,8 +8111,6 @@ COMMIT;
 -- divergence from cel-go: indexOf/lastIndexOf with an out-of-range
 -- offset error instead of returning -1 -- the corpus and cel-java
 -- agree against cel-go v0.32.0 there.
-
-BEGIN;
 
 CREATE OR REPLACE FUNCTION cel._str_val(s text)
 RETURNS jsonb
@@ -8540,10 +8450,6 @@ BEGIN
   RETURN cel._str_val('"' || res || '"');
 END;
 $$;
-
-COMMIT;
-
-BEGIN;
 
 -- string.format ------------------------------------------------------
 
@@ -8986,8 +8892,6 @@ WHERE id IN (
   'string_format')
 ON CONFLICT DO NOTHING;
 
-COMMIT;
-
 -- ---- sql/130_ext_math.sql ----
 
 -- The math extension (cel-go ext/math.go at the pinned v0.32.0,
@@ -8999,8 +8903,6 @@ COMMIT;
 -- Bit operations run in numeric two's-complement arithmetic (div /
 -- mod by exact powers of two) because Postgres bigint shifts take
 -- the count mod 64, and uint64 values do not fit bigint.
-
-BEGIN;
 
 CREATE OR REPLACE FUNCTION cel._math_ident(args jsonb[])
 RETURNS jsonb
@@ -9640,15 +9542,11 @@ INSERT INTO cel.env_item (env, kind, ref) VALUES
   ('math', 'macro', 'greatest/-1/1')
 ON CONFLICT DO NOTHING;
 
-COMMIT;
-
 -- ---- sql/140_ext_lists.sql ----
 
 -- The lists extension (cel-go ext/lists.go at the pinned v0.32.0):
 -- slice, flatten, sort, sortBy (macro over @sortByAssociatedKeys),
 -- lists.range, reverse, distinct. Registered under the 'lists' env.
-
-BEGIN;
 
 CREATE OR REPLACE FUNCTION cel._list_val(elems jsonb)
 RETURNS jsonb
@@ -10055,15 +9953,11 @@ INSERT INTO cel.env_item (env, kind, ref) VALUES
   ('lists', 'macro', 'sortBy/2/1')
 ON CONFLICT DO NOTHING;
 
-COMMIT;
-
 -- ---- sql/150_ext_encoders.sql ----
 
 -- The encoders extension (cel-go ext/encoders.go at the pinned
 -- v0.32.0): base64.encode / base64.decode. Registered under the
 -- 'encoders' env.
-
-BEGIN;
 
 -- Go accepts both padded and raw (unpadded) standard base64
 -- (encoders.go:143-150); Postgres decode requires padding, so pad
@@ -10122,16 +10016,12 @@ INSERT INTO cel.env_item (env, kind, ref) VALUES
   ('encoders', 'overload', 'base64_encode_bytes')
 ON CONFLICT DO NOTHING;
 
-COMMIT;
-
 -- ---- sql/160_ext_bindings.sql ----
 
 -- The bindings extension (cel-go ext/bindings.go at the pinned
 -- v0.32.0): the cel.bind(var, init, expr) macro, expanding to the
 -- bind-style comprehension (empty range, accumulator = the bound
 -- variable). Registered under the 'bindings' env.
-
-BEGIN;
 
 CREATE OR REPLACE FUNCTION cel._mx_cel_bind(
   target jsonb, args jsonb, next_id bigint,
@@ -10191,8 +10081,6 @@ INSERT INTO cel.env_item (env, kind, ref) VALUES
   ('bindings', 'macro', 'bind/3/1')
 ON CONFLICT DO NOTHING;
 
-COMMIT;
-
 -- ---- sql/170_ext_network.sql ----
 
 -- The network extension (cel-go ext/network.go at the pinned
@@ -10209,8 +10097,6 @@ COMMIT;
 -- share: no leading zeros in IPv4 octets, no partial addresses, no
 -- zone suffixes, no IPv4-mapped IPv6, and a CIDR requires an
 -- explicit /bits.
-
-BEGIN;
 
 -- Strict address parse. Returns the canonical text or NULL when the
 -- input is not a valid address under netip.ParseAddr rules.
@@ -10716,6 +10602,4 @@ INSERT INTO cel.env_item (env, kind, ref) VALUES
   ('network', 'type', 'net.IP'),
   ('network', 'type', 'net.CIDR')
 ON CONFLICT DO NOTHING;
-
-COMMIT;
 
