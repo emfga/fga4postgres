@@ -74,7 +74,7 @@ a future contributor will otherwise reopen.
    verbatim JSON per model id plus a normalized internal form for fast
    resolution. Owner-confirmed.
 4. **CEL is consumed from cel4postgres, never reimplemented.** The
-   pinned release artifact (`vendor/cel4postgres--0.0.1.sql`, from
+   pinned release artifact (`vendor/cel4postgres--0.0.2.sql`, from
    github.com/emfga/cel4postgres) installs before `sql/` in initdb and
    in the release story. Conditions evaluate through `cel.*`; the
    OpenFGA dialect (`ipaddress`, `in_cidr`, typed-parameter coercion)
@@ -149,10 +149,16 @@ gitignored `dist/`.
 simultaneously install order and initdb order (initdb does not descend
 into subdirectories). fga4postgres scripts start at `010` because the
 `000` slot belongs to the vendored cel4postgres bundle, bind-mounted as
-a single file in compose.yaml. Every script opens its own `BEGIN;` …
-`COMMIT;` and is idempotent (`CREATE OR REPLACE`, `IF NOT EXISTS`,
-`ON CONFLICT`), so plain concatenation builds a release and re-running
-the installer is the upgrade path.
+a single file in compose.yaml. No script opens or closes a
+transaction — the caller owns the boundary (`psql -1`, a migration
+tool's transaction, pg_tle's `CREATE EXTENSION`), which is what lets
+a plain release artifact be embedded where a transaction is already
+open; `build-release.sh` refuses a `BEGIN;`/`COMMIT;` line in `sql/`
+or the vendored bundle, and each artifact's `-tx` twin adds exactly
+one pair around the whole file. Every script is idempotent
+(`CREATE OR REPLACE`, `IF NOT EXISTS`, `ON CONFLICT`), so plain
+concatenation builds a release and re-running the installer is the
+upgrade path.
 
 **Schema naming.** Everything lives in schema `fga`. Public entry
 points are unprefixed (`fga.check`, `fga.version`); every internal
@@ -241,8 +247,8 @@ docker compose logs --no-color # on failure
 Installing by hand into any database:
 
 ```bash
-psql -v ON_ERROR_STOP=1 -f vendor/cel4postgres--0.0.1.sql "$DB_URL"
-for f in sql/*.sql; do psql -v ON_ERROR_STOP=1 -f "$f" "$DB_URL"; done
+psql -v ON_ERROR_STOP=1 -1 -f vendor/cel4postgres--0.0.2.sql "$DB_URL"
+for f in sql/*.sql; do psql -v ON_ERROR_STOP=1 -1 -f "$f" "$DB_URL"; done
 ```
 
 The engine version lives in exactly one place: the
