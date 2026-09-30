@@ -45,24 +45,26 @@ Distribution is plain SQL scripts and
 
 ## Installation
 
-From a release, one file installs everything:
+From a release, one file installs everything, in one transaction:
 
 ```bash
-psql -v ON_ERROR_STOP=1 -f fga4postgres--<version>.sql "$DB_URL"
+psql -v ON_ERROR_STOP=1 -1 -f fga4postgres--<version>.sql "$DB_URL"
 ```
 
 From a checkout:
 
 ```bash
-psql -v ON_ERROR_STOP=1 -f vendor/cel4postgres--*.sql "$DB_URL"
+psql -v ON_ERROR_STOP=1 -1 -f vendor/cel4postgres--*.sql "$DB_URL"
 for f in sql/*.sql; do
-  psql -v ON_ERROR_STOP=1 -f "$f" "$DB_URL"
+  psql -v ON_ERROR_STOP=1 -1 -f "$f" "$DB_URL"
 done
 ```
 
-The scripts are idempotent; re-running the installer is the upgrade
-path. [docs/INSTALL.md](docs/INSTALL.md) covers the pg_tle channel
-and the consumer privilege template.
+The scripts are idempotent and open no transaction of their own;
+re-running the installer is the upgrade path.
+[docs/INSTALL.md](docs/INSTALL.md) covers the `-tx` artifacts,
+embedding in a migration tool, the pg_tle channel and the consumer
+privilege template.
 
 ## Development environment
 

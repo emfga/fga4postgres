@@ -25,8 +25,6 @@
 --     errors at 26 — list_users charges one hop more; cycles
 --     yield nothing (fail-closed).
 
-BEGIN;
-
 DO $$
 BEGIN
   -- uid = nil uuid and urel = '' means the typed wildcard;
@@ -582,5 +580,3 @@ AS $$
         AND tr.condition_name = coalesce(t.condition_name, '')
     );
 $$;
-
-COMMIT;

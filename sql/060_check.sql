@@ -32,8 +32,6 @@
 --        object form, object type, request relation; contextual
 --        tuples last, refused as YF127.
 
-BEGIN;
-
 DO $$
 BEGIN
   CREATE TYPE fga._check_result AS (allowed boolean,
@@ -741,5 +739,3 @@ BEGIN
   RETURN jsonb_build_object('result', results);
 END;
 $$;
-
-COMMIT;

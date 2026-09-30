@@ -16,8 +16,6 @@
 -- actually references it — which matches upstream's
 -- partial-evaluation behaviour without needing UNKNOWN support.
 
-BEGIN;
-
 INSERT INTO cel.env (name) VALUES ('openfga')
 ON CONFLICT DO NOTHING;
 
@@ -397,5 +395,3 @@ BEGIN
   END IF;
 END;
 $$;
-
-COMMIT;

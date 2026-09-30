@@ -6,10 +6,9 @@
 #
 #   pgtle-wrap.sh <extname> <version> <artifact.sql>... > out.sql
 #
-# The artifacts run unchanged except for one transformation: their
-# top-level BEGIN;/COMMIT; lines are dropped, because a pg_tle
-# script executes inside CREATE EXTENSION's own transaction, where
-# transaction control is not allowed.
+# The artifacts run unchanged. Pass the plain ones, never a -tx
+# twin: a pg_tle script executes inside CREATE EXTENSION's own
+# transaction, where transaction control is not allowed.
 
 set -eu
 
@@ -21,7 +20,13 @@ tag='_fga_pgtle_'
 tmp=$(mktemp)
 trap 'rm -f "$tmp"' EXIT
 
-cat -- "$@" | grep -v -x -e 'BEGIN;' -e 'COMMIT;' >"$tmp"
+cat -- "$@" >"$tmp"
+
+if grep -q -x -e 'BEGIN;' -e 'COMMIT;' "$tmp"; then
+  echo "input controls transactions; pass the plain artifacts," \
+    "not the -tx ones" >&2
+  exit 1
+fi
 
 # The bundle becomes one dollar-quoted literal; the quoting breaks
 # if its tag ever appears in the content, so refuse instead of

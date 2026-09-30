@@ -69,9 +69,10 @@ func installFiles(root string) ([]string, error) {
 	return append(cel, engine...), nil
 }
 
-// execFile runs one install script. The scripts hold their own
-// BEGIN/COMMIT and multiple statements, so this goes through the
-// simple protocol.
+// execFile runs one install script. A script is many statements,
+// so this goes through the simple protocol, which also runs the
+// whole string as one implicit transaction: the scripts open none
+// of their own, and a failure leaves the file unapplied.
 func execFile(
 	ctx context.Context, pool *pgxpool.Pool, path string,
 ) error {

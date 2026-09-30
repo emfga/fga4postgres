@@ -3,8 +3,10 @@
 -- 010 is the first fga4postgres script on purpose: in initdb the 000
 -- slot is taken by the vendored cel4postgres bundle (see compose.yaml),
 -- which must install before anything here runs.
-
-BEGIN;
+--
+-- No script opens a transaction of its own. The caller decides:
+-- psql -1 (--single-transaction) per file, a migration tool's
+-- transaction around a whole bundle, or pg_tle's CREATE EXTENSION.
 
 CREATE SCHEMA IF NOT EXISTS fga;
 
@@ -28,5 +30,3 @@ SET search_path = fga, pg_temp
 AS $$
   SELECT version FROM fga.schema_version;
 $$;
-
-COMMIT;

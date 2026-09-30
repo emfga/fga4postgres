@@ -12,8 +12,6 @@
 -- write (ulid) order, matching upstream's tuple order; the
 -- differential comparison is order-insensitive over both.
 
-BEGIN;
-
 CREATE OR REPLACE FUNCTION fga._expand_node(
   store_id uuid, model_id uuid,
   ot text, oid uuid, rel text,
@@ -177,5 +175,3 @@ BEGIN
       store_id, mid, o.object_type, oid, rel, name, ctx, rw)));
 END;
 $$;
-
-COMMIT;

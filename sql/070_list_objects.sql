@@ -26,8 +26,6 @@
 -- forward check validates the entire path, so optimistic
 -- expansion through such relations is sound.
 
-BEGIN;
-
 DO $$
 BEGIN
   CREATE TYPE fga._lo_node AS (
@@ -415,5 +413,3 @@ BEGIN
     to_jsonb(objects));
 END;
 $$;
-
-COMMIT;

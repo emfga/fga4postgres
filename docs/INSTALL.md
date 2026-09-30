@@ -12,10 +12,10 @@ PostgreSQL 18 is the floor: the engine uses the native
 ## Plain SQL (works everywhere)
 
 Download `fga4postgres--<version>.sql` from a release (verify
-against `SHA256SUMS`) and run it:
+against `SHA256SUMS`) and run it in one transaction:
 
 ```sh
-psql -v ON_ERROR_STOP=1 -f fga4postgres--<version>.sql "$DB_URL"
+psql -v ON_ERROR_STOP=1 -1 -f fga4postgres--<version>.sql "$DB_URL"
 ```
 
 That single file bundles the pinned cel4postgres release and the
@@ -23,22 +23,45 @@ whole engine. If the database already runs the pinned
 cel4postgres, use `fga4postgres-engine--<version>.sql` instead —
 it contains only the engine and expects schema `cel` to exist.
 
+Each file comes in two shapes. The plain file contains no
+transaction control, so it runs inside a transaction someone else
+opens: psql's `-1` (`--single-transaction`), a migration tool's, or
+pg_tle's `CREATE EXTENSION`. Its `-tx` twin
+(`fga4postgres-tx--<version>.sql`,
+`fga4postgres-engine-tx--<version>.sql`) wraps the same content in
+exactly one `BEGIN;` and one `COMMIT;`, for a bare `psql -f` that
+should still be all or nothing.
+
 Every script is idempotent; re-running the installer against a
 live database is the upgrade path.
 
 From a checkout instead of a release:
 
 ```sh
-psql -v ON_ERROR_STOP=1 -f vendor/cel4postgres--*.sql "$DB_URL"
+psql -v ON_ERROR_STOP=1 -1 -f vendor/cel4postgres--*.sql "$DB_URL"
 for f in sql/*.sql; do
-  psql -v ON_ERROR_STOP=1 -f "$f" "$DB_URL"
+  psql -v ON_ERROR_STOP=1 -1 -f "$f" "$DB_URL"
 done
 ```
 
+## Inside a migration tool
+
+Migration tools (Flyway, Liquibase, Kysely, Alembic, Rails, …)
+usually run each migration inside a transaction they own. Embed the
+plain `fga4postgres--<version>.sql` as the body of one migration
+and execute it as a single multi-statement string, without bind
+parameters — the file is many statements with `$$`-quoted function
+bodies, which PostgreSQL accepts only over the simple query
+protocol. The whole install then commits or rolls back with the
+migration. Do not embed a `-tx` file: its `COMMIT;` would end the
+tool's transaction halfway through.
+
 ## pg_tle (RDS, Aurora, and anywhere pg_tle is allowed)
 
-Wrap the release artifact into a `pgtle.install_extension` call
-and install it as a real extension:
+Wrap the plain release artifact (not a `-tx` one: transaction
+control is not allowed inside `CREATE EXTENSION`, and the script
+refuses it) into a `pgtle.install_extension` call and install it
+as a real extension:
 
 ```sh
 ./scripts/pgtle-wrap.sh fga4postgres <version> \

@@ -15,8 +15,6 @@
 -- CALLER rights — no SECURITY DEFINER — so table privileges are
 -- part of the reader surface, not a bypass of it.
 
-BEGIN;
-
 DO $$
 BEGIN
   IF NOT EXISTS (
@@ -87,5 +85,3 @@ BEGIN
     ON ALL TABLES IN SCHEMA fga TO fga_writer;
 END;
 $$;
-
-COMMIT;

@@ -56,9 +56,9 @@ jobs:
       - name: Idempotent reinstall
         run: |
           DB="postgres://$POSTGRES_USER:$POSTGRES_PASSWORD@$POSTGRES_HOST:$POSTGRES_PORT/$POSTGRES_DB"
-          psql -v ON_ERROR_STOP=1 -q -f vendor/cel4postgres--*.sql "$DB"
+          psql -v ON_ERROR_STOP=1 -q -1 -f vendor/cel4postgres--*.sql "$DB"
           for f in sql/*.sql; do
-            psql -v ON_ERROR_STOP=1 -q -f "$f" "$DB"
+            psql -v ON_ERROR_STOP=1 -q -1 -f "$f" "$DB"
           done
 
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
@@ -87,8 +87,10 @@ jobs:
         run: docker compose logs --no-color
 
   # The release channels, proven on every run rather than only at
-  # publish time: the all-in bundle initdb-installs on the bare
-  # pinned image; the wrapped artifact installs through pg_tle via
+  # publish time: every artifact installs in its promised shape
+  # (plain inside a caller's transaction, -tx on its own); the
+  # all-in bundle initdb-installs on the bare pinned image; the
+  # wrapped artifact installs through pg_tle via
   # CREATE EXTENSION; and the grants template actually separates
   # the two roles (a reader can check but not write).
   artifacts:
@@ -103,6 +105,9 @@ jobs:
 
       - name: Build artifacts
         run: ./scripts/build-release.sh
+
+      - name: Install every artifact in its promised shape
+        run: ./scripts/smoke-artifacts.sh
 
       - name: Install the bundle on a bare database
         run: |

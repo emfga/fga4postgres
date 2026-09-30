@@ -8,8 +8,6 @@
 -- (condition deliberately not part of tuple identity) and keeps
 -- REPLICA IDENTITY intact for logical replication.
 
-BEGIN;
-
 CREATE TABLE IF NOT EXISTS fga.tuple (
   store uuid NOT NULL,
   object_type text NOT NULL,
@@ -945,5 +943,3 @@ AS $$
         AND tr.condition_name = coalesce(t.condition_name, '')
     );
 $$;
-
-COMMIT;

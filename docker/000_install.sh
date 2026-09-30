@@ -4,11 +4,14 @@
 # fga4postgres script, in name order. This exists because initdb runs
 # only a flat directory and a single-file bind mount cannot be layered
 # over a read-only directory mount -- so sql/ and vendor/ are mounted
-# at their own paths and this script sequences them.
+# at their own paths and this script sequences them. The scripts
+# open no transaction of their own, so --single-transaction keeps
+# each file all or nothing -- which matters on the bench's
+# persistent volume, not on compose's tmpfs.
 set -eu
 
 for f in /vendor/cel4postgres--*.sql /sql/*.sql; do
   echo "fga4postgres initdb: applying $f"
-  psql -v ON_ERROR_STOP=1 \
+  psql -v ON_ERROR_STOP=1 --single-transaction \
     --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" -f "$f"
 done

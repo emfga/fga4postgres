@@ -18,10 +18,10 @@ permissions:
 # between jobs -- fewer moving parts, and nothing to pin.
 
 jobs:
-  # The plain-scripts channel: the all-in bundle initdb-installs
-  # on the bare pinned image and answers fga.version(); the
-  # engine-only file installs over the vendored cel4postgres
-  # bundle the same way compose layers them.
+  # The plain-scripts channel: scripts/smoke-artifacts.sh installs
+  # every artifact in the shape it promises -- each plain file inside
+  # a transaction it does not own, each -tx file with a bare psql -f,
+  # the engine-only files over the vendored cel4postgres bundle.
   smoke:
     if: >-
       github.repository == 'emfga/fga4postgres' &&
@@ -38,40 +38,7 @@ jobs:
       - name: Build and install artifacts
         run: |
           ./scripts/build-release.sh
-          version=$(sed -n \
-            "s/^VALUES ('\([0-9][0-9.]*\)');$/\1/p" \
-            sql/010_install.sql)
-          image=$(sed -n 's/^ *image: \(postgres:[^ ]*\)$/\1/p' \
-            compose.yaml)
-          smoke() {
-            docker run -d --rm --name relcheck \
-              -e POSTGRES_DB=fga -e POSTGRES_USER=fga \
-              -e POSTGRES_PASSWORD=pw "$@" \
-              "$image" >/dev/null
-            # -h 127.0.0.1: over the socket, psql reaches
-            # initdb's temporary server mid-install; only the
-            # final server listens on TCP.
-            got=
-            for _ in $(seq 60); do
-              got=$(docker exec relcheck psql -h 127.0.0.1 \
-                -U fga -d fga \
-                -tAc 'SELECT fga.version()' 2>/dev/null) && break
-              sleep 2
-            done
-            docker rm -f relcheck >/dev/null
-            if [ "$got" != "$version" ]; then
-              echo "expected $version, got '$got'" >&2
-              exit 1
-            fi
-          }
-          init=/docker-entrypoint-initdb.d
-          echo "== fga4postgres--$version.sql"
-          smoke -v "$PWD/dist/fga4postgres--$version.sql:$init/install.sql:ro"
-          echo "== fga4postgres-engine--$version.sql over vendored cel"
-          smoke \
-            -v "$PWD/vendor:/vendor:ro" \
-            -v "$PWD/dist/fga4postgres-engine--$version.sql:/engine.sql:ro" \
-            -v "$PWD/scripts/release-engine-initdb.sh:$init/000.sh:ro"
+          ./scripts/smoke-artifacts.sh
 
   # The flagship channel: the all-in bundle wrapped by
   # scripts/pgtle-wrap.sh into pgtle.install_extension, installed

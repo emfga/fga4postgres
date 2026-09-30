@@ -8,8 +8,6 @@
 -- "latest" queries stay index-backed. PostgreSQL 18 is the version
 -- floor precisely because uuidv7() is used natively, with no shim.
 
-BEGIN;
-
 CREATE TABLE IF NOT EXISTS fga.store (
   id uuid NOT NULL DEFAULT uuidv7(),
   name text NOT NULL,
@@ -58,5 +56,3 @@ BEGIN
   DELETE FROM fga.store WHERE id = store_id;
 END;
 $$;
-
-COMMIT;

@@ -11,8 +11,6 @@
 -- fga._validate_model below; the derivation queries themselves
 -- assume upstream-shaped input and only normalize.
 
-BEGIN;
-
 -- The id-domain gate: every id the API accepts must be a
 -- canonical lower-case hyphenated uuid, and the
 -- nil uuid is reserved as the wildcard sentinel. Everything else
@@ -629,5 +627,3 @@ BEGIN
   RETURN resolved;
 END;
 $$;
-
-COMMIT;
