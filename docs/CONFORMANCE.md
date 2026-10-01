@@ -173,3 +173,22 @@ corpus-visible):
   interleaved writes.
 - PostgreSQL 18+ is the platform floor (native `uuidv7()`); this
   is a platform bound, not a semantic divergence.
+- Compiled relations (`docs/INSTALL.md`, "Compiled relations") are
+  an additive surface upstream does not have: per-relation SQL
+  functions an application calls inside its own queries. They make
+  no claim of their own beyond answering exactly as the generic
+  engine does, and that is what the suite checks: the
+  check, list_objects and list_users corpora replay in two more
+  modes (`compiled`, `compiledCtxTuples`) in which every assertion
+  is answered by the generated function and compared with the
+  corpus expectation and the oracle. A relation answered by the
+  generic resolver instead is printed with its reason, like any
+  other skip. `__subjects` returns a final list (wildcards
+  expanded over a registered subject table, exclusions applied),
+  which upstream's `ListUsers` does not, so its wildcard cases are
+  compared with a per-subject `check` rather than with the
+  oracle's `{wildcard}` answer. For an opted-in store, `check`,
+  `batch_check`, `list_objects` and `streamed_list_objects` on the
+  latest model are answered through these functions and replay
+  through the same corpora; `list_users` is not, so its response
+  keeps upstream's shape.

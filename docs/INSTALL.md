@@ -134,6 +134,230 @@ template — for example `REVOKE EXECUTE ON ALL FUNCTIONS IN
 SCHEMA fga FROM PUBLIC` — is deliberate and yours to apply;
 the installer never revokes anything.
 
+## Compiled relations
+
+`list_objects` answers "which documents can Anne see?" with a
+list the application then has to join, sort and page itself. For
+a page of 50 documents sorted by title, that is the wrong way
+round: the database already holds the documents, and the
+authorization rule is the filter. Compiled relations turn every
+relation of a store's model into plain SQL functions the
+application calls *inside* its own query, so PostgreSQL filters,
+sorts and pages in one plan.
+
+They are opt-in per store. Every model write to an opted-in store
+regenerates, in the same transaction, three functions per
+`(type, relation)` in a schema the application owns:
+
+| function | answers | mirrors |
+|---|---|---|
+| `<type>__<relation>__objects(p_subject_type, p_subject_id, …)` | the object ids the subject has the relation on | `list_objects`, uncapped |
+| `<type>__<relation>__subjects(p_object, p_subject_type, …)` | the subject ids that have the relation on the object | `list_users`, as a final list |
+| `<type>__<relation>__check(p_object, p_subject_type, p_subject_id, …)` | whether the subject has the relation | `check` |
+
+Every answer equals the generic resolver's, errors included.
+Each relation compiles to the cheapest exact strategy; one that
+cannot be compiled exactly gets a function with the same
+signature that calls the generic resolver. Opted-in stores also
+answer `fga.check`, `fga.batch_check`, `fga.list_objects` and
+`fga.streamed_list_objects` through the compiled functions when
+the request targets the latest model; `fga.list_users` keeps
+upstream's response shape and always uses the generic resolver.
+
+The examples below run in order, top to bottom, against a fresh
+install; a test in `conformance/` executes them exactly as
+written.
+
+### 1. The application's tables, and a schema for the functions
+
+The engine never creates or drops a schema: the application
+creates the target schema, owns it, and decides who may use it.
+
+```sql
+CREATE SCHEMA app;
+CREATE TABLE app.app_user (
+  user_id uuid PRIMARY KEY,
+  name text NOT NULL
+);
+CREATE TABLE app.document (
+  document_id uuid PRIMARY KEY,
+  title text NOT NULL
+);
+INSERT INTO app.app_user VALUES
+  ('0192f0a0-0000-7000-8000-00000000a001', 'Anne'),
+  ('0192f0a0-0000-7000-8000-00000000a002', 'Bruno'),
+  ('0192f0a0-0000-7000-8000-00000000a003', 'Carla');
+INSERT INTO app.document VALUES
+  ('0192f0a0-0000-7000-8000-00000000d001', 'Budget'),
+  ('0192f0a0-0000-7000-8000-00000000d002', 'Roadmap'),
+  ('0192f0a0-0000-7000-8000-00000000d003', 'Handbook');
+
+CREATE SCHEMA app_authz;
+```
+
+### 2. A store and its model
+
+```sql
+SELECT fga.create_store('docs-example');
+
+SELECT fga.write_authorization_model(
+  (SELECT id FROM fga.store WHERE name = 'docs-example'),
+  '{"schema_version": "1.1", "type_definitions": [
+     {"type": "user"},
+     {"type": "folder",
+      "relations": {"viewer": {"this": {}}},
+      "metadata": {"relations": {"viewer": {
+        "directly_related_user_types": [{"type": "user"}]}}}},
+     {"type": "document",
+      "relations": {
+        "parent": {"this": {}},
+        "viewer": {"union": {"child": [
+          {"this": {}},
+          {"tuple_to_userset": {
+            "tupleset": {"relation": "parent"},
+            "computed_userset": {"relation": "viewer"}}}]}}},
+      "metadata": {"relations": {
+        "parent": {"directly_related_user_types": [
+          {"type": "folder"}]},
+        "viewer": {"directly_related_user_types": [
+          {"type": "user"}, {"type": "user", "wildcard": {}}]}}}}]}');
+```
+
+### 3. Opt in
+
+```sql
+SELECT fga.enable_compiled_relations(
+  store => (SELECT id FROM fga.store WHERE name = 'docs-example'),
+  target_schema => 'app_authz',
+  subject_sources => '{"user": "app.app_user(user_id)"}');
+```
+
+Opting in generates the functions for the latest model at once.
+`fga.compiled_relation` lists them, with the strategy each
+relation compiled to and, for a relation answered by the generic
+resolver, the reason. `fga.disable_compiled_relations(store)`
+drops exactly the functions the engine registered; deleting the
+store does the same.
+
+`subject_sources` is optional. It names, per subject type, the
+application's table and uuid column holding every subject of
+that type, as `schema.table(column)`. `__subjects` needs it to
+turn a wildcard grant (`user:*`) into a list of users — the
+engine cannot otherwise know who "everyone" is. Without a source,
+`__subjects` raises when it meets such a wildcard.
+
+### 4. Tuples, then statistics
+
+```sql
+SELECT fga.write(
+  (SELECT id FROM fga.store WHERE name = 'docs-example'),
+  '{"writes": {"tuple_keys": [
+     {"object": "folder:0192f0a0-0000-7000-8000-00000000f001",
+      "relation": "viewer",
+      "user": "user:0192f0a0-0000-7000-8000-00000000a001"},
+     {"object": "document:0192f0a0-0000-7000-8000-00000000d001",
+      "relation": "parent",
+      "user": "folder:0192f0a0-0000-7000-8000-00000000f001"},
+     {"object": "document:0192f0a0-0000-7000-8000-00000000d002",
+      "relation": "viewer",
+      "user": "user:0192f0a0-0000-7000-8000-00000000a002"},
+     {"object": "document:0192f0a0-0000-7000-8000-00000000d003",
+      "relation": "viewer",
+      "user": "user:*"}]}}');
+
+ANALYZE fga.tuple;
+```
+
+Every query shape below relies on planner statistics for
+`fga.tuple`. Autovacuum keeps them current in normal operation;
+after a bulk load, run `ANALYZE fga.tuple` yourself — without
+statistics a page that takes milliseconds can take seconds.
+
+### 5. A page, filtered by authorization
+
+Call `__objects` in `FROM`, inside `IN (…)` or `EXISTS (…)`:
+
+```sql
+SELECT d.document_id, d.title
+FROM app.document d
+WHERE d.document_id IN (
+  SELECT x
+  FROM app_authz.document__viewer__objects(
+    'user', '0192f0a0-0000-7000-8000-00000000a001') x)
+ORDER BY d.title
+LIMIT 50;
+```
+
+Anne sees Budget (through its folder) and Handbook (shared with
+everyone). Called this way, PostgreSQL inlines the function into
+the query and plans the authorization filter together with the
+page. Calling it in the select list instead
+(`SELECT app_authz.document__viewer__objects(...)`) returns the
+same rows but computes the whole set first.
+
+### 6. A check, and the subjects of one object
+
+```sql
+SELECT app_authz.document__viewer__check(
+  '0192f0a0-0000-7000-8000-00000000d002',
+  'user', '0192f0a0-0000-7000-8000-00000000a001');
+
+SELECT u.name
+FROM app.app_user u
+WHERE u.user_id IN (
+  SELECT x
+  FROM app_authz.document__viewer__subjects(
+    '0192f0a0-0000-7000-8000-00000000d003', 'user') x)
+ORDER BY u.name;
+```
+
+The check answers false: Roadmap is shared with Bruno only. The
+subjects of Handbook are every user, expanded through the
+registered source. `__subjects` returns the final list — wildcards
+expanded, exclusions applied, groups expanded to their members —
+which is what an application renders; `fga.list_users` keeps
+upstream's shape instead (`user:*` plus usersets as themselves).
+
+Every function also takes `p_subject_relation` (to ask about a
+userset such as `team#member`), `p_any_subject` (to ask about
+`user:*`; the nil uuid is refused, as everywhere else),
+`p_context` and `p_contextual_tuples`, all defaulted.
+
+### 7. Privileges
+
+The generator grants nothing: generated functions follow
+PostgreSQL's rules, and their bodies read `fga` tables with the
+caller's rights. A schema the application creates grants `USAGE`
+to no one but its owner, so every other role that queries an
+opted-in store needs it — and that includes roles that only call
+`fga.check` or `fga.list_objects`, because once a store opts in
+those entry points answer through the generated functions. Without
+it they fail with "permission denied for schema app_authz" rather
+than quietly taking the slower path. Grant it once; the default
+privileges cover every function a later model write regenerates:
+
+```sql
+GRANT USAGE ON SCHEMA app_authz TO app_query_user;
+ALTER DEFAULT PRIVILEGES IN SCHEMA app_authz
+  GRANT EXECUTE ON FUNCTIONS TO app_query_user;
+```
+
+`ALTER DEFAULT PRIVILEGES` applies to functions created by the
+role that runs it, so run it as the role that writes models. The
+calling role needs `fga_reader`'s privileges as well, since the
+functions read `fga.tuple` with its rights.
+
+### Cost
+
+A compiled relation's cost grows with the set the subject can
+reach, not with the size of the store: a page for a subject who
+sees a few hundred objects stays in single-digit milliseconds,
+while a subject who sees every object of a large store pays for
+the whole set on every page. `docs/BENCHMARKS.md` ("tenant")
+records the measured envelope. A relation with CEL conditions
+evaluates its condition for every conditioned tuple on the path
+(about 0.25 ms each); compilation cannot remove that floor.
+
 ## Verifying
 
 ```sql

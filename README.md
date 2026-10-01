@@ -39,6 +39,13 @@ documented in [docs/CONFORMANCE.md](docs/CONFORMANCE.md).
   (including `on_duplicate`/`on_missing`), and `read` with keyset
   pagination
 - A minimal store namespace (`create_store`/`delete_store`)
+- Compiled relations, beyond upstream: opt a store in and every
+  relation also becomes plain SQL functions an application calls
+  inside its own queries — `id IN (SELECT x FROM
+  app_authz.document__viewer__objects('user', $1) x)` — so
+  authorization filters, sorts and pages in one plan. Answers are
+  the engine's own, corpus-tested; see
+  [docs/INSTALL.md](docs/INSTALL.md#compiled-relations).
 
 Distribution is plain SQL scripts and
 [pg_tle](https://github.com/aws/pg_tle), both first-class — see
