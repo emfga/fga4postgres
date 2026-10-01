@@ -10,8 +10,11 @@
 # cases run past their duration to reach the sample floor —
 # write:churn at ~3.4s per 100+100-op pair dominates. At
 # -min-ops 25 that overrun is ~5 min, hence the 20-minute
-# timeout. If shared runners still flap, the named fallback is
-# demoting the PR trigger to dispatch-only.
+# timeout. The tenant scenario adds 17 cases: ~2.5 min in one
+# local run at these knobs, ~15 min in all by that arithmetic
+# (not yet measured on a runner). If shared
+# runners still flap, the named fallback is demoting the PR
+# trigger to dispatch-only.
 name: Bench
 
 on:

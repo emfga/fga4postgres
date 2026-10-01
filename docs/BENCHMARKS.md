@@ -32,20 +32,124 @@ than 100 samples with `~`.
 
 ## Scenarios, sizes, seeds
 
-Three scenario models — `direct` (flat grants, the floor),
+Four scenario models — `direct` (flat grants, the floor),
 `hierarchy` (depth-20 TTU chains), `fanout` (nested usersets,
-1000-member groups) — each scale to `100k`, `1m`, `10m` and
-`100m` tuples. A size counts rows in `fga.tuple` for that
-scenario's store. Datasets and query streams are pure functions
-of (seed, scenario, size): the same seed reproduces the same
-bytes on any machine. The per-query work of every case is
-size-invariant by construction (chain depth, group width and
-per-user grant counts are constants), so cross-size comparisons
-measure the engine, not the workload.
+1000-member groups) and `tenant` (a four-level hierarchy with
+role ladders, for compiled relations; see below) — each scale
+to `100k`, `1m`, `10m` and `100m` tuples. A size counts rows in
+`fga.tuple` for that scenario's store. Datasets and query
+streams are pure functions of (seed, scenario, size): the same
+seed reproduces the same bytes on any machine. The per-query
+work of every case is size-invariant by construction (chain
+depth, group width and per-user grant counts are constants), so
+cross-size comparisons measure the engine, not the workload —
+with one deliberate exception, tenant's `all` subjects, below.
 
 `generator_version` in the result file changes whenever the
 generated fixtures change; benchreport refuses to diff results
 across fixture identities (scenario, size, seed, generator).
+
+## Compiled relations: the tenant scenario
+
+`tenant` measures compiled relations
+(`fga.enable_compiled_relations`) against the generic engine on
+one synthetic model: `platform → account → project →
+environment` (plus invoices), 6 types and 37 relations, only
+`[user]` grants, every permission a ladder of computed usersets
+and `x from parent`. The measured relation is
+`environment#can_view`. An account is always 5 projects × 50
+environments (250 leaves); the 100k size has 20 accounts
+(**5,000 leaves**), and from 1m on there is one account per
+2,500 tuples (**100,000 leaves** at 1m). The remaining tuples
+are background grants on leaves to users who are never queried.
+
+Three subject classes: `few` (reader on 3 leaves), `many`
+(admin of one account: 250 leaves at every size) and `all`
+(platform admin: every leaf, so its reach grows with the size).
+
+| feature | what one op is |
+|---|---|
+| `check` | `fga.check`, store not opted in |
+| `list_objects` | `fga.list_objects`, store not opted in (`few`, `many` only: `all` is seconds per call) |
+| `compiled_check` | the generated `__check`, called directly |
+| `check_opted_in` | `fga.check` on the opted-in store |
+| `compiled_objects` | `count(*)` over the whole `__objects` set |
+| `compiled_page` | 50 rows of the consumer's table, `id IN (SELECT x FROM __objects(...) x) ORDER BY name LIMIT 50` |
+
+The check-shaped features share one query stream per variant
+(`hit-shallow`: a direct leaf grant; `hit-deep`: a platform
+admin, three parent hops up; `miss`: a leaf reader outside its
+three leaves), and so do the list-shaped ones, so each compiled
+case compares against the generic one call for call.
+`check_opted_in` is the generic entry point on the opted-in
+store: it moves exactly when `fga.check` starts dispatching to
+compiled functions.
+
+Mechanics. The loader creates the consumer's table
+`fga_bench_tenant_<size>.environment (id, name)` beside the
+tuples (names uncorrelated with ids or hierarchy, indexed) and
+runs `ANALYZE` on it and on `fga.tuple` — every page shape needs
+analyzed `fga.tuple` statistics, and without them a page of 50
+runs 0.6–2.5 s. Each compiled case opts the store in to that
+schema (the bench creates it; the engine never creates schemas)
+for its own duration and opts it out outside the timed window,
+so the generic cases always measure a store that is not opted
+in. A compiled case refuses to run when `environment#can_view`
+did not compile to the flattened strategy. Checks go through
+pgx's statement cache like every other case; the set-shaped
+cases plan every call, so the plan never depends on what ran
+before (`internal/bench/compiled.go` says why).
+
+**The envelope.** A set-shaped `__objects` page costs in
+proportion to the subject's visible set, not to the page: the
+planner never turns `id IN (SELECT … FROM __objects(...))` into
+an early-stopping probe. The prototype that settled this design
+measured ~6.6 ms at 5,000 leaves and ~108 ms at 100,000 for a
+platform admin's page on this model, with a function that
+flattened `can_view` into one `UNION` over its four grant
+places (the leaf, its project, its account, the platform).
+
+**Measured** (one laptop: i7-1355U, 12 threads, `powersave`
+governor, the tmpfs compose stack, PostgreSQL 18.6, sharing the
+machine with other workloads — load average 0.5–5.7 during the
+runs; PR knobs `-warmup 3s -duration 5s -min-ops 25`). p50s;
+at 100k the median of three runs with the range, at 1m one run:
+
+| case | 100k (5,000 leaves) | 1m (100,000 leaves) |
+|---|--:|--:|
+| check hit-shallow | 0.36 ms (0.31–0.40) | 0.39 ms |
+| check hit-deep | 1.7 ms (1.5–4.8) | 1.8 ms |
+| check miss | 12.2 ms (11.8–14.3) | 61 ms (min 17) |
+| compiled_check hit-shallow | 0.08 ms (0.08–0.25) | 0.07 ms |
+| compiled_check hit-deep | 0.25 ms (0.22–0.27) | 0.22 ms |
+| compiled_check miss | 1.5 ms (1.5–1.9) | 1.6 ms |
+| check_opted_in miss | 12.7 ms (12.2–13.2) | 12.2 ms |
+| list_objects few | 8.3 ms (3.1–9.7) | 19.6 ms |
+| list_objects many | 33 ms (30–64) | 41 ms |
+| compiled_objects few | 28 ms (27–29) | 31 ms |
+| compiled_objects many | 28 ms (25–80) | 94 ms |
+| compiled_objects all | 50 ms (38–119) | 783 ms |
+| compiled_page few | 23 ms (23–31) | 24 ms |
+| compiled_page many | 34 ms (24–59) | 26 ms |
+| compiled_page all | 41 ms (41–139) | 880 ms |
+
+The page decomposes cleanly under `EXPLAIN (ANALYZE)` on the
+same fixtures: **planning is ~16–23 ms for every subject**, and
+execution is 3.6–4.5 ms (`few`, `many`) and 21–24 ms (`all`) at
+5,000 leaves, 4.5–7.6 ms and 780–840 ms at 100,000 (where JIT
+off changed nothing). So the engine's generated
+`environment#can_view` is well outside the prototype's envelope
+today: at 5,000 leaves planning alone costs more than the
+prototype's whole page, and at 100,000 leaves a platform admin's
+set passes five nested Sort + Unique steps of 100,000–200,000
+rows each (nested `UNION`s, spilling to disk at the default
+`work_mem`) where the prototype had one `UNION`. A
+prepared statement that settles on a generic plan skips the
+planning (measured in `psql`: 3.5 / 4.1 / 19–21 ms for
+`few` / `many` / `all` at 5,000 leaves), which is a consumer's
+choice the bench deliberately does not make for it. These
+figures say what the compiled functions cost on this model now;
+they do not say the set shape cannot reach the spike's numbers.
 
 ## Fixture loading
 
