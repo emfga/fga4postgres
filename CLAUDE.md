@@ -133,13 +133,17 @@ a future contributor will otherwise reopen.
    Never label a table-reading function `IMMUTABLE` to win an index;
    cel4postgres logs exactly that as a review item, not a pattern.
    Every function carries `SET search_path = fga, pg_temp` — except
-   the generated compiled-relation functions, which carry no `SET`
-   clause because one stops PostgreSQL from inlining them into the
-   caller's query, which is their reason to exist. Their bodies
-   schema-qualify every table, function, type and operator instead
-   (`fga.tuple`, `OPERATOR(pg_catalog.=)`), so a caller's
-   `search_path` cannot substitute a decoy; `TestCompiledInlinable`
-   and `TestCompiledSearchPathIndependent` enforce both halves.
+   the generated compiled-relation `__objects` and `__subjects`
+   functions, which carry no `SET` clause because one stops
+   PostgreSQL from inlining them into the caller's query, which is
+   their reason to exist. The generated `__check`, which never
+   inlines, keeps the clause, so the planner does not re-parse its
+   body on every planning. Every generated body schema-qualifies
+   every table, function, type and operator (`fga.tuple`,
+   `OPERATOR(pg_catalog.=)`), so a caller's `search_path` cannot
+   substitute a decoy; `TestCompiledInlinable`,
+   `TestCompiledConfigPerKind` and
+   `TestCompiledSearchPathIndependent` enforce it.
 10. **The id domain is native `uuid`; PostgreSQL 18 is the version
     floor.** Object and subject ids are `uuid` columns, accepted in
     canonical lower-case hyphenated spelling only — Postgres's uuid
