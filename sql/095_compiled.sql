@@ -241,11 +241,14 @@ BEGIN
 END;
 $$;
 
--- Delegated subjects: list_users answers, and its users become the
--- final list — a userset filter yields the userset ids, and a
--- typed wildcard expands over the registered subject source,
--- keeping only the subjects check allows (a wildcard may carry
--- exclusions list_users does not show).
+-- Delegated subjects: the generic list_users search, uncapped,
+-- turned into the final list __subjects promises (decision 8).
+-- list_users answers in upstream's shape, so its users are mapped:
+-- an object user is its id; a userset user (the filter names a
+-- relation) is the userset's id; and a typed wildcard expands over
+-- the registered subject source, keeping only the subjects check
+-- allows — upstream's shape hides a wildcard's exclusions (user:*
+-- but not bob is just user:*), and check is what applies them.
 CREATE OR REPLACE FUNCTION fga._compiled_subjects(
   store_id uuid, model_id uuid, object_type text, relation text,
   object_id uuid, subject_type text, subject_relation text,
@@ -264,7 +267,7 @@ BEGIN
     filter := filter || jsonb_build_object(
       'relation', subject_relation);
   END IF;
-  users := fga.list_users(store_id, jsonb_build_object(
+  users := fga._list_users(store_id, jsonb_build_object(
     'authorization_model_id', model_id::text,
     'object', jsonb_build_object(
       'type', object_type, 'id', fga._compiled_oid(object_id)),
@@ -272,25 +275,30 @@ BEGIN
     'user_filters', jsonb_build_array(filter),
     'context', context,
     'contextual_tuples', coalesce(contextual_tuples, '[]'::jsonb)
-  )) -> 'users';
+  ), 0) -> 'users';
 
-  RETURN QUERY
-  SELECT coalesce(u -> 'object' ->> 'id',
-                  u -> 'userset' ->> 'id')::uuid
-  FROM jsonb_array_elements(users) AS u
-  WHERE u ? 'object' OR u ? 'userset';
-
-  IF EXISTS (
+  IF NOT EXISTS (
     SELECT FROM jsonb_array_elements(users) AS u
     WHERE u ? 'wildcard'
   ) THEN
     RETURN QUERY
-    SELECT s.id FROM fga._compiled_source_ids(
-      store_id, subject_type) AS s(id)
-    WHERE fga._compiled_check(store_id, model_id, object_type,
-      relation, object_id, subject_type, s.id, '', false,
-      context, contextual_tuples);
+    SELECT coalesce(u -> 'object' ->> 'id',
+                    u -> 'userset' ->> 'id')::uuid
+    FROM jsonb_array_elements(users) AS u
+    WHERE u ? 'object' OR u ? 'userset';
+    RETURN;
   END IF;
+
+  RETURN QUERY
+  SELECT (u -> 'object' ->> 'id')::uuid
+  FROM jsonb_array_elements(users) AS u
+  WHERE u ? 'object'
+  UNION
+  SELECT s.id FROM fga._compiled_source_ids(
+    store_id, subject_type) AS s(id)
+  WHERE fga._compiled_check(store_id, model_id, object_type,
+    relation, object_id, subject_type, s.id, '', false,
+    context, contextual_tuples);
 END;
 $$;
 
@@ -909,6 +917,85 @@ AS $$
     ON d.root_type = v.type_name AND d.root_relation = v.relation_name;
 $$;
 
+-- The note a relation's registry reason carries when its
+-- __subjects may meet a wildcard grant of a type the store has
+-- registered no subject source for: such a call raises rather than
+-- return a partial list, and the registry says so from the model
+-- write on. NULL when every wildcard the relation can reach — on
+-- itself, through computed usersets, tuple-to-usersets or userset
+-- grants — has a source.
+CREATE OR REPLACE FUNCTION fga._compiled_source_note(
+  store_id uuid, model_id uuid, type_name text, relation_name text
+)
+RETURNS text
+LANGUAGE sql
+STABLE PARALLEL SAFE
+SET search_path = fga, pg_temp
+AS $$
+  WITH RECURSIVE
+  node AS (
+    SELECT r.type_name, r.relation_name, n
+    FROM fga.model_relation r, fga._rewrite_nodes(r.rewrite) AS n
+    WHERE r.store = store_id
+      AND r.model_id = _compiled_source_note.model_id
+  ),
+  restriction AS (
+    SELECT tr.* FROM fga.model_type_restriction tr
+    WHERE tr.store = store_id
+      AND tr.model_id = _compiled_source_note.model_id
+  ),
+  edge AS (
+    SELECT nd.type_name, nd.relation_name, nd.type_name AS to_type,
+           nd.n -> 'computed_userset' ->> 'relation' AS to_relation
+    FROM node nd WHERE nd.n ? 'computed_userset'
+    UNION ALL
+    SELECT nd.type_name, nd.relation_name, tr.subject_type,
+           nd.n -> 'tuple_to_userset' -> 'computed_userset'
+             ->> 'relation'
+    FROM node nd
+    JOIN restriction tr
+      ON tr.type_name = nd.type_name
+     AND tr.relation_name
+           = nd.n -> 'tuple_to_userset' -> 'tupleset' ->> 'relation'
+    WHERE nd.n ? 'tuple_to_userset'
+      AND tr.subject_relation = '' AND NOT tr.is_wildcard
+    UNION ALL
+    SELECT nd.type_name, nd.relation_name, tr.subject_type,
+           tr.subject_relation
+    FROM node nd
+    JOIN restriction tr
+      ON tr.type_name = nd.type_name
+     AND tr.relation_name = nd.relation_name
+    WHERE nd.n ? 'this' AND tr.subject_relation <> ''
+  ),
+  reach AS (
+    SELECT _compiled_source_note.type_name,
+           _compiled_source_note.relation_name
+    UNION
+    SELECT e.to_type, e.to_relation
+    FROM reach x
+    JOIN edge e
+      ON e.type_name = x.type_name
+     AND e.relation_name = x.relation_name
+  )
+  SELECT '__subjects: no subject source registered for wildcard '
+    || 'type ' || string_agg(DISTINCT tr.subject_type, ', '
+                             ORDER BY tr.subject_type)
+  FROM reach x
+  JOIN restriction tr
+    ON tr.type_name = x.type_name
+   AND tr.relation_name = x.relation_name
+  WHERE tr.is_wildcard
+    AND EXISTS (
+      SELECT FROM node nd
+      WHERE nd.type_name = x.type_name
+        AND nd.relation_name = x.relation_name AND nd.n ? 'this')
+    AND NOT EXISTS (
+      SELECT FROM fga.compiled_store cs
+      WHERE cs.store = store_id
+        AND cs.subject_sources ? tr.subject_type);
+$$;
+
 -- Every function of a model: names, signatures and definitions,
 -- each body from its relation's strategy emitter.
 CREATE OR REPLACE FUNCTION fga._compiled_functions(
@@ -928,7 +1015,10 @@ AS $$
       WHEN 'objects' THEN b.objects_body
       WHEN 'subjects' THEN b.subjects_body
       ELSE b.check_body END),
-    p.strategy, p.reason, p.ord
+    p.strategy,
+    nullif(concat_ws('; ', p.reason, fga._compiled_source_note(
+      store_id, model_id, p.type_name, p.relation_name)), ''),
+    p.ord
   FROM fga._compiled_plan(store_id, model_id) AS p
   CROSS JOIN LATERAL (
     SELECT * FROM fga._compiled_emit_flattened(store_id, model_id,
