@@ -177,7 +177,65 @@ where the prototype, which skipped that test, read the index
 alone. In `psql` on the same data the page took ~227 ms with the
 test and ~123 ms without it; with a temporary copy of
 `tuple_reverse_idx` that `INCLUDE`s `condition_name`, the exact
-page took ~125 ms.
+page took ~125 ms. The reverse index now does (next section).
+
+### The covering reverse index
+
+`sql/050_tuple.sql` builds the reverse index as
+`tuple_reverse_cond_idx`, the same keys plus
+`INCLUDE (condition_name)`, and drops `tuple_reverse_idx`. Measured
+on the same laptop, PostgreSQL 18.6 on the tmpfs compose stack,
+default settings (`maintenance_work_mem` 64 MB); load average
+0.8–1.3 throughout. Two databases held identical data, one with
+each index, both vacuumed (an index-only scan skips the heap only
+for pages the visibility map marks all-visible, which autovacuum
+keeps true of a settled table). Runs alternated between them, five
+rounds, order flipped each round; each cell is the median of the
+five p50s in ms, at the bench's knobs `-warmup 2s -duration 5s
+-min-ops 25`. The 100k database holds the four 100k fixtures
+(400,000 tuples); the 1m one holds the tenant and direct 1m
+fixtures (2,000,000).
+
+| case | 100k old | 100k new | 1m old | 1m new |
+|---|--:|--:|--:|--:|
+| compiled_objects few | 2.27 | 2.27 | 3.23 | 3.23 |
+| compiled_objects many | 2.45 | 2.36 | 2.45 | 2.27 |
+| compiled_objects all | 5.59 | 4.42 | 129 | **48** |
+| compiled_page few | 2.36 | 2.36 | 3.23 | 3.10 |
+| compiled_page many | 2.87 | 2.76 | 2.98 | 2.65 |
+| compiled_page all | 11.8 | 8.3 | 241 | **139** |
+| write churn (direct) | 24.8 | 24.8 | 25.8 | 25.8 |
+| pgbench write+delete | 25.1 | 24.9 | 26.9 | 26.8 |
+
+A platform admin's page at 100,000 leaves drops from 241 to
+~139 ms, and counting the whole set from 129 to 48 ms; narrow
+subjects do not move. `write churn` is the bench's `write` case
+(one op is a 100-tuple `fga.write` and the matching delete); its
+p50 falls on histogram buckets, so the same op was also timed with
+`pgbench -T 10` (latency average, 5 runs per side): within 1%
+either way, i.e. noise. A tuple write is dominated by the write
+gate's validation, not by one more index entry's bytes. In two of
+the ten 100k runs every tenant case on both sides took ~20 ms
+(a planning-time mode not tied to the index); the medians skip
+past them.
+
+Index size and build time, the same index built fresh over the
+same rows (bytes from `pg_relation_size`):
+
+| tuples | old index | new index | growth |
+|--:|--:|--:|--:|
+| 1,000,000 (tenant 1m) | 106,127,360 | 115,023,872 | +8.4% |
+| 2,000,000 | 201,687,040 | 220,266,496 | +9.2% |
+| 4,000,000 (all four 1m) | 392,495,104 | 430,399,488 | +9.7% |
+
+No fixture tuple carries a condition, so every entry grows only by
+its null bitmap; a conditioned tuple's entry also carries its
+condition name. Upgrading a 1,000,000-tuple table — re-running
+`sql/050_tuple.sql` with only the old index present, in one
+transaction — took 1.42 / 1.72 / 1.69 s (the old index alone built
+in 1.23–1.44 s); re-running it once the new index exists took
+0.10–0.12 s. At 4,000,000 tuples each build took 5–6.6 s, measured
+while other work loaded the machine (load average 10–27).
 
 Checks trade the other way. One body means one plan, and its
 every arm starts on every call, where the composed form started
@@ -204,7 +262,8 @@ The loader records what it loaded in a `fga_bench.manifest`
 table (a schema the tooling creates and owns; the engine's
 `sql/` and the release artifacts never reference it) and skips
 loads whose manifest already matches. At 10M+ rows it drops the
-two secondary indexes (`tuple_ulid_idx`, `tuple_reverse_idx`)
+two secondary indexes (`tuple_ulid_idx`,
+`tuple_reverse_cond_idx`)
 before the COPY and recreates them by re-running
 `sql/050_tuple.sql` — it touches engine-owned objects during
 load, which is why bench databases are dedicated. `ANALYZE` and

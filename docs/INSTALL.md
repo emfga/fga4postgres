@@ -35,6 +35,18 @@ should still be all or nothing.
 Every script is idempotent; re-running the installer against a
 live database is the upgrade path.
 
+Upgrading to 0.1.0 from an earlier release rebuilds the reverse
+tuple index (`tuple_reverse_idx` becomes `tuple_reverse_cond_idx`,
+which also covers `condition_name`). Building it blocks writes to
+`fga.tuple`, and dropping the old index then blocks reads as well,
+until the installer's transaction commits. The build took ~1.7 s
+for 1,000,000 tuples and 5–6.6 s for 4,000,000 on the machine in
+`docs/BENCHMARKS.md`. The installer has to run inside a
+transaction, so it cannot use `CREATE INDEX CONCURRENTLY`, and no
+concurrent upgrade path is offered yet: schedule the upgrade where
+a pause in tuple traffic of that length is acceptable. Re-running
+the installer once the new index exists rebuilds nothing.
+
 From a checkout instead of a release:
 
 ```sh
