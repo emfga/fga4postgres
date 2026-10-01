@@ -6,7 +6,9 @@
 #   Installed between BEGIN and ROLLBACK it must leave no fga or cel
 #   schema behind -- one stray COMMIT; would keep them -- and
 #   installed with --single-transaction it must answer fga.version();
-# - a -tx artifact installs with a bare psql -f.
+# - a -tx artifact installs with a bare psql -f;
+# - each one installs a second time over itself, because re-running
+#   the installer is the upgrade path.
 #
 # The engine-only files install over the vendored cel4postgres
 # bundle, in the same transaction. Run after build-release.sh; used
@@ -75,10 +77,14 @@ smoke() {
   fi
   # shellcheck disable=SC2086
   sql --single-transaction $pre -f "$plain"
+  # shellcheck disable=SC2086
+  sql --single-transaction $pre -f "$plain"
   expect_version
 
   tx="/dist/$name-tx--$version.sql"
   echo "== $tx"
+  # shellcheck disable=SC2086
+  sql $pre -f "$tx"
   # shellcheck disable=SC2086
   sql $pre -f "$tx"
   expect_version
