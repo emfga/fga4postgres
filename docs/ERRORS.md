@@ -64,6 +64,15 @@ The v1.19.0 corpus asserts 2000, 2002, 2021, 2022 and 2027; the
 rest are codes the engine's own write and lookup paths need. New
 codes are added by the rule, recorded here in the same commit.
 
+Compiled relations (an additive, non-upstream surface) raise
+existing codes only, with the meaning closest to upstream's:
+
+| SQLSTATE | raised when |
+|---|---|
+| YF100 | the target schema is missing or reserved (`fga`, `cel`, `pg_*`, `information_schema`) or already serves another store; a subject source is malformed; a generated function gets the nil uuid, or a subject id together with `p_any_subject`; `__subjects` must expand a wildcard whose subject type has no registered source |
+| YF156 | two relations would generate the same function name, or the target schema already holds a function with a generated signature that the engine did not create |
+| YF502 | the store to opt in does not exist |
+
 ## Raising
 
 ```sql
