@@ -77,7 +77,7 @@ DECLARE
   frontier fga._lo_node[];
   next_frontier fga._lo_node[];
   cands fga._lo_cand[];
-  seen text[] := '{}';
+  seen fga._lo_node[] := '{}';
   found uuid[] := '{}';
   clear_ids uuid[] := '{}';
   tainted_ids uuid[] := '{}';
@@ -187,11 +187,7 @@ BEGIN
   WHILE coalesce(array_length(frontier, 1), 0) > 0
         AND coalesce(array_length(found, 1), 0) < 1000
   LOOP
-    seen := seen || (
-      SELECT coalesce(array_agg(
-        f.ntype || ':' || f.nid || '#' || f.nrel
-          || CASE WHEN f.tainted THEN '@t' ELSE '@f' END), '{}')
-      FROM unnest(frontier) f);
+    seen := seen || frontier;
 
     -- Discover candidate nodes with their row conditions.
     WITH f AS (SELECT * FROM unnest(frontier) AS f),
@@ -327,25 +323,37 @@ BEGIN
           AND mr.subject_relation = u.relation_name
       );
 
-    -- Evaluate row conditions; collect per-candidate errors with
-    -- upstream's scoping (raised later only if results stay under
-    -- the cap).
+    -- Drop nodes already expanded (a hashed anti-join: the seen
+    -- set only grows, so a per-candidate array scan is quadratic),
+    -- then evaluate row conditions — only for rows that carry one.
+    -- Per-candidate errors are collected with upstream's scoping
+    -- (raised later only if results stay under the cap).
+    WITH fresh AS (
+      SELECT * FROM unnest(cands) c
+      WHERE (c.ntype, c.nid, c.nrel, c.tainted) NOT IN (
+        SELECT x.ntype, x.nid, x.nrel, x.tainted
+        FROM unnest(seen) x)
+    ),
+    judged AS (
+      SELECT f.ntype, f.nid, f.nrel, f.tainted,
+             true AS met, NULL::text AS err
+      FROM fresh f
+      WHERE coalesce(f.cond_name, '') = ''
+      UNION ALL
+      SELECT f.ntype, f.nid, f.nrel, f.tainted, e.met, e.err
+      FROM fresh f
+      CROSS JOIN LATERAL fga._eval_condition(
+        store_id, mid, f.cond_name, f.cond_ctx, req_ctx) e
+      WHERE coalesce(f.cond_name, '') <> ''
+    )
     SELECT
-      coalesce(array_agg(
-        (c.ntype, c.nid, c.nrel, c.tainted)::fga._lo_node)
-        FILTER (WHERE coalesce(c.cond_name, '') = ''
-                      OR ev.met), '{}'),
-      count(*) FILTER (WHERE ev.err IS NOT NULL),
-      min(ev.err) FILTER (WHERE ev.err IS NOT NULL)
+      coalesce(array_agg(DISTINCT
+        (j.ntype, j.nid, j.nrel, j.tainted)::fga._lo_node)
+        FILTER (WHERE j.met), '{}'),
+      count(*) FILTER (WHERE j.err IS NOT NULL),
+      min(j.err) FILTER (WHERE j.err IS NOT NULL)
     INTO next_frontier, level_errs, level_first
-    FROM unnest(cands) c
-    LEFT JOIN LATERAL fga._eval_condition(
-      store_id, mid, c.cond_name, c.cond_ctx, req_ctx) ev
-      ON coalesce(c.cond_name, '') <> ''
-    WHERE NOT (
-      c.ntype || ':' || c.nid || '#' || c.nrel
-        || CASE WHEN c.tainted THEN '@t' ELSE '@f' END
-    ) = ANY (seen);
+    FROM judged j;
 
     err_count := err_count + coalesce(level_errs, 0);
     first_err := coalesce(first_err, level_first);
