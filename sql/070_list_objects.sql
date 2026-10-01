@@ -59,6 +59,52 @@ EXCEPTION WHEN duplicate_object THEN
 END;
 $$;
 
+-- A compiled relation's __objects function (sql/095_compiled.sql),
+-- called by the search below once the request has passed its
+-- validation, with the cap applied on top (0 = uncapped). The
+-- fga._dispatching setting keeps the generated body's hand-offs to
+-- the generic resolver generic (see fga._check_compiled).
+--
+-- Past the cap the generic search tolerates condition errors,
+-- while a generated body refuses on any it meets, so a capped call
+-- the generated function refuses returns NULL: the caller then
+-- answers generically, which either raises the same error or
+-- returns the capped list.
+CREATE OR REPLACE FUNCTION fga._list_objects_compiled(
+  fn regprocedure, object_type text, subject_type text,
+  subject_id uuid, subject_relation text, any_subject boolean,
+  context jsonb, contextual_tuples jsonb, cap integer
+)
+RETURNS text[]
+LANGUAGE plpgsql
+STABLE PARALLEL SAFE
+SET search_path = fga, pg_temp
+SET fga._dispatching = 'on'
+AS $$
+DECLARE
+  q constant text := format(
+    'SELECT coalesce(array_agg(%L || x::text), ''{}'') FROM ('
+    'SELECT x FROM %s($1, $2, $3, $4, $5, $6) AS x LIMIT $7) AS l',
+    object_type || ':', fn::oid::regproc);
+  objects text[];
+BEGIN
+  IF cap = 0 THEN
+    EXECUTE q INTO objects
+    USING subject_type, subject_id, subject_relation, any_subject,
+      context, contextual_tuples, NULL::bigint;
+    RETURN objects;
+  END IF;
+  BEGIN
+    EXECUTE q INTO objects
+    USING subject_type, subject_id, subject_relation, any_subject,
+      context, contextual_tuples, cap::bigint;
+  EXCEPTION WHEN SQLSTATE 'YF000' THEN
+    RETURN NULL;
+  END;
+  RETURN objects;
+END;
+$$;
+
 -- The search behind fga.list_objects and fga.streamed_list_objects:
 -- the request's objects, at most cap of them (0 = unlimited). One
 -- body for both is what keeps their validation, error codes and
@@ -99,6 +145,7 @@ DECLARE
   chk_state text;
   chk_msg text;
   objects text[] := '{}';
+  fn regprocedure;
 BEGIN
   mid := fga._resolve_model(
     store_id, request ->> 'authorization_model_id');
@@ -172,6 +219,33 @@ BEGIN
         'invalid ''user'' value: id ''%'' is not a canonical '
         'uuid (fga4postgres id domain)', s.id_text
         USING ERRCODE = 'YF100';
+    END IF;
+  END IF;
+
+  -- An opted-in store's latest model answers through the
+  -- relation's generated __objects (see fga.check); delegated
+  -- relations are skipped, their __objects runs this search.
+  IF current_setting('fga._dispatching', true)
+     IS DISTINCT FROM 'on' THEN
+    SELECT cr.objects_fn INTO fn
+    FROM fga.compiled_relation cr
+    WHERE cr.store = store_id AND cr.model_id = mid
+      AND cr.type_name = target_type
+      AND cr.relation_name = target_rel
+      AND cr.strategy <> 'delegated';
+    IF FOUND THEN
+      objects := fga._list_objects_compiled(
+        fn, target_type, s.subject_type,
+        CASE WHEN NOT s.is_wildcard THEN sid END,
+        s.subject_relation, s.is_wildcard,
+        coalesce(req_ctx, '{}'),
+        coalesce(request -> 'contextual_tuples' -> 'tuple_keys',
+                 '[]'),
+        cap);
+      IF objects IS NOT NULL THEN
+        RETURN objects;
+      END IF;
+      objects := '{}';
     END IF;
   END IF;
 

@@ -547,9 +547,51 @@ BEGIN
 END;
 $$;
 
+-- A compiled relation's __check function (sql/095_compiled.sql),
+-- called on behalf of fga.check once the request has passed check's
+-- own validation. The function is found in the registry, so the
+-- call is dynamic.
+--
+-- The SET of fga._dispatching is what keeps dispatch from
+-- recursing: some generated bodies hand a question back to the
+-- generic resolver by calling fga.check (a delegated relation, a
+-- recursive one given contextual tuples or nearing the depth
+-- limit), and while this function runs every public entry point
+-- answers generically. The setting is restored on exit, error or
+-- not.
+CREATE OR REPLACE FUNCTION fga._check_compiled(
+  fn regprocedure, object_id uuid, subject_type text,
+  subject_id uuid, subject_relation text, any_subject boolean,
+  context jsonb, contextual_tuples jsonb
+)
+RETURNS boolean
+LANGUAGE plpgsql
+STABLE PARALLEL SAFE
+SET search_path = fga, pg_temp
+SET fga._dispatching = 'on'
+AS $$
+DECLARE
+  allowed boolean;
+BEGIN
+  EXECUTE format('SELECT %s($1, $2, $3, $4, $5, $6, $7)',
+    fn::oid::regproc)
+  INTO allowed
+  USING object_id, subject_type, subject_id, subject_relation,
+    any_subject, context, contextual_tuples;
+  RETURN allowed;
+END;
+$$;
+
 -- The public check entry point. Request is upstream's
 -- CheckRequest JSON shape (snake_case): tuple_key,
 -- contextual_tuples.tuple_keys, context, authorization_model_id.
+--
+-- On a store opted in to compiled relations, a request on the
+-- model the functions were compiled from (the latest) is answered
+-- by the relation's generated __check, after the validation below:
+-- the registry is keyed by model id, so a request pinned to an
+-- older model finds no row and resolves generically. Delegated
+-- relations are skipped — their __check calls fga.check.
 CREATE OR REPLACE FUNCTION fga.check(
   store_id uuid,
   request jsonb
@@ -573,6 +615,7 @@ DECLARE
   tkj jsonb;
   v record;
   r fga._check_result;
+  fn regprocedure;
 BEGIN
   mid := fga._resolve_model(
     store_id, request ->> 'authorization_model_id');
@@ -672,6 +715,24 @@ BEGIN
       tkj -> 'condition' ->> 'name',
       tkj -> 'condition' -> 'context')::fga._tuple_key;
   END LOOP;
+
+  IF current_setting('fga._dispatching', true)
+     IS DISTINCT FROM 'on' THEN
+    SELECT cr.check_fn INTO fn
+    FROM fga.compiled_relation cr
+    WHERE cr.store = store_id AND cr.model_id = mid
+      AND cr.type_name = o.object_type AND cr.relation_name = rel
+      AND cr.strategy <> 'delegated';
+    IF FOUND THEN
+      RETURN jsonb_build_object('allowed', fga._check_compiled(
+        fn, oid, s.subject_type,
+        CASE WHEN NOT s.is_wildcard THEN sid END,
+        s.subject_relation, s.is_wildcard,
+        coalesce(req_ctx, '{}'),
+        coalesce(request -> 'contextual_tuples' -> 'tuple_keys',
+                 '[]')));
+    END IF;
+  END IF;
 
   r := fga._check_node(
     store_id, mid,
