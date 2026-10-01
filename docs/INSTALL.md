@@ -236,8 +236,12 @@ Opting in generates the functions for the latest model at once.
 `fga.compiled_relation` lists them, with the strategy each
 relation compiled to and, for a relation answered by the generic
 resolver, the reason. `fga.disable_compiled_relations(store)`
-drops exactly the functions the engine registered; deleting the
-store does the same.
+drops exactly the functions the engine registered (those still
+there, if the application dropped the schema first); deleting the
+store does the same. Every model write to an opted-in store
+regenerates its functions in the write's transaction, and two
+concurrent writes to one store take turns: the second waits for
+the first to commit.
 
 `subject_sources` is optional. It names, per subject type, the
 application's table and uuid column holding every subject of
