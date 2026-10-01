@@ -442,11 +442,12 @@ func (c *Client) Check(
 	return resp, nil
 }
 
-func (c *Client) ListObjects(
-	ctx context.Context,
+// listObjectsRequest validates a list-objects request and renders
+// it as the engine's jsonb request, ids mapped. The unary and the
+// streamed function take the same request.
+func (c *Client) listObjectsRequest(
 	in *openfgav1.ListObjectsRequest,
-	_ ...grpc.CallOption,
-) (*openfgav1.ListObjectsResponse, error) {
+) ([]byte, error) {
 	if err := validate(in); err != nil {
 		return nil, err
 	}
@@ -455,7 +456,28 @@ func (c *Client) ListObjects(
 	for i, tk := range mapped.GetContextualTuples().GetTupleKeys() {
 		mapped.ContextualTuples.TupleKeys[i] = c.mapTuple(tk)
 	}
-	req, err := marshal.Marshal(mapped)
+	return marshal.Marshal(mapped)
+}
+
+// objectBack maps an engine "type:id" object back to the corpus
+// original.
+func (c *Client) objectBack(obj string) string {
+	if c.ids == nil {
+		return obj
+	}
+	typ, id, ok := strings.Cut(obj, ":")
+	if !ok {
+		return obj
+	}
+	return typ + ":" + c.ids.Back(id)
+}
+
+func (c *Client) ListObjects(
+	ctx context.Context,
+	in *openfgav1.ListObjectsRequest,
+	_ ...grpc.CallOption,
+) (*openfgav1.ListObjectsResponse, error) {
+	req, err := c.listObjectsRequest(in)
 	if err != nil {
 		return nil, err
 	}
@@ -470,14 +492,8 @@ func (c *Client) ListObjects(
 	if err := protojson.Unmarshal(out, resp); err != nil {
 		return nil, err
 	}
-	// Map engine object ids back to the corpus originals.
-	if c.ids != nil {
-		for i, obj := range resp.GetObjects() {
-			typ, id, ok := strings.Cut(obj, ":")
-			if ok {
-				resp.Objects[i] = typ + ":" + c.ids.Back(id)
-			}
-		}
+	for i, obj := range resp.GetObjects() {
+		resp.Objects[i] = c.objectBack(obj)
 	}
 	return resp, nil
 }
@@ -525,18 +541,28 @@ func (c *Client) ListUsers(
 	return resp, nil
 }
 
-// StreamedListObjects adapts the unary ListObjects into the
-// client-stream shape the upstream runners consume. Like the real
-// server, errors surface on the first Recv, not on the call
-// itself. One deliberate divergence carried over from the unary
-// path: a condition evaluation error always fails the stream,
+// StreamedListObjects calls fga.streamed_list_objects (uncapped,
+// one row per object) and replays its rows in the client-stream
+// shape the upstream runners consume. Like the real server, errors
+// surface on the first Recv, not on the call itself. One deliberate
+// divergence: the engine produces its whole answer before the first
+// row, so a condition evaluation error always fails the stream,
 // where upstream may have streamed partial results first.
 func (c *Client) StreamedListObjects(
 	ctx context.Context,
 	in *openfgav1.StreamedListObjectsRequest,
 	_ ...grpc.CallOption,
 ) (openfgav1.OpenFGAService_StreamedListObjectsClient, error) {
-	resp, err := c.ListObjects(ctx, &openfgav1.ListObjectsRequest{
+	s := &streamedListObjects{ctx: ctx}
+	s.objects, s.err = c.streamedListObjects(ctx, in)
+	return s, nil
+}
+
+func (c *Client) streamedListObjects(
+	ctx context.Context,
+	in *openfgav1.StreamedListObjectsRequest,
+) ([]string, error) {
+	req, err := c.listObjectsRequest(&openfgav1.ListObjectsRequest{
 		StoreId:              in.GetStoreId(),
 		AuthorizationModelId: in.GetAuthorizationModelId(),
 		Type:                 in.GetType(),
@@ -545,13 +571,33 @@ func (c *Client) StreamedListObjects(
 		ContextualTuples:     in.GetContextualTuples(),
 		Context:              in.GetContext(),
 	})
-	s := &streamedListObjects{ctx: ctx}
 	if err != nil {
-		s.err = err
-	} else {
-		s.objects = resp.GetObjects()
+		return nil, err
 	}
-	return s, nil
+	rows, err := c.pool.Query(ctx,
+		"SELECT fga.streamed_list_objects($1, $2)",
+		in.GetStoreId(), req,
+	)
+	if err != nil {
+		return nil, translate(err)
+	}
+	defer rows.Close()
+	var objects []string
+	for rows.Next() {
+		var out []byte
+		if err := rows.Scan(&out); err != nil {
+			return nil, err
+		}
+		msg := &openfgav1.StreamedListObjectsResponse{}
+		if err := protojson.Unmarshal(out, msg); err != nil {
+			return nil, err
+		}
+		objects = append(objects, c.objectBack(msg.GetObject()))
+	}
+	if err := rows.Err(); err != nil {
+		return nil, translate(err)
+	}
+	return objects, nil
 }
 
 type streamedListObjects struct {

@@ -59,11 +59,16 @@ EXCEPTION WHEN duplicate_object THEN
 END;
 $$;
 
-CREATE OR REPLACE FUNCTION fga.list_objects(
+-- The search behind fga.list_objects and fga.streamed_list_objects:
+-- the request's objects, at most cap of them (0 = unlimited). One
+-- body for both is what keeps their validation, error codes and
+-- answers identical apart from the cap.
+CREATE OR REPLACE FUNCTION fga._list_objects(
   store_id uuid,
-  request jsonb
+  request jsonb,
+  cap integer
 )
-RETURNS jsonb
+RETURNS text[]
 LANGUAGE plpgsql
 STABLE PARALLEL SAFE
 SET search_path = fga, pg_temp
@@ -83,7 +88,6 @@ DECLARE
   next_frontier fga._lo_node[];
   cands fga._lo_cand[];
   seen fga._lo_node[] := '{}';
-  cap integer := fga._setting_int('list_objects_max_results');
   clear_ids uuid[] := '{}';
   tainted_ids uuid[] := '{}';
   err_count integer := 0;
@@ -420,7 +424,20 @@ BEGIN
     SELECT DISTINCT unnest(clear_ids) AS id LIMIT nullif(cap, 0)
   ) x;
 
-  RETURN jsonb_build_object('objects',
-    to_jsonb(objects));
+  RETURN objects;
 END;
+$$;
+
+CREATE OR REPLACE FUNCTION fga.list_objects(
+  store_id uuid,
+  request jsonb
+)
+RETURNS jsonb
+LANGUAGE sql
+STABLE PARALLEL SAFE
+SET search_path = fga, pg_temp
+AS $$
+  SELECT jsonb_build_object('objects', to_jsonb(fga._list_objects(
+    store_id, request,
+    fga._setting_int('list_objects_max_results'))));
 $$;

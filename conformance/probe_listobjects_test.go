@@ -2,7 +2,9 @@ package conformance
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"testing"
 
 	openfgav1 "github.com/openfga/api/proto/openfga/v1"
@@ -256,6 +258,55 @@ func TestProbeListObjectsCapCountsConfirmed(t *testing.T) {
 		if len(got) != 1 || got[0] != "doc:owned" {
 			t.Errorf("%s: objects = %v, want [doc:owned]",
 				sd.name, got)
+		}
+	}
+}
+
+// StreamedListObjects ignores the result cap upstream, so 1,005
+// accessible objects stream as 1,005 on both sides — where the unary
+// call answers 1,000 (TestProbeListObjectsResultCap).
+func TestProbeStreamedListObjectsUncapped(t *testing.T) {
+	ctx := context.Background()
+	for _, sd := range bothSides(t, "lo-streamed") {
+		var tuples []*openfgav1.TupleKey
+		for i := 0; i < 1005; i++ {
+			tuples = append(tuples, tk(
+				fmt.Sprintf("doc:d%d", i), "viewer", "user:anne"))
+		}
+		store, model := setup(t, sd.client, plainDSL, tuples)
+		stream, err := sd.client.(interface {
+			StreamedListObjects(context.Context,
+				*openfgav1.StreamedListObjectsRequest,
+				...grpc.CallOption,
+			) (openfgav1.OpenFGAService_StreamedListObjectsClient,
+				error)
+		}).StreamedListObjects(ctx,
+			&openfgav1.StreamedListObjectsRequest{
+				StoreId:              store,
+				AuthorizationModelId: model,
+				Type:                 "doc",
+				Relation:             "viewer",
+				User:                 "user:anne",
+			})
+		if err != nil {
+			t.Fatalf("%s: %v", sd.name, err)
+		}
+		seen := map[string]bool{}
+		for {
+			resp, err := stream.Recv()
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			if err != nil {
+				t.Fatalf("%s: %v", sd.name, err)
+			}
+			seen[resp.GetObject()] = true
+		}
+		t.Logf("OBSERVED(%s): 1005 accessible -> %d streamed",
+			sd.name, len(seen))
+		if len(seen) != 1005 || !seen["doc:d1004"] {
+			t.Errorf("%s: streamed %d distinct objects, want 1005",
+				sd.name, len(seen))
 		}
 	}
 }
