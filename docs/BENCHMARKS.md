@@ -244,11 +244,16 @@ only the callees a call reached: a direct hit costs ~0.05 ms more
 every callee, ~1.2 ms less. A check called from a statement
 planned once (a prepared statement, the bench's `compiled_check`)
 pays nothing else; one planned per call (a plpgsql `EXECUTE`, as
-dispatch from `fga.check` does) also pays for parsing the body,
-which the generator keeps small: the body starts with an empty
-statement so the planner stops trying to inline it after the raw
-parse, and the statements a call with contextual tuples runs live
-in `fga.compiled_contextual` rather than in the body.
+dispatch from `fga.check` does) would also pay for the planner
+parsing the body to try inlining it. A scalar check never inlines,
+so `__check` carries `SET search_path = fga, pg_temp`, which rules
+inlining out before the body is parsed (only `__objects` and
+`__subjects`, which must inline, go without a `SET` clause), and
+the statements a call with contextual tuples runs live in
+`fga.compiled_contextual` rather than in the body. On the ladder
+fixture that took a dispatched `fga.check` on an opted-in store
+from 0.85–0.90 ms (the body then started with an empty statement
+to stop the inlining attempt after the raw parse) to 0.47–0.53 ms.
 
 ## Fixture loading
 
