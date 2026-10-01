@@ -180,6 +180,13 @@ $$;
 -- The generic resolver behind delegated functions. The model id
 -- is the one the function was compiled from, so a delegated
 -- answer never comes from another model.
+--
+-- These hand-offs set fga._dispatching (see fga._check_compiled)
+-- for their own duration, so the public entry point they call
+-- answers generically: on an opted-in store it would otherwise
+-- dispatch straight back to the generated function that handed
+-- the question off (a recursive relation given contextual tuples,
+-- called directly), which would hand it off again.
 CREATE OR REPLACE FUNCTION fga._compiled_check(
   store_id uuid, model_id uuid, object_type text, relation text,
   object_id uuid, subject_type text, subject_id uuid,
@@ -190,6 +197,7 @@ RETURNS boolean
 LANGUAGE sql
 STABLE PARALLEL SAFE
 SET search_path = fga, pg_temp
+SET fga._dispatching = 'on'
 AS $$
   SELECT (fga.check(store_id, jsonb_build_object(
     'authorization_model_id', model_id::text,
@@ -215,6 +223,7 @@ RETURNS SETOF uuid
 LANGUAGE sql
 STABLE PARALLEL SAFE
 SET search_path = fga, pg_temp
+SET fga._dispatching = 'on'
 AS $$
   SELECT split_part(o ->> 'object', ':', 2)::uuid
   FROM fga.streamed_list_objects(store_id,
@@ -273,6 +282,7 @@ RETURNS SETOF uuid
 LANGUAGE plpgsql
 STABLE PARALLEL SAFE
 SET search_path = fga, pg_temp
+SET fga._dispatching = 'on'
 AS $$
 DECLARE
   users jsonb;
