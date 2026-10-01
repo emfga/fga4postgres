@@ -45,6 +45,10 @@
 -- previous step's node, and a second source there would lose the
 -- index path every step relies on.
 
+-- Helpers earlier builds created and nothing calls any more; an
+-- upgrade by re-running the installer removes them.
+DROP FUNCTION IF EXISTS fga._compiled_no_inline();
+
 CREATE TABLE IF NOT EXISTS fga.compiled_store (
   store uuid NOT NULL,
   target_schema text NOT NULL,
@@ -1215,6 +1219,25 @@ AS $$
   ) AS v;
 $$;
 
+-- The most places a relation may flatten to. The places grow with
+-- the product of tuple-to-userset branches along a chain (four
+-- branches over nine levels is 87,381), and so do the model write
+-- and the planning of every statement calling the body: past the
+-- cap, the plan compiles the relation to the recursive walk, which
+-- reaches the same grants without listing every path, or delegates
+-- it when the walk cannot answer it. The upstream corpus needs at
+-- most 24. Planning cost tracks places times join depth: on a deep
+-- binary chain 15 places plan in ~8 ms and 63 in ~95 ms, so the cap
+-- sits at 64 rather than higher.
+CREATE OR REPLACE FUNCTION fga._compiled_place_cap()
+RETURNS integer
+LANGUAGE sql
+IMMUTABLE PARALLEL SAFE
+SET search_path = fga, pg_temp
+AS $$
+  SELECT 64;
+$$;
+
 -- The places a flattened relation reaches. A place is where a
 -- subject can be granted: a path of hops from the relation's object
 -- — tuple-to-userset edges (tupleset rows to a parent) and userset
@@ -1231,10 +1254,12 @@ $$;
 -- relation); a userset hop's row relations are the relations of the
 -- place before it that admit st#sr. A set operation reached on the
 -- way is not walked into: it is kept in opaque, and answered by its
--- own generated function. Only flattened and conditioned relations
--- come here, so the walk meets no cycle and ends: the plan keeps
--- them under 24 dispatches, and the bound on the path length only
--- guards the walk itself.
+-- own generated function. Only relations the plan would flatten
+-- come here (the plan, to count their places, then the emitter), so
+-- the walk meets no cycle and ends: the plan keeps them under 24
+-- dispatches, and the bound on the path length only guards the walk
+-- itself. Past the place cap the result is cut short; the plan
+-- never flattens such a relation, and the emitter refuses one.
 CREATE OR REPLACE FUNCTION fga._compiled_places(
   store_id uuid, model_id uuid, type_name text, relation_name text
 )
@@ -1301,13 +1326,25 @@ AS $$
     ) AS n(path, t, r)
     WHERE NOT rel.needs_check
       AND jsonb_array_length(w.path) < 32
+  ),
+  -- The walk stops once it has met more places than the cap: a
+  -- place holds at most one row per relation of its type, so more
+  -- rows than cap times the most relations of a type means more
+  -- places than the cap, and fewer means the walk finished. The
+  -- recursive CTE is read lazily, so the limit ends the walk itself.
+  bounded AS (
+    SELECT * FROM w
+    LIMIT fga._compiled_place_cap() * (
+      SELECT max(c.n) FROM (
+        SELECT count(*) AS n FROM rel GROUP BY rel.type_name) AS c)
+      + 1
   )
   SELECT w.path, w.t,
     coalesce(array_agg(DISTINCT w.r ORDER BY w.r)
                FILTER (WHERE NOT rel.needs_check), '{}'),
     coalesce(array_agg(DISTINCT w.r ORDER BY w.r)
                FILTER (WHERE rel.needs_check), '{}')
-  FROM w
+  FROM bounded AS w
   JOIN rel ON rel.type_name = w.t AND rel.relation_name = w.r
   GROUP BY w.path, w.t;
 $$;
@@ -1809,6 +1846,7 @@ DECLARE
   arms text[] := '{}';
   bools text[] := '{}';
   errs text[] := '{}';
+  n integer := 0;
 BEGIN
   objs := '{}';
   subs := '{}';
@@ -1818,6 +1856,14 @@ BEGIN
       _compiled_flat_arms.relation_name) AS p
     ORDER BY jsonb_array_length(p.path), p.path::text
   LOOP
+    -- The places were cut short at the cap: never emit a part.
+    n := n + 1;
+    IF n > fga._compiled_place_cap() THEN
+      RAISE EXCEPTION 'compiled relations: %#% flattens to more '
+        'than % places', type_name, relation_name,
+        fga._compiled_place_cap()
+        USING ERRCODE = 'internal_error';
+    END IF;
     prefixes := prefixes || jsonb_build_object(pl.path::text,
       to_jsonb(pl.rels));
     s := fga._compiled_place(store_id, model_id, target, pl.path,
@@ -2589,7 +2635,8 @@ $$;
 -- A relation on (or reaching) a cycle, or deep, compiles to the
 -- recursive walk instead — when every relation it reaches is plain,
 -- because the walk reads tuples itself and knows only plain
--- rewrites. Anything else delegates.
+-- rewrites — and so does one that would flatten to more places
+-- than the cap (_compiled_place_cap). Anything else delegates.
 CREATE OR REPLACE FUNCTION fga._compiled_plan(
   store_id uuid, model_id uuid
 )
@@ -2747,20 +2794,39 @@ AS $$
              'limit' END
       ELSE f.reaches_kind
     END AS reason,
-    f.kind, NOT f.cycles AND d.hops < 24 AS flat
+    f.kind, f.reaches_kind, NOT f.cycles AND d.hops < 24 AS flat
     FROM facts f
     LEFT JOIN depth d
       ON d.root_type = f.type_name AND d.root_relation = f.relation_name
+  ),
+  -- Whether a relation that would flatten needs more places than
+  -- the cap; walkable says whether the recursive walk can answer it
+  -- instead (plain, reaching only plain relations).
+  sized AS (
+    SELECT v.*,
+      v.reason IS NULL AND v.flat
+        AND v.kind IS DISTINCT FROM 'intersection or exclusion'
+        AND (SELECT count(*) FROM fga._compiled_places(store_id,
+               _compiled_plan.model_id, v.type_name, v.relation_name))
+            > fga._compiled_place_cap() AS over,
+      v.kind IS NULL AND v.reaches_kind IS NULL AS walkable
+    FROM verdict v
   )
   SELECT v.type_name, v.relation_name,
     CASE WHEN v.reason IS NOT NULL THEN 'delegated'
+         WHEN v.over AND v.walkable THEN 'recursive'
+         WHEN v.over THEN 'delegated'
          WHEN NOT v.flat THEN 'recursive'
          WHEN v.kind = 'intersection or exclusion' THEN 'setop'
          WHEN v.kind = 'conditioned grant' THEN 'conditioned'
          ELSE 'flattened' END,
-    v.reason,
-    CASE WHEN v.reason IS NULL AND v.flat THEN 1 + v.len ELSE 0 END
-  FROM verdict v;
+    CASE WHEN v.over AND NOT v.walkable
+      THEN format('flattening would need more than %s places',
+                  fga._compiled_place_cap())
+      ELSE v.reason END,
+    CASE WHEN v.reason IS NULL AND v.flat AND NOT v.over
+      THEN 1 + v.len ELSE 0 END
+  FROM sized v;
 $$;
 
 -- The note a relation's registry reason carries when its

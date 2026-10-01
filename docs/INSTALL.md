@@ -362,6 +362,20 @@ records the measured envelope. A relation with CEL conditions
 evaluates its condition for every conditioned tuple on the path
 (about 0.25 ms each); compilation cannot remove that floor.
 
+The model write flattens a relation into the places a subject can
+be granted at — the object itself, its parents, their parents —
+and the count multiplies with every tuple-to-userset branch along
+a chain (four parent relations over nine levels is 87,381 places).
+Flattening stops at 64 places per relation: past that, a relation
+compiles to the recursive walk, which reaches the same grants
+without listing every path, or is delegated when it reaches a set
+operation or a condition, with `fga.compiled_relation.reason`
+saying so. Planning cost grows with places times chain depth: on a
+synthetic deep binary chain, 15 places plan in about 8 ms and 63 in
+about 95 ms, which is the worst case under the cap; shallow models
+are far cheaper (the tenant model plans in about 2 ms). The
+upstream corpus needs at most 24.
+
 ## Verifying
 
 ```sql
