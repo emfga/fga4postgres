@@ -154,7 +154,24 @@ DECLARE
   grp_key text;
   grp_err text;
   grp_valid boolean := false;
+  may_wildcard boolean;
+  may_userset boolean;
 BEGIN
+  -- Which reads can return rows at all. Every row a read returns
+  -- matches a type restriction of this relation: stored rows are
+  -- filtered by them and contextual rows were refused without one.
+  -- So with no wildcard restriction for the subject's type there
+  -- is no wildcard row, and with no userset restriction no userset
+  -- row — a deny walking a deep hierarchy skips both reads per node.
+  SELECT coalesce(bool_or(tr.is_wildcard AND tr.subject_type = st),
+                  false),
+         coalesce(bool_or(tr.subject_relation <> ''), false)
+  INTO may_wildcard, may_userset
+  FROM fga.model_type_restriction tr
+  WHERE tr.store = store_id
+    AND tr.model_id = _check_direct.model_id
+    AND tr.type_name = ot AND tr.relation_name = rel;
+
   -- Exact probe (a userset subject is compared, never expanded),
   -- then the wildcard probe for plain object subjects. Rows carry
   -- their conditions; admissibility was already applied by the
@@ -166,7 +183,7 @@ BEGIN
     SELECT * FROM fga._read_exact(
       store_id, model_id, ot, oid, rel, st,
       '00000000-0000-0000-0000-000000000000', '', ctx)
-    WHERE srel = '' AND NOT s_wild
+    WHERE srel = '' AND NOT s_wild AND may_wildcard
   LOOP
     IF coalesce(row.condition_name, '') = '' THEN
       RETURN (true, false);
@@ -191,6 +208,7 @@ BEGIN
   FOR u IN
     SELECT * FROM fga._read_usersets(
       store_id, model_id, ot, oid, rel, ctx)
+    WHERE may_userset
     ORDER BY subject_type, subject_relation
   LOOP
     IF grp_key IS DISTINCT FROM
