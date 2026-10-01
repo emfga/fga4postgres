@@ -94,6 +94,8 @@ func TestModelJSONSpellings(t *testing.T) {
 		    "tupleset": {"relation": "parent"},
 		    "computed_userset": {"relation": "member"},
 		    "computedUserset": {"relation": "member"}}}}`)},
+		{"empty conditions", `{"schema_version": "1.1",
+		  "type_definitions": [{"type": "user"}], "conditions": {}}`},
 		{"camelCase directlyRelatedUserTypes",
 			`{"schema_version": "1.1", "type_definitions": [
 			  {"type": "user"},
@@ -109,6 +111,138 @@ func TestModelJSONSpellings(t *testing.T) {
 			}
 		})
 	}
+}
+
+// paramModel is a model whose one condition, guarding doc viewers,
+// declares the given parameters.
+func paramModel(expression, parameters string) string {
+	return `{"schema_version": "1.1", "type_definitions": [
+	  {"type": "user"},
+	  {"type": "doc", "relations": {"viewer": {"this": {}}},
+	   "metadata": {"relations": {"viewer": {"directly_related_user_types":
+	     [{"type": "user", "condition": "cond"}]}}}}],
+	  "conditions": {"cond": {"name": "cond", "expression": ` +
+		expression + `, "parameters": ` + parameters + `}}}`
+}
+
+// A condition parameter's type decodes as upstream decodes it: the
+// type by name or by enum number, LIST and MAP with one generic type
+// and the rest with none. Its camelCase keys are unknown keys, so a
+// typeName reads as no type at all.
+func TestConditionParamTypes(t *testing.T) {
+	for _, c := range []struct{ name, parameters string }{
+		{"by name", `{"x": {"type_name": "TYPE_NAME_INT"}}`},
+		{"by enum number", `{"x": {"type_name": 3}}`},
+		{"any", `{"x": {"type_name": "TYPE_NAME_ANY"}}`},
+		{"list of int", `{"x": {"type_name": "TYPE_NAME_LIST",
+		  "generic_types": [{"type_name": "TYPE_NAME_INT"}]}}`},
+		{"map of list of string", `{"x": {"type_name": "TYPE_NAME_MAP",
+		  "generic_types": [{"type_name": "TYPE_NAME_LIST",
+		    "generic_types": [{"type_name": 3}]}]}}`},
+		{"no parameters", `null`},
+		{"empty parameters", `{}`},
+		{"camelCase typeName", `{"x": {"typeName": "TYPE_NAME_INT"}}`},
+		{"camelCase genericTypes", `{"x": {"type_name": "TYPE_NAME_LIST",
+		  "genericTypes": [{"type_name": "TYPE_NAME_INT"}]}}`},
+		{"camelCase typeName in a generic type",
+			`{"x": {"type_name": "TYPE_NAME_LIST",
+			  "generic_types": [{"typeName": "TYPE_NAME_INT"}]}}`},
+		{"no type", `{"x": {}}`},
+		{"null type", `{"x": {"type_name": null}}`},
+		{"unspecified", `{"x": {"type_name": "TYPE_NAME_UNSPECIFIED"}}`},
+		{"unknown name", `{"x": {"type_name": "TYPE_NAME_FOO"}}`},
+		{"unknown enum number", `{"x": {"type_name": 99}}`},
+		{"fractional enum number", `{"x": {"type_name": 3.5}}`},
+		{"number as a string", `{"x": {"type_name": "3"}}`},
+		{"int with a generic type", `{"x": {"type_name": "TYPE_NAME_INT",
+		  "generic_types": [{"type_name": "TYPE_NAME_INT"}]}}`},
+		{"list without a generic type",
+			`{"x": {"type_name": "TYPE_NAME_LIST"}}`},
+		{"map without a generic type",
+			`{"x": {"type_name": "TYPE_NAME_MAP"}}`},
+		{"list with two generic types", `{"x": {"type_name": "TYPE_NAME_LIST",
+		  "generic_types": [{"type_name": "TYPE_NAME_INT"},
+		                    {"type_name": "TYPE_NAME_INT"}]}}`},
+		{"list of list without a generic type",
+			`{"x": {"type_name": "TYPE_NAME_LIST",
+			  "generic_types": [{"type_name": "TYPE_NAME_LIST"}]}}`},
+		{"null generic types", `{"x": {"type_name": "TYPE_NAME_LIST",
+		  "generic_types": null}}`},
+		{"generic types not a list", `{"x": {"type_name": "TYPE_NAME_LIST",
+		  "generic_types": {"type_name": "TYPE_NAME_INT"}}}`},
+		{"parameter not an object", `{"x": "TYPE_NAME_INT"}`},
+		{"null parameter", `{"x": null}`},
+		{"parameters not an object", `[]`},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			model := paramModel(`"true"`, c.parameters)
+			want := oracleWriteModel(t, model)
+			got := engineWriteModel(t, model)
+			if got != want {
+				t.Errorf("engine answered %d, oracle %d", got, want)
+			}
+		})
+	}
+}
+
+// A type given by enum number is that type when a condition is
+// evaluated: 3 is a string, so an int in the context is refused.
+func TestConditionParamTypeByNumberAnswers(t *testing.T) {
+	model := paramModel(`"x == 'a'"`, `{"x": {"type_name": 3}}`)
+	user := "user:01900000-0000-7000-8000-000000000001"
+	doc := "doc:01900000-0000-7000-8000-000000000020"
+	writes := mustJSON(t, map[string]any{"writes": map[string]any{
+		"tuple_keys": []map[string]any{{
+			"user": user, "relation": "viewer", "object": doc,
+			"condition": map[string]string{"name": "cond"}}}}})
+
+	oracleStore := oracleCreateStore(t)
+	oraclePost(t, "/stores/"+oracleStore+"/authorization-models", model)
+	oraclePost(t, "/stores/"+oracleStore+"/write", writes)
+	engineStore := engineCreateStore(t)
+	engineCall(t, "fga.write_authorization_model", engineStore, model)
+	engineCall(t, "fga.write", engineStore, writes)
+
+	for _, x := range []any{"a", "b", 5} {
+		check := mustJSON(t, map[string]any{
+			"tuple_key": map[string]string{
+				"user": user, "relation": "viewer", "object": doc},
+			"context": map[string]any{"x": x}})
+		want := oracleCheck(t, oracleStore, check)
+		got := engineCheck(t, engineStore, check)
+		if got != want {
+			t.Errorf("x = %v: engine %s, oracle %s", x, got, want)
+		}
+	}
+}
+
+// oracleCheck answers "true", "false" or the upstream error code.
+func oracleCheck(t *testing.T, store, check string) string {
+	t.Helper()
+	status, body := oracleDo(t, http.MethodPost,
+		"/stores/"+store+"/check", check)
+	if status != http.StatusOK {
+		var e struct{ Code string }
+		decode(t, body, &e)
+		return fmt.Sprint(openfgav1.ErrorCode_value[e.Code])
+	}
+	var r struct{ Allowed bool }
+	decode(t, body, &r)
+	return fmt.Sprint(r.Allowed)
+}
+
+// engineCheck is oracleCheck for the engine.
+func engineCheck(t *testing.T, store, check string) string {
+	t.Helper()
+	var out []byte
+	err := testdb.Pool(t).QueryRow(context.Background(),
+		"SELECT fga.check($1, $2::jsonb)", store, check).Scan(&out)
+	if err != nil {
+		return fmt.Sprint(int(sqlclient.Code(err)))
+	}
+	var r struct{ Allowed bool }
+	decode(t, out, &r)
+	return fmt.Sprint(r.Allowed)
 }
 
 // A camelCase model answers exactly as upstream answers it, on every

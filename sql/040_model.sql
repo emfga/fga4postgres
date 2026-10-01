@@ -237,6 +237,84 @@ BEGIN
 END;
 $$;
 
+-- A condition parameter's type, decoded as upstream decodes it: the
+-- type by name or by its enum number, LIST and MAP with exactly one
+-- generic type and every other type with none. The result names its
+-- type, the only form evaluation reads (fga._param_value). Upstream
+-- discards unknown keys, so a camelCase typeName or genericTypes
+-- reads as absent and is refused for what is then missing. A shape
+-- protojson cannot decode is YF100; a type it decodes but cannot
+-- use is YF156, with upstream's message. A model with both kinds of
+-- fault may report the other one first.
+CREATE OR REPLACE FUNCTION fga._condition_param_type(
+  cond text,
+  param text,
+  decl jsonb
+)
+RETURNS jsonb
+LANGUAGE plpgsql
+IMMUTABLE PARALLEL SAFE
+SET search_path = fga, pg_temp
+AS $$
+DECLARE
+  -- Upstream's TypeName enum; a name's number is its position - 1.
+  names CONSTANT text[] := ARRAY[
+    'TYPE_NAME_UNSPECIFIED', 'TYPE_NAME_ANY', 'TYPE_NAME_BOOL',
+    'TYPE_NAME_STRING', 'TYPE_NAME_INT', 'TYPE_NAME_UINT',
+    'TYPE_NAME_DOUBLE', 'TYPE_NAME_DURATION', 'TYPE_NAME_TIMESTAMP',
+    'TYPE_NAME_MAP', 'TYPE_NAME_LIST', 'TYPE_NAME_IPADDRESS'];
+  tn jsonb;
+  name text := 'TYPE_NAME_UNSPECIFIED';
+  generics jsonb;
+  wanted int;
+BEGIN
+  IF jsonb_typeof(decl) IS DISTINCT FROM 'object' THEN
+    RAISE EXCEPTION 'invalid type of parameter ''%'' on condition ''%''',
+      param, cond USING ERRCODE = 'YF100';
+  END IF;
+  tn := decl -> 'type_name';
+  IF jsonb_typeof(tn) = 'number' THEN
+    IF tn::numeric <> trunc(tn::numeric)
+       OR tn::numeric NOT BETWEEN 0 AND cardinality(names) - 1
+    THEN
+      RAISE EXCEPTION 'invalid ConditionParamTypeRef.TypeName: value '
+        'must be one of the defined enum values'
+        USING ERRCODE = 'YF100';
+    END IF;
+    name := names[tn::int + 1];
+  ELSIF jsonb_typeof(tn) = 'string' AND tn #>> '{}' = ANY (names) THEN
+    name := tn #>> '{}';
+  END IF;
+  IF name = 'TYPE_NAME_UNSPECIFIED' THEN
+    RAISE EXCEPTION 'failed to compile expression on condition ''%'' - '
+      'failed to decode parameter type for parameter ''%'': unknown '
+      'condition parameter type `TYPE_NAME_UNSPECIFIED`', cond, param
+      USING ERRCODE = 'YF156';
+  END IF;
+
+  generics := coalesce(nullif(decl -> 'generic_types', 'null'), '[]');
+  IF jsonb_typeof(generics) <> 'array' THEN
+    RAISE EXCEPTION 'invalid generic types of parameter ''%'' on '
+      'condition ''%''', param, cond USING ERRCODE = 'YF100';
+  END IF;
+  wanted := CASE WHEN name IN ('TYPE_NAME_LIST', 'TYPE_NAME_MAP')
+                 THEN 1 ELSE 0 END;
+  IF jsonb_array_length(generics) <> wanted THEN
+    RAISE EXCEPTION 'failed to compile expression on condition ''%'' - '
+      'failed to decode parameter type for parameter ''%'': condition '
+      'parameter type `%` requires % generic types; found %',
+      cond, param, name, wanted, jsonb_array_length(generics)
+      USING ERRCODE = 'YF156';
+  END IF;
+  IF wanted = 0 THEN
+    RETURN jsonb_build_object('type_name', name);
+  END IF;
+  RETURN jsonb_build_object('type_name', name, 'generic_types',
+    jsonb_build_array(
+      fga._condition_param_type(cond, param, generics -> 0)));
+END;
+$$;
+
 CREATE OR REPLACE FUNCTION fga.write_authorization_model(
   store_id uuid,
   request jsonb
@@ -268,6 +346,28 @@ BEGIN
       END ORDER BY td.ord), '[]')
     FROM jsonb_array_elements(request -> 'type_definitions')
       WITH ORDINALITY AS td(value, ord)));
+
+  IF jsonb_typeof(request -> 'conditions') = 'object' THEN
+    IF EXISTS (
+      SELECT FROM jsonb_each(request -> 'conditions') AS cond
+      WHERE jsonb_typeof(cond.value -> 'parameters')
+            NOT IN ('object', 'null')
+    ) THEN
+      RAISE EXCEPTION 'condition parameters must be an object'
+        USING ERRCODE = 'YF100';
+    END IF;
+    request := jsonb_set(request, '{conditions}', (
+      SELECT coalesce(jsonb_object_agg(cond.key,
+        CASE WHEN jsonb_typeof(cond.value -> 'parameters') = 'object'
+          THEN jsonb_set(cond.value, '{parameters}', (
+            SELECT coalesce(jsonb_object_agg(p.key,
+              fga._condition_param_type(cond.key, p.key, p.value)),
+              '{}')
+            FROM jsonb_each(cond.value -> 'parameters') AS p))
+          ELSE cond.value
+        END), '{}')
+      FROM jsonb_each(request -> 'conditions') AS cond));
+  END IF;
 
   INSERT INTO fga.model (store, schema_version, model)
   VALUES (
