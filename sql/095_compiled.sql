@@ -1146,11 +1146,31 @@ AS $$
       ' OPERATOR(pg_catalog.=) ', type_name, relation_name);
 $$;
 
+-- The statement a body that cannot be inlined starts with, so the
+-- planner gives up inlining it before analysing it (see
+-- _compiled_assemble).
+CREATE OR REPLACE FUNCTION fga._compiled_no_inline()
+RETURNS text
+LANGUAGE sql
+IMMUTABLE PARALLEL SAFE
+SET search_path = fga, pg_temp
+AS $$
+  SELECT E'SELECT;\n';
+$$;
+
 -- The three bodies around a relation's arms: validation first (it
 -- raises, never filters) in each counterpart's order — contextual
 -- tuples before the subject for the list APIs, after it for check
 -- — then the union of the arms. A check with held condition errors
 -- raises the first of them when no arm grants.
+--
+-- A check body starts with an empty statement (_compiled_no_inline).
+-- PostgreSQL never inlines a check that reads tuples (its EXISTS
+-- stops it), but finds that out only after parsing and analysing
+-- the body, on every planning of the statement calling it; with two
+-- statements it stops after the raw parse. A plpgsql EXECUTE plans
+-- its statement on every call (dispatch calls __check that way), and
+-- on the tenant bench a check so called went from 0.37 ms to 0.21.
 CREATE OR REPLACE FUNCTION fga._compiled_assemble(
   store_id uuid, model_id uuid,
   objs text[], subs text[], checks text[], check_errs text[],
@@ -1174,9 +1194,10 @@ AS $$
     || (SELECT string_agg(format(
          E'\nUNION\nSELECT a.x FROM (%s) AS a(x)', a), '' ORDER BY i)
         FROM unnest(subs) WITH ORDINALITY AS u(a, i)),
-    format('SELECT fga._compiled_sid(p_subject_id, p_any_subject, '
+    format('%sSELECT fga._compiled_sid(p_subject_id, p_any_subject, '
       'p_subject_relation) IS NOT NULL AND fga._compiled_oid(p_object) '
-      'IS NOT NULL AND %s AND %s', ctx_check, CASE
+      'IS NOT NULL AND %s AND %s', fga._compiled_no_inline(), ctx_check,
+      CASE
       WHEN cardinality(check_errs) = 0
       THEN format('(%s)', array_to_string(checks, E'\n  OR '))
       ELSE format(E'CASE WHEN %s THEN true\n  ELSE '
@@ -2355,7 +2376,7 @@ BEGIN
 
   risky := '(SELECT pg_catalog.count(*) FROM (SELECT DISTINCT w.t, '
     'w.o, w.r FROM w) AS n) OPERATOR(pg_catalog.>=) 26';
-  check_body := format(
+  check_body := fga._compiled_no_inline() || format(
     E'%s\nSELECT fga._compiled_sid(p_subject_id, p_any_subject, '
     || 'p_subject_relation) IS NOT NULL AND fga._compiled_oid(p_object) '
     'IS NOT NULL AND CASE WHEN NOT %s THEN (%s) '
