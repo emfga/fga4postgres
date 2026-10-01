@@ -23,6 +23,17 @@ func Addr() string {
 	return "localhost:" + testdb.Env("OPENFGA_GRPC_PORT", "8081")
 }
 
+// URL resolves the oracle's HTTP API. OPENFGA_URL wins (the
+// containerised suite sets it to http://openfga:8080); otherwise
+// localhost with the compose-published OPENFGA_HTTP_PORT. A request's
+// JSON spelling exists only here: the gRPC client sends protos.
+func URL() string {
+	if u := testdb.Env("OPENFGA_URL", ""); u != "" {
+		return u
+	}
+	return "http://localhost:" + testdb.Env("OPENFGA_HTTP_PORT", "8080")
+}
+
 var (
 	once   sync.Once
 	client openfgav1.OpenFGAServiceClient

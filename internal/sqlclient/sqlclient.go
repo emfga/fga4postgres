@@ -77,6 +77,13 @@ func translate(err error) error {
 	return err
 }
 
+// Code is the upstream status code of an engine error: what
+// translate maps it to, codes.OK for nil. It lets a test that calls
+// the engine through raw SQL compare refusals with the oracle's.
+func Code(err error) codes.Code {
+	return status.Code(translate(err))
+}
+
 // dummyULID satisfies upstream's 26-char ULID patterns during
 // proto-shape validation. Engine store and model ids are uuids
 // (the pinned id-domain divergence), so those two fields are

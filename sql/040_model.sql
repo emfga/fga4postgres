@@ -1,8 +1,8 @@
 -- Authorization model storage.
 --
--- write_authorization_model stores the verbatim upstream JSON
--- (snake_case protojson, the shape upstream's own HTTP API serves)
--- keyed by an immutable uuidv7 model id, and derives the
+-- write_authorization_model stores the upstream JSON, its rewrite
+-- fields in snake_case whichever of upstream's two spellings they
+-- arrived in, keyed by an immutable uuidv7 model id, and derives the
 -- normalized rows the resolver reads. Models are immutable and
 -- versioned: old models stay queryable, checks may pin a model id,
 -- defaulting to the store's latest.
@@ -167,6 +167,76 @@ AS $$
   SELECT node FROM nodes;
 $$;
 
+-- Upstream decodes a model with protojson, which takes a field under
+-- its proto name and under its JSON name. Three model fields are
+-- named differently the two ways: the rewrite's computedUserset and
+-- tupleToUserset, and the computedUserset inside a tupleToUserset.
+-- Every other field has one name, and a key upstream does not know
+-- is discarded, so no other camelCase key is renamed here. A node
+-- holding both spellings of one field is refused, as protojson
+-- refuses a duplicate field.
+CREATE OR REPLACE FUNCTION fga._snake_field(
+  node jsonb,
+  snake text,
+  camel text
+)
+RETURNS jsonb
+LANGUAGE plpgsql
+IMMUTABLE PARALLEL SAFE
+SET search_path = fga, pg_temp
+AS $$
+BEGIN
+  IF jsonb_typeof(node) IS DISTINCT FROM 'object'
+     OR NOT node ? camel
+  THEN
+    RETURN node;
+  END IF;
+  IF node ? snake THEN
+    RAISE EXCEPTION 'duplicate field "%"', camel
+      USING ERRCODE = 'YF100';
+  END IF;
+  RETURN (node - camel) || jsonb_build_object(snake, node -> camel);
+END;
+$$;
+
+-- A rewrite tree with every node's fields in snake_case, the only
+-- spelling the resolver reads.
+CREATE OR REPLACE FUNCTION fga._snake_rewrite(node jsonb)
+RETURNS jsonb
+LANGUAGE plpgsql
+IMMUTABLE PARALLEL SAFE
+SET search_path = fga, pg_temp
+AS $$
+DECLARE
+  op text;
+BEGIN
+  node := fga._snake_field(node, 'computed_userset', 'computedUserset');
+  node := fga._snake_field(node, 'tuple_to_userset', 'tupleToUserset');
+  IF jsonb_typeof(node -> 'tuple_to_userset') = 'object' THEN
+    node := jsonb_set(node, '{tuple_to_userset}', fga._snake_field(
+      node -> 'tuple_to_userset', 'computed_userset', 'computedUserset'));
+  END IF;
+  FOREACH op IN ARRAY ARRAY['union', 'intersection'] LOOP
+    IF jsonb_typeof(node -> op -> 'child') = 'array' THEN
+      node := jsonb_set(node, ARRAY[op, 'child'], (
+        SELECT coalesce(jsonb_agg(fga._snake_rewrite(c.value)
+                                  ORDER BY c.ord), '[]')
+        FROM jsonb_array_elements(node -> op -> 'child')
+          WITH ORDINALITY AS c(value, ord)));
+    END IF;
+  END LOOP;
+  FOREACH op IN ARRAY ARRAY['base', 'subtract'] LOOP
+    IF jsonb_typeof(node -> 'difference') = 'object'
+       AND node -> 'difference' ? op
+    THEN
+      node := jsonb_set(node, ARRAY['difference', op],
+        fga._snake_rewrite(node -> 'difference' -> op));
+    END IF;
+  END LOOP;
+  RETURN node;
+END;
+$$;
+
 CREATE OR REPLACE FUNCTION fga.write_authorization_model(
   store_id uuid,
   request jsonb
@@ -185,6 +255,19 @@ BEGIN
     RAISE EXCEPTION 'type_definitions must be an array'
       USING ERRCODE = 'YF100';
   END IF;
+
+  request := jsonb_set(request, '{type_definitions}', (
+    SELECT coalesce(jsonb_agg(
+      CASE WHEN jsonb_typeof(td.value -> 'relations') = 'object'
+        THEN jsonb_set(td.value, '{relations}', (
+          SELECT coalesce(jsonb_object_agg(rel.key,
+                                           fga._snake_rewrite(rel.value)),
+                          '{}')
+          FROM jsonb_each(td.value -> 'relations') AS rel))
+        ELSE td.value
+      END ORDER BY td.ord), '[]')
+    FROM jsonb_array_elements(request -> 'type_definitions')
+      WITH ORDINALITY AS td(value, ord)));
 
   INSERT INTO fga.model (store, schema_version, model)
   VALUES (
