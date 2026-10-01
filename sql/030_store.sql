@@ -44,6 +44,9 @@ VOLATILE
 SET search_path = fga, pg_temp
 AS $$
 BEGIN
+  -- Compiled relations first: dropping their functions needs the
+  -- registry rows that name them.
+  PERFORM fga.disable_compiled_relations(store_id);
   DELETE FROM fga.tuple WHERE store = store_id;
   DELETE FROM fga.model_reachable WHERE store = store_id;
   DELETE FROM fga.model_computed WHERE store = store_id;

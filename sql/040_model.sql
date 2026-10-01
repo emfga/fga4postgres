@@ -320,6 +320,11 @@ BEGIN
     type_name, relation_name, to_type, to_relation
   FROM closure;
 
+  -- An opted-in store's compiled relations follow the new model in
+  -- this same transaction (sql/095_compiled.sql); a no-op for every
+  -- other store.
+  PERFORM fga._compiled_generate(store_id);
+
   RETURN jsonb_build_object('authorization_model_id',
                             new_id::text);
 END;
