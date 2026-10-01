@@ -255,6 +255,49 @@ fixture that took a dispatched `fga.check` on an opted-in store
 from 0.85–0.90 ms (the body then started with an empty statement
 to stop the inlining attempt after the raw parse) to 0.47–0.53 ms.
 
+### Dispatch reuses the generated plan
+
+`fga.list_objects` and `fga.streamed_list_objects` reach the
+generated `__objects` through a dynamic statement, which
+PostgreSQL plans on every execution. The generated function has
+no `SET` clause so that callers can inline it, and dispatch
+inlined it too, so its whole body was planned again on every
+call. Dispatch now asks for the rows `WITH ORDINALITY`, which
+the planner never inlines: the function runs as a function and
+its own plan is cached for the session.
+`TestCompiledDispatchCallsTheFunction` asserts it by call count.
+
+Measured on the tenant 100k fixture with `can_view` compiled,
+same laptop, PostgreSQL 18.6, load average 1.8: in one session,
+three warm-up calls and then the median of 15, the two installs
+alternated twice (both rounds agreed within 0.2 ms); ms:
+
+| dispatched call | objects | before | after |
+|---|--:|--:|--:|
+| `fga.list_objects` few | 5 | 2.1 | 0.32 |
+| `fga.list_objects` many | 250 | 2.4 | 0.52 |
+| `fga.list_objects` all | 1,000 | 4.2 | 2.7 |
+| `fga.streamed_list_objects` few | 5 | 2.1 | 0.32 |
+| `fga.streamed_list_objects` many | 250 | 2.4 | 0.56 |
+| `fga.streamed_list_objects` all | 5,000 | 7.2 | 5.2 |
+
+The saving is the planning, so it is a fixed ~1.6–1.9 ms here and
+grows with the body: on a consumer's model with a four-level
+hierarchy and 5,000 leaves, where the flattened body is ~13 KB,
+planning took 10.8 ms against 0.85 ms of execution, and the same
+list call went from 1.65 to 0.18 ms.
+
+The same change found `fga.streamed_list_objects` running the
+search twice per call: it passed the search straight to
+`unnest()`, whose row estimate evaluates a stable argument while
+planning. Counted with `track_functions`, the first five calls in
+a session searched twice; from the sixth, PostgreSQL's plan cache
+switched to a generic plan, which does not evaluate it. The search
+is now held in a variable (`TestStreamedListObjectsSearchesOnce`).
+Two of each case's fifteen timed calls fell in that window, which
+a median does not see; a short-lived connection paid it on every
+call.
+
 ## Fixture loading
 
 Fixtures bypass `fga.write` and COPY straight into `fga.tuple`,
