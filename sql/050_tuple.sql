@@ -32,10 +32,22 @@ CREATE UNIQUE INDEX IF NOT EXISTS tuple_ulid_idx
   ON fga.tuple (store, ulid);
 
 -- Reverse expansion (list_objects): find objects by subject,
--- mirroring upstream's migration 006 index shape.
-CREATE INDEX IF NOT EXISTS tuple_reverse_idx
+-- mirroring upstream's migration 006 index shape. condition_name
+-- rides along so a parent edge, which must be an unconditioned row,
+-- is answered from the index alone: a broad page walks one edge per
+-- object it lists.
+--
+-- Releases before 0.1.0 created this index as tuple_reverse_idx,
+-- without the INCLUDE; re-running the installer builds the new one
+-- and drops the old, so any earlier state converges. Not
+-- CONCURRENTLY: the bundle must run inside a transaction (a
+-- migration tool, psql -1, the -tx artifact, pg_tle), so the build
+-- blocks writes to fga.tuple while it runs (docs/INSTALL.md).
+CREATE INDEX IF NOT EXISTS tuple_reverse_cond_idx
   ON fga.tuple (store, subject_type, subject_id, subject_relation,
-                relation, object_type, object_id);
+                relation, object_type, object_id)
+  INCLUDE (condition_name);
+DROP INDEX IF EXISTS fga.tuple_reverse_idx;
 
 -- The composite shape shared by stored rows and the contextual-
 -- tuple overlay, so one read path serves both.

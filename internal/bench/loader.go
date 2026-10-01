@@ -296,7 +296,7 @@ func Load(
 		progress("dropping secondary indexes for the %s load",
 			size.Name)
 		for _, idx := range []string{
-			"tuple_ulid_idx", "tuple_reverse_idx",
+			"tuple_ulid_idx", "tuple_reverse_cond_idx",
 		} {
 			if _, err := pool.Exec(ctx,
 				"DROP INDEX IF EXISTS fga."+idx,
