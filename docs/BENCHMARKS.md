@@ -109,47 +109,88 @@ platform admin's page on this model, with a function that
 flattened `can_view` into one `UNION` over its four grant
 places (the leaf, its project, its account, the platform).
 
-**Measured** (one laptop: i7-1355U, 12 threads, `powersave`
-governor, the tmpfs compose stack, PostgreSQL 18.6, sharing the
-machine with other workloads — load average 0.5–5.7 during the
-runs; PR knobs `-warmup 3s -duration 5s -min-ops 25`). p50s;
-at 100k the median of three runs with the range, at 1m one run:
+**Measured** before and after `environment#can_view` became one
+body over its four places (one laptop: i7-1355U, 12 threads,
+`powersave` governor, 16 GB, the tmpfs compose stack,
+PostgreSQL 18.6, shared with other workloads — load average
+1.0–3.8 during the runs; PR knobs `-warmup 3s -duration 5s
+-min-ops 25`). "Before" composed each relation from the reached
+relations' generated functions; "after" inlines the reachable
+ladder into each body. The two alternated, three runs each; p50
+medians in ms (p50s fall on the histogram's buckets, so close
+values repeat):
 
-| case | 100k (5,000 leaves) | 1m (100,000 leaves) |
-|---|--:|--:|
-| check hit-shallow | 0.36 ms (0.31–0.40) | 0.39 ms |
-| check hit-deep | 1.7 ms (1.5–4.8) | 1.8 ms |
-| check miss | 12.2 ms (11.8–14.3) | 61 ms (min 17) |
-| compiled_check hit-shallow | 0.08 ms (0.08–0.25) | 0.07 ms |
-| compiled_check hit-deep | 0.25 ms (0.22–0.27) | 0.22 ms |
-| compiled_check miss | 1.5 ms (1.5–1.9) | 1.6 ms |
-| check_opted_in miss | 12.7 ms (12.2–13.2) | 12.2 ms |
-| list_objects few | 8.3 ms (3.1–9.7) | 19.6 ms |
-| list_objects many | 33 ms (30–64) | 41 ms |
-| compiled_objects few | 28 ms (27–29) | 31 ms |
-| compiled_objects many | 28 ms (25–80) | 94 ms |
-| compiled_objects all | 50 ms (38–119) | 783 ms |
-| compiled_page few | 23 ms (23–31) | 24 ms |
-| compiled_page many | 34 ms (24–59) | 26 ms |
-| compiled_page all | 41 ms (41–139) | 880 ms |
+| case | 100k before | 100k after | 1m before | 1m after |
+|---|--:|--:|--:|--:|
+| check hit-shallow | 0.39 | 0.39 | 0.37 | 0.37 |
+| check hit-deep | 1.72 | 1.94 | 1.79 | 2.02 |
+| check miss | 12.3 | 14.3 | 12.3 | 14.3 |
+| list_objects few | 2.9 | 1.9 | 3.5 | 2.3 |
+| list_objects many | 57 | 59 | 77 | 74 |
+| compiled_check hit-shallow | 0.07 | 0.14 | 0.09 | 0.14 |
+| compiled_check hit-deep | 0.21 | 0.25 | 0.21 | 0.22 |
+| compiled_check miss | 1.47 | **0.25** | 1.47 | **0.22** |
+| check_opted_in hit-shallow | 0.42 | 0.55 | 0.42 | 0.55 |
+| check_opted_in hit-deep | 0.60 | 0.67 | 0.62 | 0.65 |
+| check_opted_in miss | 1.86 | **0.67** | 1.94 | **0.67** |
+| compiled_objects few | 29 | **2.3** | 29 | **2.1** |
+| compiled_objects many | 30 | **2.6** | 30 | **2.6** |
+| compiled_objects all | 46 | **5.4** | 669 | **139** |
+| compiled_page few | 29 | **2.6** | 33 | **2.2** |
+| compiled_page many | 30 | **2.9** | 34 | **3.1** |
+| compiled_page all | 46 | **6.5** | 696 | **241** |
 
-The page decomposes cleanly under `EXPLAIN (ANALYZE)` on the
-same fixtures: **planning is ~16–23 ms for every subject**, and
-execution is 3.6–4.5 ms (`few`, `many`) and 21–24 ms (`all`) at
-5,000 leaves, 4.5–7.6 ms and 780–840 ms at 100,000 (where JIT
-off changed nothing). So the engine's generated
-`environment#can_view` is well outside the prototype's envelope
-today: at 5,000 leaves planning alone costs more than the
-prototype's whole page, and at 100,000 leaves a platform admin's
-set passes five nested Sort + Unique steps of 100,000–200,000
-rows each (nested `UNION`s, spilling to disk at the default
-`work_mem`) where the prototype had one `UNION`. A
-prepared statement that settles on a generic plan skips the
-planning (measured in `psql`: 3.5 / 4.1 / 19–21 ms for
-`few` / `many` / `all` at 5,000 leaves), which is a consumer's
-choice the bench deliberately does not make for it. These
-figures say what the compiled functions cost on this model now;
-they do not say the set shape cannot reach the spike's numbers.
+The `check` and `list_objects` rows run the generic engine on a
+store that is not opted in, the same code before and after: their
+differences are run-to-run noise (the generic miss, timed apart in
+`psql` with each install, was 11.7 and 11.8 ms).
+
+`fga.list_objects` on the opted-in store dispatches to the
+generated `__objects` (capped at 1,000). Timed in `psql`, median of
+15 calls planned each time, the two installs alternated twice:
+
+| dispatched call | 100k before | 100k after | 1m before | 1m after |
+|---|--:|--:|--:|--:|
+| `fga.list_objects` few | 25 | 2.0 | 27 | 2.1 |
+| `fga.list_objects` many | 26 | 2.2 | 28 | 2.3 |
+| `fga.list_objects` all | 41 | 5.1 | 619–654 | 120–130 |
+| `fga.check` hit-shallow | 0.27–0.30 | 0.39–0.42 | 0.32–0.34 | 0.44–0.45 |
+| `fga.check` hit-deep | 0.46–0.49 | 0.50 | 0.54 | 0.53–0.54 |
+| `fga.check` miss | 1.6–1.7 | 0.50 | 1.9 | 0.54–0.55 |
+
+Where the time goes, under `EXPLAIN (ANALYZE, SUMMARY)` on a warm
+session: the page now plans in **~1.5–2 ms** for every subject
+(16–23 ms before), and executes in 0.24 / 0.5–0.7 / 7.3 ms for
+`few` / `many` / `all` at 5,000 leaves and 0.2 / 1.6 / ~245 ms at
+100,000. The plan is the prototype's: one Sort + Unique over an
+Append of the four places' index nested loops (it was 80 dedup
+nodes), sorting 100,000 rows in memory at the default `work_mem`.
+
+So the page is inside the prototype's envelope at 5,000 leaves
+(6.5 ms against ~6.6). At 100,000 leaves a platform admin's page
+is ~2× it (241 ms against ~108–129), and the difference is
+exactness, measured: a parent edge must be an unconditioned row
+(the generic resolver ignores a stranded row whose condition the
+model no longer admits), and `condition_name` is not in
+`tuple_reverse_idx`, so the 100,000 leaf edges are heap fetches
+where the prototype, which skipped that test, read the index
+alone. In `psql` on the same data the page took ~227 ms with the
+test and ~123 ms without it; with a temporary copy of
+`tuple_reverse_idx` that `INCLUDE`s `condition_name`, the exact
+page took ~125 ms.
+
+Checks trade the other way. One body means one plan, and its
+every arm starts on every call, where the composed form started
+only the callees a call reached: a direct hit costs ~0.05 ms more
+(`compiled_check hit-shallow`), and a miss, which used to call
+every callee, ~1.2 ms less. A check called from a statement
+planned once (a prepared statement, the bench's `compiled_check`)
+pays nothing else; one planned per call (a plpgsql `EXECUTE`, as
+dispatch from `fga.check` does) also pays for parsing the body,
+which the generator keeps small: the body starts with an empty
+statement so the planner stops trying to inline it after the raw
+parse, and the statements a call with contextual tuples runs live
+in `fga.compiled_contextual` rather than in the body.
 
 ## Fixture loading
 
