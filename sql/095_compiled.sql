@@ -755,6 +755,64 @@ AS $$
     fga._compiled_name(type_name, relation_name, kind));
 $$;
 
+-- The edges of a model's relation graph: a relation points at every
+-- relation its rewrite can reach in one step — a computed userset
+-- (same object, hop 0), a userset restriction or a tuple-to-userset
+-- parent that defines the computed relation (another object, hop 1:
+-- a dispatch, the only step that spends check's depth budget).
+CREATE OR REPLACE FUNCTION fga._compiled_edges(
+  store_id uuid, model_id uuid
+)
+RETURNS TABLE (type_name text, relation_name text, to_type text,
+               to_relation text, hop integer)
+LANGUAGE sql
+STABLE PARALLEL SAFE
+SET search_path = fga, pg_temp
+AS $$
+  WITH
+  rel AS (
+    SELECT r.type_name, r.relation_name, r.rewrite
+    FROM fga.model_relation r
+    WHERE r.store = store_id AND r.model_id = _compiled_edges.model_id
+  ),
+  node AS (
+    SELECT rel.type_name, rel.relation_name, n
+    FROM rel, fga._rewrite_nodes(rel.rewrite) AS n
+  ),
+  restriction AS (
+    SELECT tr.* FROM fga.model_type_restriction tr
+    WHERE tr.store = store_id
+      AND tr.model_id = _compiled_edges.model_id
+  )
+  SELECT nd.type_name, nd.relation_name, nd.type_name AS to_type,
+         nd.n -> 'computed_userset' ->> 'relation' AS to_relation,
+         0 AS hop
+  FROM node nd WHERE nd.n ? 'computed_userset'
+  UNION ALL
+  SELECT nd.type_name, nd.relation_name, tr.subject_type,
+         nd.n -> 'tuple_to_userset' -> 'computed_userset'
+           ->> 'relation', 1
+  FROM node nd
+  JOIN restriction tr
+    ON tr.type_name = nd.type_name
+   AND tr.relation_name
+         = nd.n -> 'tuple_to_userset' -> 'tupleset' ->> 'relation'
+  JOIN rel p
+    ON p.type_name = tr.subject_type
+   AND p.relation_name = nd.n -> 'tuple_to_userset'
+         -> 'computed_userset' ->> 'relation'
+  WHERE nd.n ? 'tuple_to_userset'
+    AND tr.subject_relation = '' AND NOT tr.is_wildcard
+  UNION ALL
+  SELECT nd.type_name, nd.relation_name, tr.subject_type,
+         tr.subject_relation, 1
+  FROM node nd
+  JOIN restriction tr
+    ON tr.type_name = nd.type_name
+   AND tr.relation_name = nd.relation_name
+  WHERE nd.n ? 'this' AND tr.subject_relation <> '';
+$$;
+
 -- The strategy of every relation of a model, the reason a
 -- relation is delegated, and the order to create functions in
 -- (callees before callers).
@@ -788,36 +846,8 @@ AS $$
     SELECT tr.* FROM fga.model_type_restriction tr
     WHERE tr.store = store_id AND tr.model_id = _compiled_plan.model_id
   ),
-  -- Edges of the relation graph; hop 1 marks a dispatch to another
-  -- object, the only step that spends check's depth budget.
   edge AS (
-    SELECT nd.type_name, nd.relation_name, nd.type_name AS to_type,
-           nd.n -> 'computed_userset' ->> 'relation' AS to_relation,
-           0 AS hop
-    FROM node nd WHERE nd.n ? 'computed_userset'
-    UNION ALL
-    SELECT nd.type_name, nd.relation_name, tr.subject_type,
-           nd.n -> 'tuple_to_userset' -> 'computed_userset'
-             ->> 'relation', 1
-    FROM node nd
-    JOIN restriction tr
-      ON tr.type_name = nd.type_name
-     AND tr.relation_name
-           = nd.n -> 'tuple_to_userset' -> 'tupleset' ->> 'relation'
-    JOIN rel p
-      ON p.type_name = tr.subject_type
-     AND p.relation_name = nd.n -> 'tuple_to_userset'
-           -> 'computed_userset' ->> 'relation'
-    WHERE nd.n ? 'tuple_to_userset'
-      AND tr.subject_relation = '' AND NOT tr.is_wildcard
-    UNION ALL
-    SELECT nd.type_name, nd.relation_name, tr.subject_type,
-           tr.subject_relation, 1
-    FROM node nd
-    JOIN restriction tr
-      ON tr.type_name = nd.type_name
-     AND tr.relation_name = nd.relation_name
-    WHERE nd.n ? 'this' AND tr.subject_relation <> ''
+    SELECT * FROM fga._compiled_edges(store_id, _compiled_plan.model_id)
   ),
   own AS (
     SELECT rel.type_name, rel.relation_name, CASE
