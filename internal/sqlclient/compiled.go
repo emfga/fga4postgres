@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
+	"slices"
 	"strings"
 	"sync"
 
@@ -22,7 +23,10 @@ import (
 // Compiled answers Check, ListObjects and ListUsers through a
 // store's generated relation functions (sql/095_compiled.sql)
 // instead of the generic resolver, so the corpora can prove the
-// generated functions agree with upstream. Everything else —
+// generated functions agree with upstream. Check and ListObjects
+// also ask the public API on the same opted-in store, which
+// dispatches to those functions, and refuse to answer when the
+// two disagree; ListUsers is never dispatched. Everything else —
 // stores, models, tuple writes — goes through the plain client;
 // CreateStore also creates a schema for the store and opts it in.
 //
@@ -266,10 +270,43 @@ func (c *Compiled) Check(
 		objID, subj.typ, subj.id, subj.rel, subj.id == nil,
 		reqCtx, ctxTuples,
 	).Scan(&allowed)
+	err = translate(err)
+	api, apiErr := c.Client.Check(ctx, in, opts...)
+	if d := disagree(err, apiErr); d != "" {
+		return nil, status.Error(codes.Internal, "compiled: fga.check "+
+			"on the opted-in store and the generated function "+
+			"disagree: "+d)
+	}
 	if err != nil {
-		return nil, translate(err)
+		return nil, err
+	}
+	if api.GetAllowed() != allowed {
+		return nil, status.Errorf(codes.Internal, "compiled: fga.check "+
+			"on the opted-in store answered %v, the generated "+
+			"function %v", api.GetAllowed(), allowed)
 	}
 	return &openfgav1.CheckResponse{Allowed: allowed}, nil
+}
+
+// disagree compares the outcome of a generated function with the
+// public API's on the same opted-in store, which dispatches to
+// that function (sql/060_check.sql, sql/070_list_objects.sql): both
+// succeed, or both refuse with the same code. It returns "" when
+// they agree.
+func disagree(generated, api error) string {
+	switch {
+	case generated == nil && api == nil:
+		return ""
+	case generated == nil:
+		return "only the public API refused: " + api.Error()
+	case api == nil:
+		return "only the generated function refused: " +
+			generated.Error()
+	case status.Code(generated) != status.Code(api):
+		return fmt.Sprintf("refusal codes %v and %v",
+			status.Code(api), status.Code(generated))
+	}
+	return ""
 }
 
 func (c *Compiled) ListObjects(
@@ -303,17 +340,24 @@ func (c *Compiled) ListObjects(
 	if err != nil {
 		return nil, err
 	}
+	var ids []string
 	rows, err := c.pool.Query(ctx, fmt.Sprintf(
 		"SELECT x::text FROM %s($1, $2::uuid, $3, $4, $5::jsonb, "+
 			"$6::jsonb) AS x LIMIT %d", fn, MaxListResults),
 		subj.typ, subj.id, subj.rel, subj.id == nil,
 		reqCtx, ctxTuples)
-	if err != nil {
-		return nil, translate(err)
+	if err == nil {
+		ids, err = pgx.CollectRows(rows, pgx.RowTo[string])
 	}
-	ids, err := pgx.CollectRows(rows, pgx.RowTo[string])
+	err = translate(err)
+	api, apiErr := c.Client.ListObjects(ctx, in, opts...)
+	if d := disagree(err, apiErr); d != "" {
+		return nil, status.Error(codes.Internal, "compiled: "+
+			"fga.list_objects on the opted-in store and the "+
+			"generated function disagree: "+d)
+	}
 	if err != nil {
-		return nil, translate(err)
+		return nil, err
 	}
 	resp := &openfgav1.ListObjectsResponse{}
 	for _, id := range ids {
@@ -321,6 +365,16 @@ func (c *Compiled) ListObjects(
 			id = c.ids.Back(id)
 		}
 		resp.Objects = append(resp.Objects, in.GetType()+":"+id)
+	}
+	// A capped answer is any MaxListResults of the objects, so
+	// only its size is comparable.
+	got := slices.Sorted(slices.Values(resp.GetObjects()))
+	want := slices.Sorted(slices.Values(api.GetObjects()))
+	if len(got) != len(want) ||
+		(len(got) < MaxListResults && !slices.Equal(got, want)) {
+		return nil, status.Errorf(codes.Internal, "compiled: "+
+			"fga.list_objects on the opted-in store answered %v, "+
+			"the generated function %v", want, got)
 	}
 	return resp, nil
 }
