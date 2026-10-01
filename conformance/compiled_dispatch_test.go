@@ -74,9 +74,8 @@ func newDispatchStore(t *testing.T, optIn bool) dispatchStore {
 }
 
 // optInCountable opts a store in to a fresh schema whose functions
-// callCounts can see (countable), and opts it out before the
-// schema is dropped: deleting a store whose functions are already
-// gone fails, which would leave the store behind.
+// callCounts can see (countable), and opts it out again when the
+// test ends so no opted-in store outlives it.
 func optInCountable(t *testing.T, storeID string) string {
 	t.Helper()
 	schema := compiledSchema(t)

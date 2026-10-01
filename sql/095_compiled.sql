@@ -2812,7 +2812,10 @@ $$;
 
 -- Drops every registered function of a store and its registry
 -- rows. Only registered functions: anything else in the schema
--- belongs to the application.
+-- belongs to the application. A registered function that is
+-- already gone (the application dropped its schema first) is
+-- skipped: the registry still holds its oid, which no longer names
+-- anything to drop.
 CREATE OR REPLACE FUNCTION fga._compiled_drop(store_id uuid)
 RETURNS void
 LANGUAGE plpgsql
@@ -2829,6 +2832,7 @@ BEGIN
          LATERAL (VALUES (r.objects_fn), (r.subjects_fn),
                          (r.check_fn)) AS v(f)
     WHERE r.store = store_id
+      AND EXISTS (SELECT FROM pg_proc p WHERE p.oid = v.f)
   LOOP
     EXECUTE format('DROP FUNCTION %s', fn);
   END LOOP;
@@ -2904,6 +2908,7 @@ BEGIN
          LATERAL (VALUES (r.objects_fn), (r.subjects_fn),
                          (r.check_fn)) AS v(f)
     WHERE r.store = store_id
+      AND EXISTS (SELECT FROM pg_proc p WHERE p.oid = v.f)
       AND NOT EXISTS (
         SELECT FROM jsonb_array_elements(fns) AS g
         WHERE to_regprocedure(g ->> 'sig') = v.f)
