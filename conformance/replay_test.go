@@ -57,14 +57,25 @@ func shuffledTuples(
 
 // replayMode is how a corpus case is replayed: normal, with the
 // stage tuples handed as contextual tuples (upstream's own second
-// run), or answered by the store's compiled relation functions.
+// run), or answered by the store's compiled relation functions —
+// with the stage tuples stored, or handed to the generated
+// functions as contextual tuples.
 type replayMode int
 
 const (
 	modeNormal replayMode = iota
 	modeCtxTuples
 	modeCompiled
+	modeCompiledCtxTuples
 )
+
+func (m replayMode) compiled() bool {
+	return m == modeCompiled || m == modeCompiledCtxTuples
+}
+
+func (m replayMode) ctxTuples() bool {
+	return m == modeCtxTuples || m == modeCompiledCtxTuples
+}
 
 // engineForCase builds the sqlclient with a per-file uuid map —
 // deterministic across runs, disjoint across files. In compiled
@@ -74,14 +85,14 @@ func engineForCase(
 	t *testing.T, file string, mode replayMode,
 ) probeClient {
 	ids := uuidmap.New("yaml/" + file)
-	if mode == modeCompiled {
+	if mode.compiled() {
 		return sqlclient.NewCompiled(testdb.Pool(t), ids)
 	}
 	return sqlclient.New(testdb.Pool(t), ids)
 }
 
 func engineName(mode replayMode) string {
-	if mode == modeCompiled {
+	if mode.compiled() {
 		return "compiled"
 	}
 	return "engine"
@@ -99,14 +110,23 @@ var delegatedVia = regexp.MustCompile(`^reaches \S+ \((.*)\)$`)
 // strategy: its answers still come from a generated function, but
 // one that calls the generic resolver, so the compiled strategies
 // are not what this case exercised for it.
-func reportDelegated(t *testing.T, engine *side) {
+//
+// In the contextual-tuple mode a recursive relation is reported too:
+// its functions hand a call carrying contextual tuples to the
+// generic resolver.
+func reportDelegated(t *testing.T, engine *side, mode replayMode) {
 	t.Helper()
 	rows, err := testdb.Pool(t).Query(context.Background(), `
-		SELECT type_name || '#' || relation_name, reason
+		SELECT type_name || '#' || relation_name,
+		       CASE strategy WHEN 'delegated' THEN reason
+		       ELSE 'recursive strategy, called with contextual '
+		         || 'tuples' END
 		FROM fga.compiled_relation
 		WHERE store = $1 AND model_id = $2
-		  AND strategy = 'delegated'
-		ORDER BY 1`, engine.storeID, engine.modelID)
+		  AND (strategy = 'delegated'
+		       OR (strategy = 'recursive' AND $3))
+		ORDER BY 1`, engine.storeID, engine.modelID,
+		mode == modeCompiledCtxTuples)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -129,7 +149,8 @@ func reportDelegated(t *testing.T, engine *side) {
 		// every delegated reason in the register.
 		reason, _, _ := strings.Cut(e.reason, "; __subjects:")
 		if m := delegatedVia.FindStringSubmatch(reason); m != nil {
-			reason = "depends on a delegated relation: " + m[1]
+			reason = "reaches a relation it cannot compose with: " +
+				m[1]
 		}
 		t.Run("delegated/"+e.rel, func(t *testing.T) {
 			skiplist.Skip(t, "compiled: relation delegated to the "+
@@ -140,9 +161,7 @@ func reportDelegated(t *testing.T, engine *side) {
 
 // reportGeneric records, after a compiled-mode assertion, what the
 // compiled path did not answer itself.
-func reportGeneric(
-	t *testing.T, engine *side, ctxTuples bool,
-) {
+func reportGeneric(t *testing.T, engine *side) {
 	t.Helper()
 	c, ok := engine.client.(*sqlclient.Compiled)
 	if !ok {
@@ -153,12 +172,6 @@ func reportGeneric(
 			skiplist.Skip(t, "compiled: request refused by the "+
 				"generic API's validation (no generated function "+
 				"takes request strings)")
-		})
-	}
-	if ctxTuples {
-		t.Run("contextual_tuples", func(t *testing.T) {
-			skiplist.Skip(t, "compiled: contextual tuples take "+
-				"the delegated path (P1.6)")
 		})
 	}
 }
@@ -175,7 +188,7 @@ func runCheckReplay(
 ) {
 	ctx := context.Background()
 	rng := caseRand(t.Name())
-	ctxVariant := mode == modeCtxTuples
+	ctxVariant := mode.ctxTuples()
 
 	if ctxVariant {
 		if len(tc.Stages) > 1 {
@@ -213,8 +226,8 @@ func runCheckReplay(
 		st := stage
 		t.Run(fmt.Sprintf("stage_%d", stageNum), func(t *testing.T) {
 			writeStageBoth(t, rng, sides, st, ctxVariant)
-			if mode == modeCompiled {
-				reportDelegated(t, sides[0])
+			if mode.compiled() {
+				reportDelegated(t, sides[0], mode)
 			}
 			for i, a := range st.CheckAssertions {
 				name := a.Name
@@ -225,8 +238,7 @@ func runCheckReplay(
 				t.Run(name, func(t *testing.T) {
 					runCheckAssertion(
 						t, rng, sides, st, assertion, ctxVariant)
-					reportGeneric(t, sides[0],
-						len(assertion.ContextualTuples) > 0)
+					reportGeneric(t, sides[0])
 				})
 			}
 		})
@@ -299,7 +311,7 @@ func runListObjectsReplay(
 ) {
 	ctx := context.Background()
 	rng := caseRand(t.Name())
-	ctxVariant := mode == modeCtxTuples
+	ctxVariant := mode.ctxTuples()
 
 	if ctxVariant {
 		if len(tc.Stages) > 1 {
@@ -337,8 +349,8 @@ func runListObjectsReplay(
 		st := stage
 		t.Run(fmt.Sprintf("stage_%d", stageNum), func(t *testing.T) {
 			writeStageBoth(t, rng, sides, st, ctxVariant)
-			if mode == modeCompiled {
-				reportDelegated(t, sides[0])
+			if mode.compiled() {
+				reportDelegated(t, sides[0], mode)
 			}
 			for i, a := range st.ListObjectsAssertions {
 				assertion := a
@@ -346,8 +358,7 @@ func runListObjectsReplay(
 					func(t *testing.T) {
 						runListObjectsAssertion(
 							t, rng, sides, st, assertion, ctxVariant)
-						reportGeneric(t, sides[0],
-							len(assertion.ContextualTuples) > 0)
+						reportGeneric(t, sides[0])
 					})
 			}
 		})
@@ -447,7 +458,7 @@ func runListUsersReplay(
 ) {
 	ctx := context.Background()
 	rng := caseRand(t.Name())
-	ctxVariant := mode == modeCtxTuples
+	ctxVariant := mode.ctxTuples()
 
 	if ctxVariant {
 		if len(tc.Stages) > 1 {
@@ -485,23 +496,23 @@ func runListUsersReplay(
 		st := stage
 		t.Run(fmt.Sprintf("stage_%d", stageNum), func(t *testing.T) {
 			writeStageBoth(t, rng, sides, st, ctxVariant)
-			if mode == modeCompiled {
-				reportDelegated(t, sides[0])
+			if mode.compiled() {
+				reportDelegated(t, sides[0], mode)
 			}
 			for i, a := range st.ListUsersAssertions {
 				assertion := a
 				t.Run(fmt.Sprintf("assertion_%d", i),
 					func(t *testing.T) {
-						if mode == modeCompiled &&
+						if mode.compiled() &&
 							hasWildcard(assertion.Expectation) {
 							runListUsersWildcardCompiled(t, rng, sides,
-								tc.Stages[:stageNum+1], assertion)
+								tc.Stages[:stageNum+1], assertion,
+								ctxVariant)
 							return
 						}
 						runListUsersAssertion(
 							t, rng, sides, st, assertion, ctxVariant)
-						reportGeneric(t, sides[0],
-							len(assertion.ContextualTuples) > 0)
+						reportGeneric(t, sides[0])
 					})
 			}
 		})
@@ -516,13 +527,21 @@ func runListUsersReplay(
 // nothing grants to directly — and the list must equal the source
 // subjects the engine's check allows, one at a time. Upstream's
 // answer cannot be the reference: user:* hides who is excluded.
+// In the ctx variant the stage tuples were not written, so they go
+// along as contextual tuples, as in every other assertion.
 func runListUsersWildcardCompiled(
 	t *testing.T, rng *rand.Rand, sides []*side,
 	stages []*corpus.Stage, a *corpus.ListUsersAssertion,
+	ctxVariant bool,
 ) {
 	ctx := context.Background()
 	runListUsersAssertion(t, rng, sides[1:], stages[len(stages)-1], a,
-		false)
+		ctxVariant)
+	keys := a.ContextualTuples
+	if ctxVariant {
+		keys = append(append([]*openfgav1.TupleKey{}, keys...),
+			stages[len(stages)-1].Tuples...)
+	}
 
 	c := sides[0].client.(*sqlclient.Compiled)
 	ftype := a.Request.Filters[0]
@@ -545,7 +564,7 @@ func runListUsersWildcardCompiled(
 			add(k.GetUser())
 		}
 	}
-	for _, k := range a.ContextualTuples {
+	for _, k := range keys {
 		add(k.GetUser())
 	}
 	for _, u := range a.Expectation {
@@ -559,10 +578,8 @@ func runListUsersWildcardCompiled(
 	}
 
 	var ctxTuples *openfgav1.ContextualTupleKeys
-	if len(a.ContextualTuples) > 0 {
-		ctxTuples = &openfgav1.ContextualTupleKeys{
-			TupleKeys: a.ContextualTuples,
-		}
+	if len(keys) > 0 {
+		ctxTuples = &openfgav1.ContextualTupleKeys{TupleKeys: keys}
 	}
 	var want []string
 	for _, id := range source {
@@ -593,7 +610,7 @@ func runListUsersWildcardCompiled(
 		Relation:             a.Request.Relation,
 		UserFilters:          []*openfgav1.UserTypeFilter{{Type: ftype}},
 		Context:              a.Context,
-		ContextualTuples:     a.ContextualTuples,
+		ContextualTuples:     keys,
 	})
 	if err != nil {
 		t.Fatalf("%s: unexpected error: %v", sides[0].name, err)
@@ -608,7 +625,7 @@ func runListUsersWildcardCompiled(
 		t.Errorf("%s: subjects %v, check allows %v over the source",
 			sides[0].name, got, want)
 	}
-	reportGeneric(t, sides[0], len(a.ContextualTuples) > 0)
+	reportGeneric(t, sides[0])
 }
 
 func hasWildcard(users []string) bool {

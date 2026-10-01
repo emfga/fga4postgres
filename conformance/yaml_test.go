@@ -85,6 +85,9 @@ func TestCheckCorpus(t *testing.T) {
 			t.Run("compiled", func(t *testing.T) {
 				runCheckReplay(t, file, tc, modeCompiled)
 			})
+			t.Run("compiledCtxTuples", func(t *testing.T) {
+				runCheckReplay(t, file, tc, modeCompiledCtxTuples)
+			})
 		})
 }
 
@@ -101,6 +104,9 @@ func TestListObjectsCorpus(t *testing.T) {
 			t.Run("compiled", func(t *testing.T) {
 				runListObjectsReplay(t, file, tc, modeCompiled)
 			})
+			t.Run("compiledCtxTuples", func(t *testing.T) {
+				runListObjectsReplay(t, file, tc, modeCompiledCtxTuples)
+			})
 		})
 }
 
@@ -116,6 +122,9 @@ func TestListUsersCorpus(t *testing.T) {
 			})
 			t.Run("compiled", func(t *testing.T) {
 				runListUsersReplay(t, file, tc, modeCompiled)
+			})
+			t.Run("compiledCtxTuples", func(t *testing.T) {
+				runListUsersReplay(t, file, tc, modeCompiledCtxTuples)
 			})
 		})
 }
