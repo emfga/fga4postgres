@@ -21,12 +21,14 @@
 --     (2000) — never dropped for a granting sibling (unlike
 --     check) and never tolerated by result count (unlike
 --     list_objects);
---   - the cap stops the search: once a node reached only through
---     unions holds as many users as the cap, its remaining rows
---     and children are not read (so an error there is never
---     met — upstream likewise stops collecting at the cap). Under
---     an intersection or exclusion every operand is computed in
---     full, since the operation may still remove users.
+--   - the cap (list_users_max_results in fga.setting, 0 =
+--     unlimited) stops the search: once a node reached only
+--     through unions holds as many users as the cap, its
+--     remaining rows and children are not read (so an error
+--     there is never met — upstream likewise stops collecting at
+--     the cap). Under an intersection or exclusion every operand
+--     is computed in full, since the operation may still remove
+--     users.
 --   - depth: the userset ladder errors at 25 links where check
 --     errors at 26 — list_users charges one hop more; cycles
 --     yield nothing (fail-closed).
@@ -454,7 +456,7 @@ DECLARE
   uset fga._lu_set;
   users fga._lu_user[];
   result jsonb;
-  cap integer := 1000;
+  cap integer := fga._setting_int('list_users_max_results');
 BEGIN
   mid := fga._resolve_model(
     store_id, request ->> 'authorization_model_id');
@@ -547,7 +549,7 @@ BEGIN
             'type', x.utype, 'id', x.uid::text))
       END AS u
     FROM unnest(users) x
-    LIMIT cap
+    LIMIT nullif(cap, 0)
   ) s;
 
   RETURN jsonb_build_object('users', result);

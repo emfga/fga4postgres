@@ -17,12 +17,13 @@
 --   Conditions: per-row conditions evaluate during expansion with
 --        the merged context; condition errors are collected per
 --        candidate and raised only when the result count stays
---        below the 1000 cap (upstream's scoping) — otherwise
+--        below the cap (upstream's scoping) — otherwise
 --        tolerated.
---   Cap: the search stops once the cap is reached, counting
---        confirmed objects only — a candidate still awaiting its
---        forward check may yet be refused, so it never ends the
---        search early.
+--   Cap: list_objects_max_results in fga.setting (0 =
+--        unlimited). The search stops once the cap is reached,
+--        counting confirmed objects only — a candidate still
+--        awaiting its forward check may yet be refused, so it
+--        never ends the search early.
 --
 -- Candidates whose path crossed a relation containing
 -- intersection or difference carry a sticky taint and are
@@ -82,7 +83,7 @@ DECLARE
   next_frontier fga._lo_node[];
   cands fga._lo_cand[];
   seen fga._lo_node[] := '{}';
-  cap integer := 1000;
+  cap integer := fga._setting_int('list_objects_max_results');
   clear_ids uuid[] := '{}';
   tainted_ids uuid[] := '{}';
   err_count integer := 0;
@@ -188,7 +189,7 @@ BEGIN
   END IF;
 
   WHILE coalesce(array_length(frontier, 1), 0) > 0
-        AND cardinality(clear_ids) < cap
+        AND (cap = 0 OR cardinality(clear_ids) < cap)
   LOOP
     seen := seen || frontier;
 
@@ -390,7 +391,7 @@ BEGIN
   FOR cid IN
     SELECT unnest(tainted_ids) EXCEPT SELECT unnest(clear_ids)
   LOOP
-    EXIT WHEN cardinality(clear_ids) >= cap;
+    EXIT WHEN cap > 0 AND cardinality(clear_ids) >= cap;
     BEGIN
       r := fga._check_node(
         store_id, mid, target_type, cid, target_rel,
@@ -408,7 +409,7 @@ BEGIN
   END LOOP;
 
   IF err_count > 0
-     AND cardinality(clear_ids) < cap THEN
+     AND (cap = 0 OR cardinality(clear_ids) < cap) THEN
     RAISE EXCEPTION '%', first_err USING ERRCODE = 'YF100';
   END IF;
 
@@ -416,7 +417,7 @@ BEGIN
     target_type || ':' || x.id), '{}')
   INTO objects
   FROM (
-    SELECT DISTINCT unnest(clear_ids) AS id LIMIT cap
+    SELECT DISTINCT unnest(clear_ids) AS id LIMIT nullif(cap, 0)
   ) x;
 
   RETURN jsonb_build_object('objects',

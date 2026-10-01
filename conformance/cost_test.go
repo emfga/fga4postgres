@@ -3,9 +3,12 @@ package conformance
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"testing"
 
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	openfgav1 "github.com/openfga/api/proto/openfga/v1"
 
 	"github.com/emfga/fga4postgres/internal/sqlclient"
@@ -187,5 +190,98 @@ func TestListUsersCapStopsEarly(t *testing.T) {
 	}
 	if got := calls["fga._lu_union"]; got != 1000 {
 		t.Errorf("fga._lu_union calls = %d, want 1000", got)
+	}
+}
+
+// The caps are database-wide settings, like upstream's server
+// config: 0 lifts the cap and a negative value is refused. The
+// oracle's cap is fixed by its own config, so this is engine-only.
+//
+// Other tests rely on the default 1000 while this one runs, so every
+// change is made inside a transaction that is rolled back, with the
+// list call made in that same transaction.
+func TestListMaxResultsSetting(t *testing.T) {
+	// anne sees 1,005 docs: d1..d1004 directly, and doc:shared,
+	// whose 1,005 viewers are anne and u1..u1004.
+	var tuples []*openfgav1.TupleKey
+	tuples = append(tuples, tk("doc:shared", "viewer", "user:anne"))
+	for i := 1; i < 1005; i++ {
+		tuples = append(tuples,
+			tk(fmt.Sprintf("doc:d%d", i), "viewer", "user:anne"),
+			tk("doc:shared", "viewer", fmt.Sprintf("user:u%d", i)))
+	}
+	s := newCostStore(t, plainDSL, tuples)
+	objectsReq := jsonArg(t, map[string]any{
+		"type": "doc", "relation": "viewer",
+		"user": s.user("user", "anne"),
+	})
+	usersReq := jsonArg(t, map[string]any{
+		"object": map[string]string{
+			"type": "doc", "id": s.ids.ID("shared"),
+		},
+		"relation":     "viewer",
+		"user_filters": []map[string]string{{"type": "user"}},
+	})
+	lists := []struct {
+		setting, stmt string
+		req           []byte
+	}{
+		{"list_objects_max_results", `SELECT jsonb_array_length(
+		   fga.list_objects($1, $2) -> 'objects')`, objectsReq},
+		{"list_users_max_results", `SELECT jsonb_array_length(
+		   fga.list_users($1, $2) -> 'users')`, usersReq},
+	}
+
+	ctx := context.Background()
+	pool := testdb.Pool(t)
+	for _, l := range lists {
+		count := func(q interface {
+			QueryRow(context.Context, string, ...any) pgx.Row
+		}) int {
+			var n int
+			if err := q.QueryRow(ctx, l.stmt, s.id, l.req).
+				Scan(&n); err != nil {
+				t.Fatalf("%s: %v", l.setting, err)
+			}
+			return n
+		}
+		for _, c := range []struct{ value, want int }{
+			{0, 1005}, {10, 10},
+		} {
+			tx, err := pool.Begin(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = tx.Exec(ctx,
+				"UPDATE fga.setting SET value = $1 WHERE name = $2",
+				c.value, l.setting)
+			if err != nil {
+				t.Fatalf("%s = %d: %v", l.setting, c.value, err)
+			}
+			got := count(tx)
+			_ = tx.Rollback(ctx)
+			if got != c.want {
+				t.Errorf("%s = %d: answered %d, want %d",
+					l.setting, c.value, got, c.want)
+			}
+		}
+		if got := count(pool); got != 1000 {
+			t.Errorf("%s after rollback: answered %d, want 1000",
+				l.setting, got)
+		}
+
+		tx, err := pool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = tx.Exec(ctx,
+			"UPDATE fga.setting SET value = -1 WHERE name = $1",
+			l.setting)
+		_ = tx.Rollback(ctx)
+		var pgErr *pgconn.PgError
+		if !errors.As(err, &pgErr) || pgErr.Code != "23514" {
+			t.Errorf("%s = -1: err = %v, want a check violation",
+				l.setting, err)
+		}
 	}
 }
