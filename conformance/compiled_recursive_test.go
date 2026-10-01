@@ -107,18 +107,41 @@ func (f compiledFixture) outcome(
 	t *testing.T, query string, args ...any,
 ) string {
 	t.Helper()
+	return f.outcomeAs(t, false, query, args...)
+}
+
+// genericOutcome is outcome with dispatch to compiled functions
+// turned off, so the public API answers through the generic
+// resolver. On an opted-in store it would otherwise call the very
+// function under test, and the comparison would prove nothing.
+func (f compiledFixture) genericOutcome(
+	t *testing.T, query string, args ...any,
+) string {
+	t.Helper()
+	return f.outcomeAs(t, true, query, args...)
+}
+
+func (f compiledFixture) outcomeAs(
+	t *testing.T, generic bool, query string, args ...any,
+) string {
+	t.Helper()
 	ctx := context.Background()
 	conn, err := testdb.Pool(t).Acquire(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer conn.Release()
-	if _, err := conn.Exec(ctx,
-		"SET statement_timeout = '5s'"); err != nil {
+	setup := "SET statement_timeout = '5s'"
+	if generic {
+		setup += "; SET fga._dispatching = 'on'"
+	}
+	if _, err := conn.Exec(ctx, setup); err != nil {
 		t.Fatal(err)
 	}
 	defer func() {
+		// Separately: one failing RESET must not undo the other.
 		_, _ = conn.Exec(ctx, "RESET statement_timeout")
+		_, _ = conn.Exec(ctx, "RESET fga._dispatching")
 	}()
 	rows, err := conn.Query(ctx, query, args...)
 	if err != nil {
@@ -162,7 +185,7 @@ func TestCompiledCycleTerminates(t *testing.T) {
 	}
 	generic := func(rel, user string) string {
 		typ, name, _ := strings.Cut(rel, "#")
-		return f.outcome(t, `
+		return f.genericOutcome(t, `
 			SELECT split_part(o ->> 'object', ':', 2)
 			FROM fga.streamed_list_objects($1, jsonb_build_object(
 			  'type', $2::text, 'relation', $3::text,
