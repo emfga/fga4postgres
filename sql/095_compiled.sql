@@ -22,16 +22,28 @@
 -- usual SET search_path.
 --
 -- Strategies: each relation compiles to its own emitter.
---   flattened  a UNION of fixed joins over fga.tuple (direct
---              grants, wildcards, usersets, computed usersets,
---              tuple-to-userset) for relations without cycles,
---              set operations or conditions;
---   recursive  a WITH RECURSIVE walk over the tuple graph for
---              relations on (or reaching) a cycle of the relation
---              graph, or deep enough to meet check's depth limit;
---   delegated  same signature, body calls the generic resolver;
---              used for anything no other emitter answers exactly
---              (the reason column says why).
+--   flattened    a UNION of fixed joins over fga.tuple (direct
+--                grants, wildcards, usersets, computed usersets,
+--                tuple-to-userset) for relations without cycles,
+--                set operations or conditions;
+--   conditioned  the flattened shape, with the relation's own
+--                conditioned grants filtered through the condition
+--                evaluator and the request context;
+--   setop        intersection and exclusion as INTERSECT / EXCEPT
+--                (AND / AND NOT for __check) over the same arms;
+--   recursive    a WITH RECURSIVE walk over the tuple graph for
+--                relations on (or reaching) a cycle of the relation
+--                graph, or deep enough to meet check's depth limit;
+--   delegated    same signature, body calls the generic resolver;
+--                used for anything no other emitter answers exactly
+--                (the reason column says why).
+--
+-- The flattened, conditioned and set-operation strategies read a
+-- call's contextual tuples themselves, as a source beside
+-- fga.tuple. A recursive body hands a call that carries contextual
+-- tuples to the generic resolver: its walk joins fga.tuple on the
+-- previous step's node, and a second source there would lose the
+-- index path every step relies on.
 
 CREATE TABLE IF NOT EXISTS fga.compiled_store (
   store uuid NOT NULL,
@@ -406,19 +418,216 @@ AS $$
          ELSE '' END);
 $$;
 
--- True when a call carries no contextual tuples. Flattened bodies
--- read fga.tuple only; a call with contextual tuples takes the
--- delegated path instead, so it is answered exactly, just not fast.
-CREATE OR REPLACE FUNCTION fga._compiled_no_ctuples(
-  contextual_tuples jsonb
-)
-RETURNS boolean
+-- The test a generated body makes for "this call carries no
+-- contextual tuples", as text. Inline rather than a function call:
+-- a call would be one more non-inlinable call (its SET clause) in
+-- every arm, where the expression costs nothing and folds at plan
+-- time when the call passes the '[]' default, so the planner drops
+-- every contextual-tuple branch.
+CREATE OR REPLACE FUNCTION fga._compiled_no_ctuples_sql()
+RETURNS text
 LANGUAGE sql
 IMMUTABLE PARALLEL SAFE
 SET search_path = fga, pg_temp
 AS $$
-  SELECT contextual_tuples IS NULL
-      OR contextual_tuples = '[]'::jsonb;
+  SELECT '(p_contextual_tuples IS NULL OR p_contextual_tuples '
+    'OPERATOR(pg_catalog.=) ''[]''::pg_catalog.jsonb)';
+$$;
+
+-- The contextual tuples of a generated call, validated exactly as
+-- the public API validates them (write-grade, against the model
+-- the function was compiled from). cond_errcode is the API's code
+-- for a condition-binding refusal: check refuses it as an invalid
+-- tuple, the list APIs as a validation error.
+--
+-- COST and ROWS say what a call really is — a handful of tuples, or
+-- none. A generated body run as its own statement (anything not
+-- inlined, a nested __check above all) is planned through the plan
+-- cache, which keeps a generic plan only when it costs about what
+-- the custom ones do; priced at the defaults, the contextual
+-- branches of the generic plan made it lose, and every call was
+-- planned again (a point check went from 0.12 ms to 1.15 ms).
+CREATE OR REPLACE FUNCTION fga._compiled_ctx(
+  store_id uuid, model_id uuid, tuples jsonb, cond_errcode text
+)
+RETURNS SETOF fga._tuple_key
+LANGUAGE plpgsql
+STABLE PARALLEL SAFE
+COST 1 ROWS 10
+SET search_path = fga, pg_temp
+AS $$
+DECLARE
+  tkj jsonb;
+  v record;
+BEGIN
+  FOR tkj IN
+    SELECT * FROM jsonb_array_elements(coalesce(tuples, '[]'))
+  LOOP
+    SELECT * INTO v FROM fga._validate_tuple(
+      store_id, model_id,
+      tkj ->> 'object', tkj ->> 'relation', tkj ->> 'user',
+      tkj -> 'condition' ->> 'name',
+      'YF127', cond_errcode);
+    RETURN NEXT (v.object_type, v.object_id, v.relation,
+      v.subject_type, v.subject_id, v.subject_relation,
+      tkj -> 'condition' ->> 'name',
+      tkj -> 'condition' -> 'context')::fga._tuple_key;
+  END LOOP;
+END;
+$$;
+
+-- True, or the validation error of the first invalid contextual
+-- tuple: the guard every generated body runs before answering, so
+-- an invalid tuple is refused even when no read would reach it.
+CREATE OR REPLACE FUNCTION fga._compiled_ctx_valid(
+  store_id uuid, model_id uuid, tuples jsonb, cond_errcode text
+)
+RETURNS boolean
+LANGUAGE sql
+STABLE PARALLEL SAFE
+SET search_path = fga, pg_temp
+AS $$
+  SELECT count(*) >= 0
+  FROM fga._compiled_ctx(store_id, model_id, tuples, cond_errcode);
+$$;
+
+-- Where a generated body reads the rows of one (type, relation):
+-- two sources, each a {FROM item, base condition} pair for alias g
+-- — the stored rows, and the call's contextual tuples (that branch
+-- folds away when the call passes none). An arm is emitted once per
+-- source rather than over one UNION ALL of both, because PostgreSQL
+-- keeps a filtered UNION ALL member as a subquery scan, which takes
+-- no join parameters: the parent-edge and userset joins would lose
+-- their index nested loops (a 3 ms page became 15 ms).
+-- exact_replace mirrors check's exact-key read, where a contextual
+-- row replaces the stored rows with the same key instead of joining
+-- them — the only read where the two differ, and only once a
+-- condition can tell the rows apart.
+CREATE OR REPLACE FUNCTION fga._compiled_srcs(
+  store_id uuid, model_id uuid, type_name text, relation_name text,
+  cond_errcode text, exact_replace boolean
+)
+RETURNS text[]
+LANGUAGE sql
+IMMUTABLE PARALLEL SAFE
+SET search_path = fga, pg_temp
+AS $$
+  SELECT ARRAY[
+    ARRAY['fga.tuple', format('g.store%1$s%2$L::pg_catalog.uuid '
+      'AND g.object_type%1$s%3$L AND g.relation%1$s%4$L%5$s',
+      eq, store_id, type_name, relation_name,
+      CASE WHEN exact_replace THEN format(
+        ' AND (%1$s OR NOT EXISTS (SELECT FROM %2$s AS k WHERE '
+        'k.object_type%3$sg.object_type AND k.object_id%3$sg.object_id '
+        'AND k.relation%3$sg.relation '
+        'AND k.subject_type%3$sg.subject_type '
+        'AND k.subject_id%3$sg.subject_id '
+        'AND k.subject_relation%3$sg.subject_relation))',
+        fga._compiled_no_ctuples_sql(), ctx, eq)
+      ELSE '' END)],
+    ARRAY[ctx, format('NOT %s AND g.object_type%s%L '
+      'AND g.relation%s%L', fga._compiled_no_ctuples_sql(),
+      eq, type_name, eq, relation_name)]]
+  FROM (SELECT ' OPERATOR(pg_catalog.=) ' AS eq,
+    format('fga._compiled_ctx(%L::pg_catalog.uuid, '
+      '%L::pg_catalog.uuid, p_contextual_tuples, %L)',
+      store_id, model_id, cond_errcode) AS ctx) AS v;
+$$;
+
+-- Both sources of _compiled_srcs as one FROM item for alias g,
+-- with cond added to each member. For arms that call another
+-- relation's function, so the callee is inlined once, not once per
+-- source. The planner still reaches the stored rows by index:
+-- either the arm's own filters are constants pushed into the
+-- members, or cond carries a LATERAL reference to the callee's row
+-- — a join condition would not be pushed into a filtered member.
+CREATE OR REPLACE FUNCTION fga._compiled_union(srcs text[], cond text)
+RETURNS text
+LANGUAGE sql
+IMMUTABLE PARALLEL SAFE
+SET search_path = fga, pg_temp
+AS $$
+  SELECT format('(SELECT g.object_id, g.subject_type, g.subject_id, '
+    'g.subject_relation, g.condition_name, g.condition_context '
+    'FROM %s AS g WHERE %s%s UNION ALL SELECT g.object_id, '
+    'g.subject_type, g.subject_id, g.subject_relation, '
+    'g.condition_name, g.condition_context FROM %s AS g WHERE %s%s)',
+    srcs[1][1], srcs[1][2], cond, srcs[2][1], srcs[2][2], cond);
+$$;
+
+-- Condition evaluation for generated bodies, one function per way
+-- a counterpart treats a condition error. Each evaluates through
+-- the generic evaluator (_eval_condition: tuple context wins over
+-- the request context per key, missing parameters are an error),
+-- so a compiled answer and a generic one cannot disagree on a
+-- condition — and conditions cost what they cost everywhere
+-- (decision 18).
+--
+-- met: never raises (check's grant pass; an error counts as unmet).
+CREATE OR REPLACE FUNCTION fga._compiled_met(
+  store_id uuid, model_id uuid, cond_name text, tuple_ctx jsonb,
+  req_ctx jsonb
+)
+RETURNS boolean
+LANGUAGE sql
+STABLE PARALLEL SAFE
+SET search_path = fga, pg_temp
+AS $$
+  SELECT e.met FROM fga._eval_condition(
+    store_id, model_id, cond_name, tuple_ctx, req_ctx) AS e;
+$$;
+
+-- err: the error, or NULL (check's held-error pass).
+CREATE OR REPLACE FUNCTION fga._compiled_cond_err(
+  store_id uuid, model_id uuid, cond_name text, tuple_ctx jsonb,
+  req_ctx jsonb
+)
+RETURNS text
+LANGUAGE sql
+STABLE PARALLEL SAFE
+SET search_path = fga, pg_temp
+AS $$
+  SELECT e.err FROM fga._eval_condition(
+    store_id, model_id, cond_name, tuple_ctx, req_ctx) AS e;
+$$;
+
+-- cond: met, or raises the error (the list APIs, which fail the
+-- request on any condition error they meet).
+CREATE OR REPLACE FUNCTION fga._compiled_cond(
+  store_id uuid, model_id uuid, cond_name text, tuple_ctx jsonb,
+  req_ctx jsonb
+)
+RETURNS boolean
+LANGUAGE plpgsql
+STABLE PARALLEL SAFE
+SET search_path = fga, pg_temp
+AS $$
+DECLARE
+  ev record;
+BEGIN
+  SELECT * INTO ev FROM fga._eval_condition(
+    store_id, model_id, cond_name, tuple_ctx, req_ctx);
+  IF ev.err IS NOT NULL THEN
+    RAISE EXCEPTION '%', ev.err USING ERRCODE = 'YF100';
+  END IF;
+  RETURN ev.met;
+END;
+$$;
+
+-- false, or raises a held condition error: check's last step when
+-- nothing granted.
+CREATE OR REPLACE FUNCTION fga._compiled_held_error(err text)
+RETURNS boolean
+LANGUAGE plpgsql
+STABLE PARALLEL SAFE
+SET search_path = fga, pg_temp
+AS $$
+BEGIN
+  IF err IS NOT NULL THEN
+    RAISE EXCEPTION '%', err USING ERRCODE = 'YF100';
+  END IF;
+  RETURN false;
+END;
 $$;
 
 -- Raised from a __subjects body that meets a wildcard grant whose
@@ -475,26 +684,120 @@ AS $$
       store_id, model_id, type_name, relation_name);
 $$;
 
--- The flattened emitter: a UNION of fixed joins over fga.tuple, one
--- arm per way the relation grants — the subject itself (a userset
--- subject is its own member), each direct restriction (plain,
--- wildcard, userset), each computed relation and each linked
--- parent of a tuple-to-userset. Arms that reach another relation
--- call that relation's generated function, which PostgreSQL
--- inlines in turn; the planner flattens the whole tree into one
--- query. Only relations the plan marked flattened get here: no
--- cycle, no set operation, no condition, bounded depth — so no arm
--- can raise and the union is exactly what check computes.
+-- Internal helpers of the generator whose signatures evolve are
+-- dropped by name first (see 050): CREATE OR REPLACE cannot change
+-- a row type built from OUT parameters.
+DO $$
+DECLARE
+  f record;
+BEGIN
+  FOR f IN
+    SELECT p.oid::regprocedure AS sig
+    FROM pg_proc p
+    JOIN pg_namespace n ON n.oid = p.pronamespace
+    WHERE n.nspname = 'fga'
+      AND p.proname IN ('_compiled_leaf', '_compiled_setop_node')
+  LOOP
+    EXECUTE 'DROP FUNCTION ' || f.sig;
+  END LOOP;
+END;
+$$;
+
+-- The contextual half of a check: whether any of the call's
+-- contextual tuples satisfies one of conds, the check arms'
+-- conditions on alias g over the parameters of a generated check
+-- (p_object, p_subject_type, ...). A plain function call, not a
+-- subplan, because a check body runs as its own statement when it
+-- is not inlined, and every call starts every subplan of its plan,
+-- run or not: one subplan per arm cost a page of nested checks 40%,
+-- one per check still 20%, while a call that never runs costs
+-- nothing. It runs only for calls that carry contextual tuples,
+-- where planning one dynamic statement is affordable.
+CREATE OR REPLACE FUNCTION fga._compiled_ctx_check(
+  store_id uuid, model_id uuid, conds text,
+  p_object uuid, p_subject_type text, p_subject_id uuid,
+  p_subject_relation text, p_any_subject boolean, p_context jsonb,
+  p_contextual_tuples jsonb
+)
+RETURNS boolean
+LANGUAGE plpgsql
+STABLE PARALLEL SAFE
+SET search_path = fga, pg_temp
+AS $$
+DECLARE
+  found_one boolean;
+BEGIN
+  EXECUTE format('SELECT EXISTS (SELECT FROM (SELECT $1 AS p_object, '
+    '$2 AS p_subject_type, $3 AS p_subject_id, '
+    '$4 AS p_subject_relation, $5 AS p_any_subject, $6 AS p_context, '
+    '$7 AS p_contextual_tuples) AS p, fga._compiled_ctx(%L::uuid, '
+    '%L::uuid, $7, ''YF127'') AS g WHERE %s)',
+    store_id, model_id, conds)
+  INTO found_one
+  USING p_object, p_subject_type, p_subject_id, p_subject_relation,
+    p_any_subject, p_context, p_contextual_tuples;
+  RETURN found_one;
+END;
+$$;
+
+-- The generated call to _compiled_ctx_check for one check, asking
+-- about the subject sid / anys; NULL when there are no conditions.
+CREATE OR REPLACE FUNCTION fga._compiled_ctx_exists(
+  store_id uuid, model_id uuid, conds text[], sid text, anys text
+)
+RETURNS text
+LANGUAGE sql
+IMMUTABLE PARALLEL SAFE
+SET search_path = fga, pg_temp
+AS $$
+  SELECT CASE WHEN cardinality(conds) > 0 THEN format(
+    '(NOT %s AND fga._compiled_ctx_check(%L::pg_catalog.uuid, '
+    '%L::pg_catalog.uuid, %L, p_object, p_subject_type, %s, '
+    'p_subject_relation, %s, p_context, p_contextual_tuples))',
+    fga._compiled_no_ctuples_sql(), store_id, model_id,
+    array_to_string(conds, E'\n  OR '), sid, anys) END;
+$$;
+
+-- The arms of one leaf of a rewrite — a direct assignment ('this'),
+-- a computed userset or a tuple-to-userset — for each kind: objs and
+-- subs are SELECTs of one uuid column, checks boolean expressions,
+-- check_errs SELECTs of the condition errors check holds back
+-- until nothing grants. A wildcard grant's subjects are kept apart:
+-- wild_subs lists them (over the registered subject source), wilds
+-- only tests that the grant exists. One arm per way the leaf grants
+-- and per source (_compiled_srcs): each direct restriction (plain,
+-- wildcard, userset), the computed relation, each linked parent
+-- type of a tuple-to-userset. Arms that reach another relation call
+-- that relation's generated function, which PostgreSQL inlines in
+-- turn.
 --
--- Stored rows are admitted like the generic read helpers admit
--- them: by the relation's restrictions (each arm names its subject
--- type and relation) and unconditioned only. Every name in a body
--- is schema-qualified, operators included, because the body runs
--- under the caller's search_path.
-CREATE OR REPLACE FUNCTION fga._compiled_emit_flattened(
+-- Rows are read like the generic read helpers read them: stored
+-- rows admitted by the relation's restrictions including the
+-- condition binding (each arm names its subject type, relation and
+-- condition), plus the call's contextual tuples. A conditioned
+-- direct grant evaluates its condition only on rows that carry it,
+-- after every other filter (OFFSET 0 keeps the planner from moving
+-- the call ahead of them):
+--   __objects / __subjects raise the first error they meet, as the
+--     list APIs do;
+--   __check counts an error as unmet and reports it through
+--     check_errs, as check holds it until nothing grants.
+-- Usersets and tuplesets are never conditioned here (the plan
+-- delegates such relations), and arms that reach another relation
+-- only reach relations that cannot raise.
+--
+-- sid and anys are the subject id and "any subject" expressions the
+-- check arms test, so a __subjects body can ask a check about each
+-- subject it lists. Every name in an arm is schema-qualified,
+-- operators included, because the body runs under the caller's
+-- search_path.
+CREATE OR REPLACE FUNCTION fga._compiled_leaf(
   store_id uuid, model_id uuid, target text,
-  type_name text, relation_name text,
-  OUT objects_body text, OUT subjects_body text, OUT check_body text
+  type_name text, relation_name text, node jsonb,
+  sid text, anys text,
+  OUT objs text[], OUT subs text[], OUT checks text[],
+  OUT ctx_checks text[], OUT check_errs text[], OUT wild_subs text[],
+  OUT wilds text[]
 )
 LANGUAGE plpgsql
 STABLE PARALLEL SAFE
@@ -508,225 +811,622 @@ DECLARE
     '''00000000-0000-0000-0000-000000000000''::pg_catalog.uuid';
   uncond constant text := '(g.condition_name IS NULL OR '
     'g.condition_name OPERATOR(pg_catalog.=) '''')';
-  live constant text :=
-    'fga._compiled_no_ctuples(p_contextual_tuples)';
   objects_args constant text := 'p_subject_type, p_subject_id, '
+    'p_subject_relation, p_any_subject, p_context, '
+    'p_contextual_tuples';
+  check_args constant text := format('p_subject_type, %s, '
+    'p_subject_relation, %s, p_context, p_contextual_tuples',
+    sid, anys);
+  -- ctx_checks are evaluated by _compiled_ctx_check, which binds
+  -- the parameter names themselves (sid and anys are its arguments).
+  ctx_args constant text := 'p_subject_type, p_subject_id, '
     'p_subject_relation, p_any_subject, p_context, '
     'p_contextual_tuples';
   subjects_args constant text := 'p_subject_type, '
     'p_subject_relation, p_context, p_contextual_tuples';
+  -- Sources ({FROM item, base condition} pairs): list (YF100) for
+  -- __objects / __subjects, chk (YF127) for __check, exact for
+  -- check's exact-key read.
+  list text[];
+  chk text[];
+  exact text[];
+  x text[];
+  rows_list text[];
+  rows_chk text[];
+  rows_wild text[];
   rows_of text;
+  ref_objects text;
+  ref_check text;
+  ref_subjects text;
   match text;
+  bind text;
   gate text;
-  objs text[] := '{}';
-  subs text[] := '{}';
-  checks text[] := '{}';
+  met text;
   sources jsonb;
   src text[];
-  d record;
   r record;
 BEGIN
+  objs := '{}';
+  subs := '{}';
+  checks := '{}';
+  ctx_checks := '{}';
+  check_errs := '{}';
+  wild_subs := '{}';
+  wilds := '{}';
   SELECT cs.subject_sources INTO sources
   FROM fga.compiled_store cs WHERE cs.store = store_id;
-  d := fga._compiled_emit_delegated(
-    store_id, model_id, type_name, relation_name);
 
-  -- The subject itself: T:o#R is a member of T:o#R.
-  objs := objs || format(
-    'SELECT p_subject_id WHERE p_subject_type%1$s%2$L '
-    'AND p_subject_relation%1$s%3$L AND NOT p_any_subject',
-    eq, type_name, relation_name);
-  subs := subs || format(
-    'SELECT p_object WHERE p_subject_type%1$s%2$L '
-    'AND p_subject_relation%1$s%3$L', eq, type_name, relation_name);
-  checks := checks || format(
-    '(p_subject_type%1$s%2$L AND p_subject_relation%1$s%3$L '
-    'AND NOT p_any_subject AND p_subject_id%1$sp_object)',
-    eq, type_name, relation_name);
-
-  -- Direct restrictions, when the rewrite assigns directly.
-  rows_of := fga._compiled_rows(store_id, type_name, relation_name);
-  FOR r IN
-    SELECT tr.subject_type, tr.subject_relation, tr.is_wildcard
-    FROM fga.model_type_restriction tr
-    WHERE tr.store = store_id AND tr.model_id = mid
-      AND tr.type_name = _compiled_emit_flattened.type_name
-      AND tr.relation_name = _compiled_emit_flattened.relation_name
-      AND EXISTS (
-        SELECT FROM fga.model_relation mr,
-             fga._rewrite_nodes(mr.rewrite) AS n
-        WHERE mr.store = store_id AND mr.model_id = mid
-          AND mr.type_name = tr.type_name
-          AND mr.relation_name = tr.relation_name AND n ? 'this')
-    ORDER BY tr.ord
-  LOOP
-    match := format('g.subject_type%1$s%2$L AND '
-      'g.subject_relation%1$s%3$L', eq, r.subject_type,
-      r.subject_relation);
-    IF r.is_wildcard THEN
+  IF node ? 'this' THEN
+    list := fga._compiled_srcs(store_id, mid, type_name,
+      relation_name, 'YF100', false);
+    chk := fga._compiled_srcs(store_id, mid, type_name,
+      relation_name, 'YF127', false);
+    exact := fga._compiled_srcs(store_id, mid, type_name,
+      relation_name, 'YF127', EXISTS (
+        SELECT FROM fga.model_type_restriction tr
+        WHERE tr.store = store_id AND tr.model_id = mid
+          AND tr.type_name = _compiled_leaf.type_name
+          AND tr.relation_name = _compiled_leaf.relation_name
+          AND tr.condition_name <> ''));
+    FOR r IN
+      SELECT tr.subject_type, tr.subject_relation, tr.is_wildcard,
+             tr.condition_name
+      FROM fga.model_type_restriction tr
+      WHERE tr.store = store_id AND tr.model_id = mid
+        AND tr.type_name = _compiled_leaf.type_name
+        AND tr.relation_name = _compiled_leaf.relation_name
+      ORDER BY tr.ord
+    LOOP
+      match := format('g.subject_type%1$s%2$L AND '
+        'g.subject_relation%1$s%3$L', eq, r.subject_type,
+        r.subject_relation);
+      bind := CASE WHEN r.condition_name = '' THEN uncond
+        ELSE format('g.condition_name%s%L', eq, r.condition_name) END;
       gate := format('p_subject_type%1$s%2$L AND '
         'p_subject_relation%1$s''''', eq, r.subject_type);
-      objs := objs || format(
-        'SELECT g.object_id FROM fga.tuple AS g WHERE %s AND %s '
-        'AND g.subject_id%s%s AND %s AND %s',
-        rows_of, match, eq, nil, uncond, gate);
-      checks := checks || format(
-        '(%s AND EXISTS (SELECT FROM fga.tuple AS g WHERE %s AND '
-        'g.object_id%sp_object AND %s AND g.subject_id%s%s AND %s))',
-        gate, rows_of, eq, match, eq, nil, uncond);
-      src := fga._compiled_parse_source(
-        sources ->> r.subject_type);
-      IF src IS NOT NULL THEN
+      -- A condition call over a fenced row a(x, n, c), by function.
+      met := format('%%s(%L::pg_catalog.uuid, %L::pg_catalog.uuid, '
+        'a.n, a.c, p_context)', store_id, mid);
+      rows_list := '{}';
+      rows_chk := '{}';
+      rows_wild := '{}';
+
+      IF r.subject_relation <> '' THEN
+        -- A userset grant: expand through the subject relation.
+        ref_objects := fga._compiled_ref(target, r.subject_type,
+          r.subject_relation, 'objects');
+        ref_check := fga._compiled_ref(target, r.subject_type,
+          r.subject_relation, 'check');
+        ref_subjects := fga._compiled_ref(target, r.subject_type,
+          r.subject_relation, 'subjects');
+        objs := objs || format(
+          'SELECT g.object_id FROM (SELECT x FROM %s(%s) AS x) AS c '
+          'CROSS JOIN LATERAL %s AS g WHERE %s AND %s',
+          ref_objects, objects_args, fga._compiled_union(list,
+            ' AND g.subject_id' || eq || 'c.x'), match, bind);
         subs := subs || format(
-          'SELECT s.%I FROM %I.%I AS s WHERE %s AND EXISTS (SELECT '
-          'FROM fga.tuple AS g WHERE %s AND g.object_id%sp_object '
-          'AND %s AND g.subject_id%s%s AND %s)',
-          src[3], src[1], src[2], gate, rows_of, eq, match, eq, nil,
-          uncond);
-      ELSE
-        subs := subs || format(
-          'SELECT g.subject_id FROM fga.tuple AS g WHERE %s AND '
-          'g.object_id%sp_object AND %s AND g.subject_id%s%s AND %s '
-          'AND %s AND fga._compiled_no_source(%L, g.ulid)',
-          rows_of, eq, match, eq, nil, uncond, gate, r.subject_type);
+          'SELECT x FROM %s AS g CROSS JOIN LATERAL %s(g.subject_id, '
+          '%s) AS x WHERE g.object_id%sp_object AND %s AND %s',
+          fga._compiled_union(list, ''), ref_subjects, subjects_args,
+          eq, match, bind);
+        checks := checks || format(
+          'EXISTS (SELECT FROM %s AS g WHERE %s AND '
+          'g.object_id%sp_object AND %s AND %s AND %s(g.subject_id, '
+          '%s))', chk[1][1], chk[1][2], eq, match, bind, ref_check,
+          check_args);
+        ctx_checks := ctx_checks || format(
+          '(%s AND g.object_id%sp_object AND %s AND %s AND '
+          '%s(g.subject_id, %s))', chk[2][2], eq, match, bind,
+          ref_check, ctx_args);
+        CONTINUE;
       END IF;
-    ELSIF r.subject_relation = '' THEN
-      gate := format('p_subject_type%1$s%2$L AND '
-        'p_subject_relation%1$s''''', eq, r.subject_type);
+
+      -- A plain or wildcard grant: check's exact-key read. The rows
+      -- are listed as a(x, n, c) — the object (or subject) id, the
+      -- condition name and its context.
+      FOREACH x SLICE 1 IN ARRAY list LOOP
+        IF r.is_wildcard THEN
+          rows_list := rows_list || format(
+            'SELECT g.object_id, g.condition_name, g.condition_context '
+            'FROM %s AS g WHERE %s AND %s AND %s AND g.subject_id%s%s '
+            'AND %s', x[1], x[2], match, bind, eq, nil, gate);
+          rows_wild := rows_wild || format(
+            'SELECT g.object_id, g.condition_name, g.condition_context '
+            'FROM %s AS g WHERE %s AND g.object_id%sp_object AND %s '
+            'AND %s AND g.subject_id%s%s AND %s',
+            x[1], x[2], eq, match, bind, eq, nil, gate);
+        ELSE
+          rows_list := rows_list || format(
+            'SELECT g.object_id, g.condition_name, g.condition_context '
+            'FROM %s AS g WHERE %s AND %s AND %s '
+            'AND g.subject_id%sp_subject_id AND %s '
+            'AND NOT p_any_subject', x[1], x[2], match, bind, eq, gate);
+          subs := subs || CASE WHEN r.condition_name = '' THEN format(
+            'SELECT g.subject_id FROM %s AS g WHERE %s AND '
+            'g.object_id%sp_object AND %s AND %s AND g.subject_id%s%s '
+            'AND %s', x[1], x[2], eq, match, bind, ne, nil, gate)
+          ELSE format('SELECT a.x FROM (SELECT g.subject_id, '
+            'g.condition_name, g.condition_context FROM %s AS g WHERE '
+            '%s AND g.object_id%sp_object AND %s AND %s AND '
+            'g.subject_id%s%s AND %s OFFSET 0) AS a(x, n, c) WHERE %s',
+            x[1], x[2], eq, match, bind, ne, nil, gate,
+            format(met, 'fga._compiled_cond')) END;
+        END IF;
+      END LOOP;
+      -- check's exact read: rows on the object with the subject's
+      -- key (or the wildcard's), conditions over alias g.
+      rows_of := format('g.object_id%s p_object AND %s AND %s '
+        'AND g.subject_id%s%s AND %s%s', eq, match, bind, eq,
+        CASE WHEN r.is_wildcard THEN nil ELSE sid END, gate,
+        CASE WHEN r.is_wildcard THEN '' ELSE ' AND NOT ' || anys END);
+      FOREACH x SLICE 1 IN ARRAY exact LOOP
+        rows_chk := rows_chk || format(
+          'SELECT g.condition_name, g.condition_context FROM %s AS g '
+          'WHERE %s AND %s', x[1], x[2], rows_of);
+      END LOOP;
+
+      IF r.condition_name = '' THEN
+        objs := objs || ARRAY(
+          SELECT format('SELECT a.x FROM (%s) AS a(x, n, c)', q)
+          FROM unnest(rows_list) AS q);
+        checks := checks || format('EXISTS (%s)', rows_chk[1]);
+        ctx_checks := ctx_checks || format('(%s AND g.object_id%s '
+          'p_object AND %s AND %s AND g.subject_id%s%s AND %s%s)',
+          exact[2][2], eq, match, bind, eq,
+          CASE WHEN r.is_wildcard THEN nil ELSE 'p_subject_id' END, gate,
+          CASE WHEN r.is_wildcard THEN '' ELSE ' AND NOT p_any_subject'
+          END);
+      ELSE
+        -- Conditioned: the rows go through an OFFSET 0 fence and
+        -- the condition filters them afterwards.
+        objs := objs || format('SELECT a.x FROM (%s OFFSET 0) '
+          'AS a(x, n, c) WHERE %s',
+          array_to_string(rows_list, ' UNION ALL '),
+          format(met, 'fga._compiled_cond'));
+        checks := checks || format('EXISTS (SELECT FROM (%s OFFSET 0) '
+          'AS a(n, c) WHERE %s)', array_to_string(rows_chk,
+            ' UNION ALL '), format(met, 'fga._compiled_met'));
+        check_errs := check_errs || format('SELECT %s FROM (%s '
+          'OFFSET 0) AS a(n, c)', format(met, 'fga._compiled_cond_err'),
+          array_to_string(rows_chk, ' UNION ALL '));
+      END IF;
+
+      -- The wildcard's final list: the registered subjects, or an
+      -- error when a grant exists and no source is registered. A
+      -- conditioned wildcard row raises its condition error first,
+      -- whether or not the source has rows (list_users fails on any
+      -- condition error it meets). wilds says only whether such a
+      -- grant exists, for a set operation to combine.
+      IF r.is_wildcard THEN
+        rows_of := format('(%s OFFSET 0) AS a(x, n, c)',
+          array_to_string(rows_wild, ' UNION ALL '));
+        met := CASE WHEN r.condition_name = '' THEN 'true'
+          ELSE format(met, 'fga._compiled_cond') END;
+        wilds := wilds || format('(%s AND EXISTS (SELECT FROM %s '
+          'WHERE %s))', gate, rows_of, met);
+        src := fga._compiled_parse_source(sources ->> r.subject_type);
+        IF src IS NOT NULL THEN
+          IF r.condition_name <> '' THEN
+            wild_subs := wild_subs || format(
+              'SELECT NULL::pg_catalog.uuid FROM %s WHERE %s IS NULL',
+              rows_of, met);
+          END IF;
+          wild_subs := wild_subs || format(
+            'SELECT s.%I FROM %I.%I AS s WHERE %s AND EXISTS ('
+            'SELECT FROM %s WHERE %s)',
+            src[3], src[1], src[2], gate, rows_of, met);
+        ELSE
+          wild_subs := wild_subs || format(
+            'SELECT a.x FROM %s WHERE CASE WHEN %s THEN '
+            'fga._compiled_no_source(%L, a.x::pg_catalog.text) '
+            'ELSE false END', rows_of, met, r.subject_type);
+        END IF;
+      END IF;
+    END LOOP;
+
+  ELSIF node ? 'computed_userset' THEN
+    -- The same object, another relation.
+    objs := objs || format('SELECT x FROM %s(%s) AS x',
+      fga._compiled_ref(target, type_name,
+        node -> 'computed_userset' ->> 'relation', 'objects'),
+      objects_args);
+    checks := checks || format('%s(p_object, %s)',
+      fga._compiled_ref(target, type_name,
+        node -> 'computed_userset' ->> 'relation', 'check'),
+      check_args);
+    subs := subs || format('SELECT x FROM %s(p_object, %s) AS x',
+      fga._compiled_ref(target, type_name,
+        node -> 'computed_userset' ->> 'relation', 'subjects'),
+      subjects_args);
+
+  ELSIF node ? 'tuple_to_userset' THEN
+    -- Every parent type the tupleset admits that defines the
+    -- computed relation (a parent type without it adds nothing, as
+    -- in check).
+    list := fga._compiled_srcs(store_id, mid, type_name,
+      node -> 'tuple_to_userset' -> 'tupleset' ->> 'relation',
+      'YF100', false);
+    chk := fga._compiled_srcs(store_id, mid, type_name,
+      node -> 'tuple_to_userset' -> 'tupleset' ->> 'relation',
+      'YF127', false);
+    FOR r IN
+      SELECT DISTINCT tr.subject_type AS parent,
+        node -> 'tuple_to_userset' -> 'computed_userset'
+          ->> 'relation' AS rel
+      FROM fga.model_type_restriction tr
+      WHERE tr.store = store_id AND tr.model_id = mid
+        AND tr.type_name = _compiled_leaf.type_name
+        AND tr.relation_name
+              = node -> 'tuple_to_userset' -> 'tupleset' ->> 'relation'
+        AND tr.subject_relation = '' AND NOT tr.is_wildcard
+        AND EXISTS (
+          SELECT FROM fga.model_relation p
+          WHERE p.store = store_id AND p.model_id = mid
+            AND p.type_name = tr.subject_type
+            AND p.relation_name = node -> 'tuple_to_userset'
+                  -> 'computed_userset' ->> 'relation')
+      ORDER BY 1
+    LOOP
+      match := format('g.subject_type%1$s%2$L AND '
+        'g.subject_relation%1$s'''' AND g.subject_id%3$s%4$s AND %5$s',
+        eq, r.parent, ne, nil, uncond);
+      ref_objects := fga._compiled_ref(target, r.parent, r.rel,
+        'objects');
+      ref_check := fga._compiled_ref(target, r.parent, r.rel, 'check');
+      ref_subjects := fga._compiled_ref(target, r.parent, r.rel,
+        'subjects');
       objs := objs || format(
-        'SELECT g.object_id FROM fga.tuple AS g WHERE %s AND %s '
-        'AND g.subject_id%sp_subject_id AND %s AND %s '
-        'AND NOT p_any_subject', rows_of, match, eq, uncond, gate);
-      checks := checks || format(
-        '(%s AND NOT p_any_subject AND EXISTS (SELECT FROM '
-        'fga.tuple AS g WHERE %s AND g.object_id%sp_object AND %s '
-        'AND g.subject_id%sp_subject_id AND %s))',
-        gate, rows_of, eq, match, eq, uncond);
+        'SELECT g.object_id FROM (SELECT x FROM %s(%s) AS x) AS c '
+        'CROSS JOIN LATERAL %s AS g WHERE %s',
+        ref_objects, objects_args, fga._compiled_union(list,
+          ' AND g.subject_id' || eq || 'c.x'), match);
       subs := subs || format(
-        'SELECT g.subject_id FROM fga.tuple AS g WHERE %s AND '
-        'g.object_id%sp_object AND %s AND g.subject_id%s%s AND %s '
-        'AND %s', rows_of, eq, match, ne, nil, uncond, gate);
+        'SELECT x FROM %s AS g CROSS JOIN LATERAL %s(g.subject_id, '
+        '%s) AS x WHERE g.object_id%sp_object AND %s',
+        fga._compiled_union(list, ''), ref_subjects, subjects_args,
+        eq, match);
+      checks := checks || format(
+        'EXISTS (SELECT FROM %s AS g WHERE %s AND '
+        'g.object_id%sp_object AND %s AND %s(g.subject_id, %s))',
+        chk[1][1], chk[1][2], eq, match, ref_check, check_args);
+      ctx_checks := ctx_checks || format(
+        '(%s AND g.object_id%sp_object AND %s AND %s(g.subject_id, '
+        '%s))', chk[2][2], eq, match, ref_check, ctx_args);
+    END LOOP;
+  END IF;
+END;
+$$;
+
+-- The subject itself: T:o#R is a member of T:o#R, whatever the
+-- rewrite (check answers it before reading anything).
+CREATE OR REPLACE FUNCTION fga._compiled_self(
+  type_name text, relation_name text,
+  OUT obj text, OUT sub text, OUT chk text
+)
+LANGUAGE sql
+IMMUTABLE PARALLEL SAFE
+SET search_path = fga, pg_temp
+AS $$
+  SELECT
+    format('SELECT p_subject_id WHERE p_subject_type%1$s%2$L '
+      'AND p_subject_relation%1$s%3$L AND NOT p_any_subject',
+      ' OPERATOR(pg_catalog.=) ', type_name, relation_name),
+    format('SELECT p_object WHERE p_subject_type%1$s%2$L '
+      'AND p_subject_relation%1$s%3$L',
+      ' OPERATOR(pg_catalog.=) ', type_name, relation_name),
+    format('(p_subject_type%1$s%2$L AND p_subject_relation%1$s%3$L '
+      'AND NOT p_any_subject AND p_subject_id%1$sp_object)',
+      ' OPERATOR(pg_catalog.=) ', type_name, relation_name);
+$$;
+
+-- The three bodies around a relation's arms: validation first (it
+-- raises, never filters) in each counterpart's order — contextual
+-- tuples before the subject for the list APIs, after it for check
+-- — then the union of the arms. A check with held condition errors
+-- raises the first of them when no arm grants.
+CREATE OR REPLACE FUNCTION fga._compiled_assemble(
+  store_id uuid, model_id uuid,
+  objs text[], subs text[], checks text[], check_errs text[],
+  OUT objects_body text, OUT subjects_body text, OUT check_body text
+)
+LANGUAGE sql
+IMMUTABLE PARALLEL SAFE
+SET search_path = fga, pg_temp
+AS $$
+  SELECT
+    format('SELECT NULL::pg_catalog.uuid WHERE NOT %s'
+      || E'\nUNION\nSELECT NULL::pg_catalog.uuid WHERE '
+      'fga._compiled_sid(p_subject_id, p_any_subject, '
+      'p_subject_relation) IS NULL', ctx_list)
+    || (SELECT string_agg(format(
+         E'\nUNION\nSELECT a.x FROM (%s) AS a(x)', a), '' ORDER BY i)
+        FROM unnest(objs) WITH ORDINALITY AS u(a, i)),
+    format('SELECT NULL::pg_catalog.uuid WHERE NOT %s'
+      || E'\nUNION\nSELECT NULL::pg_catalog.uuid WHERE '
+      'fga._compiled_oid(p_object) IS NULL', ctx_list)
+    || (SELECT string_agg(format(
+         E'\nUNION\nSELECT a.x FROM (%s) AS a(x)', a), '' ORDER BY i)
+        FROM unnest(subs) WITH ORDINALITY AS u(a, i)),
+    format('SELECT fga._compiled_sid(p_subject_id, p_any_subject, '
+      'p_subject_relation) IS NOT NULL AND fga._compiled_oid(p_object) '
+      'IS NOT NULL AND %s AND %s', ctx_check, CASE
+      WHEN cardinality(check_errs) = 0
+      THEN format('(%s)', array_to_string(checks, E'\n  OR '))
+      ELSE format(E'CASE WHEN %s THEN true\n  ELSE '
+        'fga._compiled_held_error((SELECT pg_catalog.min(e.x) FROM '
+        '(%s) AS e(x))) END',
+        array_to_string(checks, E'\n  OR '),
+        array_to_string(check_errs, E'\n  UNION ALL ')) END)
+  FROM (SELECT
+    format('(%s OR fga._compiled_ctx_valid(%L::pg_catalog.uuid, '
+      '%L::pg_catalog.uuid, p_contextual_tuples, ''YF100''))',
+      fga._compiled_no_ctuples_sql(), store_id, model_id) AS ctx_list,
+    format('(%s OR fga._compiled_ctx_valid(%L::pg_catalog.uuid, '
+      '%L::pg_catalog.uuid, p_contextual_tuples, ''YF127''))',
+      fga._compiled_no_ctuples_sql(), store_id, model_id) AS ctx_check
+  ) AS v;
+$$;
+
+-- The flattened emitter, which also serves the conditioned
+-- strategy: the union of every leaf of a rewrite made only of
+-- unions, direct grants, computed usersets and tuple-to-usersets.
+-- Only relations the plan marked flattened or conditioned get
+-- here: no cycle, no set operation, bounded depth, and only their
+-- own direct grants carry conditions — so the only errors a body
+-- can raise are its own condition errors, which the arms and
+-- _compiled_assemble scope like the generic resolver does.
+CREATE OR REPLACE FUNCTION fga._compiled_emit_flattened(
+  store_id uuid, model_id uuid, target text,
+  type_name text, relation_name text,
+  OUT objects_body text, OUT subjects_body text, OUT check_body text
+)
+LANGUAGE plpgsql
+STABLE PARALLEL SAFE
+SET search_path = fga, pg_temp
+AS $$
+DECLARE
+  mid constant uuid := model_id;
+  me record := fga._compiled_self(type_name, relation_name);
+  objs text[] := ARRAY[me.obj];
+  subs text[] := ARRAY[me.sub];
+  checks text[] := ARRAY[me.chk];
+  errs text[] := '{}';
+  ctx text[] := '{}';
+  l record;
+  b record;
+BEGIN
+  FOR l IN
+    SELECT f.* FROM fga.model_relation mr,
+      fga._rewrite_nodes(mr.rewrite) WITH ORDINALITY AS n(node, i),
+      fga._compiled_leaf(store_id, mid, target,
+        _compiled_emit_flattened.type_name,
+        _compiled_emit_flattened.relation_name, n.node,
+        'p_subject_id', 'p_any_subject') AS f
+    WHERE mr.store = store_id AND mr.model_id = mid
+      AND mr.type_name = _compiled_emit_flattened.type_name
+      AND mr.relation_name = _compiled_emit_flattened.relation_name
+    ORDER BY n.i
+  LOOP
+    objs := objs || l.objs;
+    subs := subs || l.subs || l.wild_subs;
+    checks := checks || l.checks;
+    ctx := ctx || l.ctx_checks;
+    errs := errs || l.check_errs;
+  END LOOP;
+  b := fga._compiled_assemble(store_id, model_id, objs, subs,
+    checks || fga._compiled_ctx_exists(store_id, mid, ctx,
+      'p_subject_id', 'p_any_subject'), errs);
+  objects_body := b.objects_body;
+  subjects_body := b.subjects_body;
+  check_body := b.check_body;
+END;
+$$;
+
+-- One node of a set-operation rewrite: its objects, its check, and
+-- its subjects as list_users computes them before any wildcard is
+-- expanded — candidates (the concrete subjects of its grants) and
+-- wild (whether a wildcard grant holds for the whole node). Unions
+-- are UNION / OR; intersection is INTERSECT / AND and exclusion
+-- EXCEPT / AND NOT of the operands' objects and checks. For
+-- subjects, intersection keeps every operand's candidates and a
+-- wildcard only when all operands grant one, and exclusion keeps
+-- the base's candidates and its wildcard unless the subtract side
+-- grants one too: the candidates then hold every subject the
+-- relation grants, and the emitter filters them by its check. A
+-- computed operand (the same object, another relation) is expanded
+-- in place for subjects, as list_users expands it, so a wildcard it
+-- grants joins wild instead of needing a subject source; wtypes
+-- names the subject types such wildcards can be of. sid and anys
+-- are the subject the checks ask about; depth names the aliases so
+-- nested set operations never shadow each other.
+CREATE OR REPLACE FUNCTION fga._compiled_setop_node(
+  store_id uuid, model_id uuid, target text,
+  type_name text, relation_name text, node jsonb,
+  sid text, anys text, depth integer,
+  OUT obj text, OUT sub text, OUT wild text, OUT chk text,
+  OUT wtypes text[]
+)
+LANGUAGE plpgsql
+STABLE PARALLEL SAFE
+SET search_path = fga, pg_temp
+AS $$
+DECLARE
+  mid constant uuid := model_id;
+  q constant text := 'q' || depth;
+  op text;
+  o text[] := '{}';
+  s text[] := '{}';
+  w text[] := '{}';
+  c text[] := '{}';
+  k record;
+  l record;
+  me record;
+  rw jsonb;
+BEGIN
+  wtypes := '{}';
+  op := CASE WHEN node ? 'union' THEN 'UNION'
+             WHEN node ? 'intersection' THEN 'INTERSECT'
+             WHEN node ? 'difference' THEN 'EXCEPT' END;
+  IF op IS NULL THEN
+    l := fga._compiled_leaf(store_id, model_id, target, type_name,
+      relation_name, node, sid, anys);
+    obj := coalesce((SELECT string_agg(format(
+        'SELECT a.x FROM (%s) AS a(x)', a), E'\nUNION\n' ORDER BY i)
+      FROM unnest(l.objs) WITH ORDINALITY AS u(a, i)),
+      'SELECT NULL::pg_catalog.uuid WHERE false');
+    sub := coalesce((SELECT string_agg(format(
+        'SELECT a.x FROM (%s) AS a(x)', a), E'\nUNION\n' ORDER BY i)
+      FROM unnest(l.subs) WITH ORDINALITY AS u(a, i)),
+      'SELECT NULL::pg_catalog.uuid WHERE false');
+    wild := coalesce('(' || nullif(array_to_string(l.wilds, ' OR '),
+      '') || ')', 'false');
+    chk := coalesce('(' || nullif(array_to_string(l.checks
+      || fga._compiled_ctx_exists(store_id, mid, l.ctx_checks, sid,
+        anys), ' OR '),
+      '') || ')', 'false');
+    IF node ? 'this' THEN
+      wtypes := ARRAY(
+        SELECT DISTINCT tr.subject_type
+        FROM fga.model_type_restriction tr
+        WHERE tr.store = store_id AND tr.model_id = mid
+          AND tr.type_name = _compiled_setop_node.type_name
+          AND tr.relation_name = _compiled_setop_node.relation_name
+          AND tr.is_wildcard);
+    ELSIF node ? 'computed_userset' THEN
+      SELECT mr.rewrite INTO rw FROM fga.model_relation mr
+      WHERE mr.store = store_id AND mr.model_id = mid
+        AND mr.type_name = _compiled_setop_node.type_name
+        AND mr.relation_name
+              = node -> 'computed_userset' ->> 'relation';
+      k := fga._compiled_setop_node(store_id, mid, target,
+        type_name, node -> 'computed_userset' ->> 'relation', rw,
+        sid, anys, depth + 1);
+      me := fga._compiled_self(type_name,
+        node -> 'computed_userset' ->> 'relation');
+      sub := format(E'SELECT %1$s.x FROM ((%2$s)\nUNION\n(%3$s)) '
+        'AS %1$s(x)', q, me.sub, k.sub);
+      wild := k.wild;
+      wtypes := k.wtypes;
+    END IF;
+    RETURN;
+  END IF;
+
+  FOR k IN
+    SELECT n.* FROM fga._rewrite_children(node) WITH ORDINALITY
+      AS kid(child, i),
+    LATERAL fga._compiled_setop_node(store_id, model_id, target,
+      type_name, relation_name, kid.child, sid, anys, depth + 1) AS n
+    ORDER BY kid.i
+  LOOP
+    o := o || k.obj;
+    s := s || k.sub;
+    w := w || k.wild;
+    c := c || k.chk;
+    wtypes := ARRAY(SELECT DISTINCT unnest(wtypes || k.wtypes));
+  END LOOP;
+
+  obj := format('SELECT %1$s.x FROM ((%2$s)) AS %1$s(x)', q,
+    array_to_string(o, E')\n' || op || E'\n('));
+  IF op = 'EXCEPT' THEN
+    sub := s[1];
+    wild := format('(%s AND NOT %s)', w[1], w[2]);
+    chk := format('(%s AND NOT %s)', c[1], c[2]);
+  ELSE
+    sub := format('SELECT %1$s.x FROM ((%2$s)) AS %1$s(x)', q,
+      array_to_string(s, E')\nUNION\n('));
+    wild := '(' || array_to_string(w,
+      CASE op WHEN 'UNION' THEN ' OR ' ELSE ' AND ' END) || ')';
+    chk := '(' || array_to_string(c,
+      CASE op WHEN 'UNION' THEN ' OR ' ELSE ' AND ' END) || ')';
+  END IF;
+END;
+$$;
+
+-- The set-operation emitter: the relation's rewrite as set
+-- operations over its leaves, plus the subject itself. The plan
+-- sends a relation here only when every relation it reaches can
+-- neither raise nor cycle, and it has no condition of its own: a
+-- set operation over such operands is exactly check's answer
+-- (a cycled false on the subtract side, or an operand error a
+-- sibling would swallow, would not be).
+--
+-- Subjects are the node's candidates, plus the registered subjects
+-- of each wildcard type when the node's wildcard holds (an error
+-- when no source is registered), kept only where the relation's
+-- check allows them. The OFFSET 0 fence keeps that check from being
+-- pushed below the wildcard's error, where it would hide it.
+CREATE OR REPLACE FUNCTION fga._compiled_emit_setop(
+  store_id uuid, model_id uuid, target text,
+  type_name text, relation_name text,
+  OUT objects_body text, OUT subjects_body text, OUT check_body text
+)
+LANGUAGE plpgsql
+STABLE PARALLEL SAFE
+SET search_path = fga, pg_temp
+AS $$
+DECLARE
+  eq constant text := ' OPERATOR(pg_catalog.=) ';
+  mid constant uuid := model_id;
+  me record := fga._compiled_self(type_name, relation_name);
+  rw jsonb;
+  sources jsonb;
+  src text[];
+  n record;
+  f record;
+  b record;
+  t text;
+  cands text;
+BEGIN
+  SELECT mr.rewrite INTO rw FROM fga.model_relation mr
+  WHERE mr.store = store_id AND mr.model_id = mid
+    AND mr.type_name = _compiled_emit_setop.type_name
+    AND mr.relation_name = _compiled_emit_setop.relation_name;
+  SELECT cs.subject_sources INTO sources
+  FROM fga.compiled_store cs WHERE cs.store = store_id;
+  n := fga._compiled_setop_node(store_id, mid, target, type_name,
+    relation_name, rw, 'p_subject_id', 'p_any_subject', 1);
+  f := fga._compiled_setop_node(store_id, mid, target, type_name,
+    relation_name, rw, 'q0.x', 'false', 1);
+
+  cands := n.sub;
+  FOR t IN SELECT x FROM unnest(n.wtypes) AS x ORDER BY 1 LOOP
+    src := fga._compiled_parse_source(sources ->> t);
+    IF src IS NOT NULL THEN
+      cands := cands || format(E'\nUNION\nSELECT s.%I FROM %I.%I AS s '
+        'WHERE p_subject_type%s%L AND p_subject_relation%s'''' AND %s',
+        src[3], src[1], src[2], eq, t, eq, n.wild);
     ELSE
-      objs := objs || format(
-        'SELECT g.object_id FROM fga.tuple AS g WHERE %s AND %s '
-        'AND %s AND g.subject_id%sANY (SELECT x FROM %s(%s) AS x)',
-        rows_of, match, uncond, eq,
-        fga._compiled_ref(target, r.subject_type, r.subject_relation,
-                          'objects'), objects_args);
-      checks := checks || format(
-        'EXISTS (SELECT FROM fga.tuple AS g WHERE %s AND '
-        'g.object_id%sp_object AND %s AND %s AND %s(g.subject_id, '
-        '%s))', rows_of, eq, match, uncond,
-        fga._compiled_ref(target, r.subject_type, r.subject_relation,
-                          'check'), objects_args);
-      subs := subs || format(
-        'SELECT x FROM fga.tuple AS g CROSS JOIN LATERAL '
-        '%s(g.subject_id, %s) AS x WHERE %s AND g.object_id%sp_object '
-        'AND %s AND %s',
-        fga._compiled_ref(target, r.subject_type, r.subject_relation,
-                          'subjects'), subjects_args,
-        rows_of, eq, match, uncond);
+      cands := cands || format(E'\nUNION\nSELECT '
+        'NULL::pg_catalog.uuid WHERE CASE WHEN p_subject_type%s%L '
+        'AND p_subject_relation%s'''' AND %s THEN '
+        'fga._compiled_no_source(%L, ''wildcard'') ELSE false END',
+        eq, t, eq, n.wild, t);
     END IF;
   END LOOP;
 
-  -- Computed usersets: the same object, another relation.
-  FOR r IN
-    SELECT DISTINCT n -> 'computed_userset' ->> 'relation' AS rel
-    FROM fga.model_relation mr, fga._rewrite_nodes(mr.rewrite) AS n
-    WHERE mr.store = store_id AND mr.model_id = mid
-      AND mr.type_name = _compiled_emit_flattened.type_name
-      AND mr.relation_name = _compiled_emit_flattened.relation_name
-      AND n ? 'computed_userset'
-    ORDER BY 1
-  LOOP
-    objs := objs || format('SELECT x FROM %s(%s) AS x',
-      fga._compiled_ref(target, type_name, r.rel, 'objects'),
-      objects_args);
-    checks := checks || format('%s(p_object, %s)',
-      fga._compiled_ref(target, type_name, r.rel, 'check'),
-      objects_args);
-    subs := subs || format('SELECT x FROM %s(p_object, %s) AS x',
-      fga._compiled_ref(target, type_name, r.rel, 'subjects'),
-      subjects_args);
-  END LOOP;
-
-  -- Tuple-to-userset: every parent type the tupleset admits that
-  -- defines the computed relation (a parent type without it adds
-  -- nothing, as in check).
-  FOR r IN
-    SELECT DISTINCT
-      n -> 'tuple_to_userset' -> 'tupleset' ->> 'relation' AS ts,
-      n -> 'tuple_to_userset' -> 'computed_userset' ->> 'relation'
-        AS rel,
-      tr.subject_type AS parent
-    FROM fga.model_relation mr, fga._rewrite_nodes(mr.rewrite) AS n
-    JOIN fga.model_type_restriction tr
-      ON tr.store = store_id AND tr.model_id = mid
-     AND tr.type_name = _compiled_emit_flattened.type_name
-     AND tr.relation_name
-           = n -> 'tuple_to_userset' -> 'tupleset' ->> 'relation'
-    WHERE mr.store = store_id AND mr.model_id = mid
-      AND mr.type_name = _compiled_emit_flattened.type_name
-      AND mr.relation_name = _compiled_emit_flattened.relation_name
-      AND n ? 'tuple_to_userset'
-      AND tr.subject_relation = '' AND NOT tr.is_wildcard
-      AND EXISTS (
-        SELECT FROM fga.model_relation p
-        WHERE p.store = store_id AND p.model_id = mid
-          AND p.type_name = tr.subject_type
-          AND p.relation_name = n -> 'tuple_to_userset'
-                -> 'computed_userset' ->> 'relation')
-    ORDER BY 1, 2, 3
-  LOOP
-    rows_of := fga._compiled_rows(store_id, type_name, r.ts);
-    match := format('g.subject_type%1$s%2$L AND '
-      'g.subject_relation%1$s'''' AND g.subject_id%3$s%4$s',
-      eq, r.parent, ne, nil);
-    objs := objs || format(
-      'SELECT g.object_id FROM fga.tuple AS g WHERE %s AND %s AND %s '
-      'AND g.subject_id%sANY (SELECT x FROM %s(%s) AS x)',
-      rows_of, match, uncond, eq,
-      fga._compiled_ref(target, r.parent, r.rel, 'objects'),
-      objects_args);
-    checks := checks || format(
-      'EXISTS (SELECT FROM fga.tuple AS g WHERE %s AND '
-      'g.object_id%sp_object AND %s AND %s AND %s(g.subject_id, %s))',
-      rows_of, eq, match, uncond,
-      fga._compiled_ref(target, r.parent, r.rel, 'check'),
-      objects_args);
-    subs := subs || format(
-      'SELECT x FROM fga.tuple AS g CROSS JOIN LATERAL '
-      '%s(g.subject_id, %s) AS x WHERE %s AND g.object_id%sp_object '
-      'AND %s AND %s',
-      fga._compiled_ref(target, r.parent, r.rel, 'subjects'),
-      subjects_args, rows_of, eq, match, uncond);
-  END LOOP;
-
-  -- Validation first (it raises, never filters), then the delegated
-  -- path for contextual tuples, then the arms.
-  objects_body := format(
-    'SELECT NULL::pg_catalog.uuid WHERE fga._compiled_sid('
-    'p_subject_id, p_any_subject, p_subject_relation) IS NULL'
-    || E'\nUNION\n%s WHERE NOT %s', d.objects_body, live)
-    || (SELECT string_agg(format(
-         E'\nUNION\nSELECT a.x FROM (%s) AS a(x) WHERE %s', a, live),
-         '' ORDER BY i)
-        FROM unnest(objs) WITH ORDINALITY AS u(a, i));
-  subjects_body := format(
-    'SELECT NULL::pg_catalog.uuid WHERE '
-    'fga._compiled_oid(p_object) IS NULL'
-    || E'\nUNION\n%s WHERE NOT %s', d.subjects_body, live)
-    || (SELECT string_agg(format(
-         E'\nUNION\nSELECT a.x FROM (%s) AS a(x) WHERE %s', a, live),
-         '' ORDER BY i)
-        FROM unnest(subs) WITH ORDINALITY AS u(a, i));
-  check_body := format(
-    'SELECT fga._compiled_sid(p_subject_id, p_any_subject, '
-    'p_subject_relation) IS NOT NULL AND fga._compiled_oid(p_object) '
-    'IS NOT NULL AND CASE WHEN %s THEN (%s) ELSE (%s) END',
-    live, array_to_string(checks, E'\n  OR '),
-    substr(d.check_body, length('SELECT ') + 1));
+  b := fga._compiled_assemble(store_id, mid,
+    ARRAY[me.obj, n.obj],
+    ARRAY[me.sub, format('SELECT q0.x FROM (SELECT c.x FROM (%s) '
+      'AS c(x) OFFSET 0) AS q0(x) WHERE q0.x IS NOT NULL AND %s',
+      cands, f.chk)],
+    ARRAY[me.chk, n.chk], '{}');
+  objects_body := b.objects_body;
+  subjects_body := b.subjects_body;
+  check_body := b.check_body;
 END;
+$$;
+
+-- The qualified name of another relation's generated function.
+CREATE OR REPLACE FUNCTION fga._compiled_ref(
+  target text, type_name text, relation_name text, kind text
+)
+RETURNS text
+LANGUAGE sql
+IMMUTABLE PARALLEL SAFE
+SET search_path = fga, pg_temp
+AS $$
+  SELECT format('%I.%I', target,
+    fga._compiled_name(type_name, relation_name, kind));
 $$;
 
 -- The recursive emitter: a walk over the relation's reach in the
@@ -777,8 +1477,7 @@ DECLARE
     '''00000000-0000-0000-0000-000000000000''::pg_catalog.uuid';
   uncond constant text := '(g.condition_name IS NULL OR '
     'g.condition_name OPERATOR(pg_catalog.=) '''')';
-  live constant text :=
-    'fga._compiled_no_ctuples(p_contextual_tuples)';
+  live constant text := fga._compiled_no_ctuples_sql();
   sub text[];
   direct_v text;
   userset_v text;
@@ -1119,35 +1818,6 @@ BEGIN
 END;
 $$;
 
--- "g.store = S AND g.object_type = T AND g.relation = R" for one
--- (type, relation), qualified.
-CREATE OR REPLACE FUNCTION fga._compiled_rows(
-  store_id uuid, type_name text, relation_name text
-)
-RETURNS text
-LANGUAGE sql
-IMMUTABLE PARALLEL SAFE
-SET search_path = fga, pg_temp
-AS $$
-  SELECT format(
-    'g.store%1$s%2$L::pg_catalog.uuid AND g.object_type%1$s%3$L '
-    'AND g.relation%1$s%4$L',
-    ' OPERATOR(pg_catalog.=) ', store_id, type_name, relation_name);
-$$;
-
--- The qualified name of another relation's generated function.
-CREATE OR REPLACE FUNCTION fga._compiled_ref(
-  target text, type_name text, relation_name text, kind text
-)
-RETURNS text
-LANGUAGE sql
-IMMUTABLE PARALLEL SAFE
-SET search_path = fga, pg_temp
-AS $$
-  SELECT format('%I.%I', target,
-    fga._compiled_name(type_name, relation_name, kind));
-$$;
-
 -- The edges of a model's relation graph: a relation points at every
 -- relation its rewrite can reach in one step — a computed userset
 -- (same object, hop 0), a userset restriction or a tuple-to-userset
@@ -1210,13 +1880,24 @@ $$;
 -- relation is delegated, and the order to create functions in
 -- (callees before callers).
 --
--- A relation flattens when its rewrite is only unions of direct
--- grants, computed usersets and tuple-to-usersets, it grants
--- through no condition, and every relation it reaches flattens
--- too. A relation on a cycle of the relation graph — or reaching
--- one — or whose dispatch chain may reach the resolution limit
--- compiles to the recursive strategy instead, when nothing it
--- reaches needs delegation for another reason.
+-- Each relation's own rewrite decides first:
+--   generic      only the generic resolver answers it (the reason
+--                says why) — it, and everything reaching it,
+--                delegates;
+--   setop        intersection or exclusion;
+--   conditioned  conditions on its own plain or wildcard grants;
+--   otherwise    unions of direct grants, computed usersets and
+--                tuple-to-usersets.
+-- A plain relation flattens when it reaches no cycle, no conditioned
+-- relation and no chain deep enough for check's depth limit. A
+-- set operation or conditioned relation compiles under the same
+-- three conditions, since it is exact only over operands that answer
+-- plainly true or false: a cycled false on the subtract side, a
+-- depth error or a condition error a sibling would swallow are not.
+-- A relation on (or reaching) a cycle, or deep, compiles to the
+-- recursive walk instead — when every relation it reaches is plain,
+-- because the walk reads tuples itself and knows only plain
+-- rewrites. Anything else delegates.
 CREATE OR REPLACE FUNCTION fga._compiled_plan(
   store_id uuid, model_id uuid
 )
@@ -1245,15 +1926,14 @@ AS $$
   ),
   own AS (
     SELECT rel.type_name, rel.relation_name, CASE
-      WHEN rel.needs_check THEN 'intersection or exclusion'
       WHEN EXISTS (
-        SELECT FROM node nd JOIN restriction tr
-          ON tr.type_name = nd.type_name
-         AND tr.relation_name = nd.relation_name
+        SELECT FROM node nd
         WHERE nd.type_name = rel.type_name
           AND nd.relation_name = rel.relation_name
-          AND nd.n ? 'this' AND tr.condition_name <> ''
-      ) THEN 'conditioned grant'
+          AND NOT (nd.n ?| ARRAY['this', 'union', 'intersection',
+                                 'difference', 'computed_userset',
+                                 'tuple_to_userset'])
+      ) THEN 'unsupported rewrite'
       WHEN EXISTS (
         SELECT FROM node nd JOIN restriction tr
           ON tr.type_name = nd.type_name
@@ -1264,15 +1944,25 @@ AS $$
           AND (tr.condition_name <> '' OR tr.is_wildcard
                OR tr.subject_relation <> '')
       ) THEN 'conditioned or indirect tupleset'
-      WHEN EXISTS (
-        SELECT FROM node nd
-        WHERE nd.type_name = rel.type_name
-          AND nd.relation_name = rel.relation_name
-          AND NOT (nd.n ?| ARRAY['this', 'union', 'computed_userset',
-                                 'tuple_to_userset'])
-      ) THEN 'unsupported rewrite'
-    END AS reason
+      WHEN cond.userset THEN 'conditioned userset grant'
+      WHEN cond.direct AND rel.needs_check
+      THEN 'conditioned grant in a set operation'
+    END AS generic,
+    CASE WHEN rel.needs_check THEN 'intersection or exclusion'
+         WHEN cond.direct THEN 'conditioned grant' END AS kind
     FROM rel
+    CROSS JOIN LATERAL (
+      SELECT coalesce(bool_or(tr.subject_relation = ''), false)
+               AS direct,
+             coalesce(bool_or(tr.subject_relation <> ''), false)
+               AS userset
+      FROM node nd JOIN restriction tr
+        ON tr.type_name = nd.type_name
+       AND tr.relation_name = nd.relation_name
+      WHERE nd.type_name = rel.type_name
+        AND nd.relation_name = rel.relation_name
+        AND nd.n ? 'this' AND tr.condition_name <> ''
+    ) AS cond
   ),
   reach AS (
     SELECT e.type_name, e.relation_name, e.to_type, e.to_relation
@@ -1283,38 +1973,64 @@ AS $$
     JOIN edge e
       ON e.type_name = x.to_type AND e.relation_name = x.to_relation
   ),
-  bad AS (
-    SELECT o.type_name, o.relation_name, coalesce(o.reason, CASE
-      WHEN EXISTS (
-        SELECT FROM reach x
+  -- Relations on a cycle of the relation graph.
+  cyclic AS (
+    SELECT x.type_name, x.relation_name FROM reach x
+    WHERE x.to_type = x.type_name AND x.to_relation = x.relation_name
+  ),
+  -- Per relation: the first thing it is, or reaches, that only the
+  -- generic resolver answers; the first set operation or conditioned
+  -- relation it reaches (the recursive walk handles neither); the
+  -- first conditioned relation it reaches (it may raise); and whether
+  -- it is on, or reaches, a cycle.
+  facts AS (
+    SELECT o.type_name, o.relation_name, o.kind,
+      coalesce(o.generic, (
+        SELECT 'reaches ' || x.to_type || '#' || x.to_relation
+               || ' (' || oo.generic || ')'
+        FROM reach x JOIN own oo
+          ON oo.type_name = x.to_type
+         AND oo.relation_name = x.to_relation
         WHERE x.type_name = o.type_name
           AND x.relation_name = o.relation_name
-          AND x.to_type = o.type_name
-          AND x.to_relation = o.relation_name)
-      THEN 'recursive: on a cycle of the relation graph'
-    END) AS reason
+          AND oo.generic IS NOT NULL
+        ORDER BY 1 LIMIT 1)) AS generic,
+      (SELECT 'reaches ' || x.to_type || '#' || x.to_relation
+              || ' (' || oo.kind || ')'
+       FROM reach x JOIN own oo
+         ON oo.type_name = x.to_type
+        AND oo.relation_name = x.to_relation
+       WHERE x.type_name = o.type_name
+         AND x.relation_name = o.relation_name
+         AND oo.kind IS NOT NULL
+       ORDER BY 1 LIMIT 1) AS reaches_kind,
+      (SELECT 'reaches ' || x.to_type || '#' || x.to_relation
+              || ' (' || oo.kind || ')'
+       FROM reach x JOIN own oo
+         ON oo.type_name = x.to_type
+        AND oo.relation_name = x.to_relation
+       WHERE x.type_name = o.type_name
+         AND x.relation_name = o.relation_name
+         AND oo.kind = 'conditioned grant'
+       ORDER BY 1 LIMIT 1) AS reaches_cond,
+      EXISTS (
+        SELECT FROM cyclic c
+        WHERE (c.type_name, c.relation_name)
+                = (o.type_name, o.relation_name)
+           OR EXISTS (
+             SELECT FROM reach x
+             WHERE x.type_name = o.type_name
+               AND x.relation_name = o.relation_name
+               AND x.to_type = c.type_name
+               AND x.to_relation = c.relation_name)) AS cycles
     FROM own o
   ),
-  verdict AS (
-    SELECT b.type_name, b.relation_name, coalesce(b.reason, (
-      SELECT 'reaches ' || x.to_type || '#' || x.to_relation
-             || ' (' || bb.reason || ')'
-      FROM reach x
-      JOIN bad bb
-        ON bb.type_name = x.to_type
-       AND bb.relation_name = x.to_relation
-      WHERE x.type_name = b.type_name
-        AND x.relation_name = b.relation_name
-        AND bb.reason IS NOT NULL
-      ORDER BY 1 LIMIT 1)) AS reason
-    FROM bad b
-  ),
-  -- Paths from every compilable relation; they reach no cycle, so
-  -- the walk ends. hops is the dispatch depth, len the call depth.
+  -- Paths from every relation reaching no cycle, so the walk ends.
+  -- hops is the dispatch depth, len the call depth.
   walk AS (
-    SELECT v.type_name AS root_type, v.relation_name AS root_relation,
-           v.type_name, v.relation_name, 0 AS hops, 0 AS len
-    FROM verdict v WHERE v.reason IS NULL
+    SELECT f.type_name AS root_type, f.relation_name AS root_relation,
+           f.type_name, f.relation_name, 0 AS hops, 0 AS len
+    FROM facts f WHERE NOT f.cycles
     UNION
     SELECT w.root_type, w.root_relation, e.to_type, e.to_relation,
            w.hops + e.hop, w.len + 1
@@ -1328,33 +2044,31 @@ AS $$
     SELECT w.root_type, w.root_relation,
            max(w.hops) AS hops, max(w.len) AS len
     FROM walk w GROUP BY 1, 2
+  ),
+  verdict AS (
+    SELECT f.type_name, f.relation_name, d.len, CASE
+      WHEN f.generic IS NOT NULL THEN f.generic
+      WHEN NOT f.cycles AND d.hops < 24 THEN f.reaches_cond
+      WHEN f.kind IS NOT NULL THEN f.kind || CASE WHEN f.cycles
+        THEN ' on or reaching a cycle of the relation graph'
+        ELSE ' with a dispatch depth that may reach the resolution '
+             'limit' END
+      ELSE f.reaches_kind
+    END AS reason,
+    f.kind, NOT f.cycles AND d.hops < 24 AS flat
+    FROM facts f
+    LEFT JOIN depth d
+      ON d.root_type = f.type_name AND d.root_relation = f.relation_name
   )
-  SELECT v.type_name, v.relation_name, k.strategy,
-    CASE WHEN k.strategy = 'delegated' THEN b.reason END,
-    CASE WHEN k.strategy = 'flattened' THEN 1 + d.len ELSE 0 END
-  FROM verdict v
-  LEFT JOIN depth d
-    ON d.root_type = v.type_name AND d.root_relation = v.relation_name
-  -- What only the generic resolver answers, in the relation or in
-  -- anything it reaches. A cycle or a deep chain is not on this
-  -- list: the recursive strategy takes those.
-  CROSS JOIN LATERAL (SELECT coalesce((
-      SELECT o.reason FROM own o
-      WHERE o.type_name = v.type_name
-        AND o.relation_name = v.relation_name), (
-      SELECT 'reaches ' || x.to_type || '#' || x.to_relation
-             || ' (' || o.reason || ')'
-      FROM reach x
-      JOIN own o
-        ON o.type_name = x.to_type AND o.relation_name = x.to_relation
-      WHERE x.type_name = v.type_name
-        AND x.relation_name = v.relation_name
-        AND o.reason IS NOT NULL
-      ORDER BY 1 LIMIT 1)) AS reason) AS b
-  CROSS JOIN LATERAL (SELECT CASE
-    WHEN v.reason IS NULL AND d.hops < 24 THEN 'flattened'
-    WHEN b.reason IS NULL THEN 'recursive'
-    ELSE 'delegated' END AS strategy) AS k;
+  SELECT v.type_name, v.relation_name,
+    CASE WHEN v.reason IS NOT NULL THEN 'delegated'
+         WHEN NOT v.flat THEN 'recursive'
+         WHEN v.kind = 'intersection or exclusion' THEN 'setop'
+         WHEN v.kind = 'conditioned grant' THEN 'conditioned'
+         ELSE 'flattened' END,
+    v.reason,
+    CASE WHEN v.reason IS NULL AND v.flat THEN 1 + v.len ELSE 0 END
+  FROM verdict v;
 $$;
 
 -- The note a relation's registry reason carries when its
@@ -1463,7 +2177,11 @@ AS $$
   CROSS JOIN LATERAL (
     SELECT * FROM fga._compiled_emit_flattened(store_id, model_id,
       target, p.type_name, p.relation_name)
-    WHERE p.strategy = 'flattened'
+    WHERE p.strategy IN ('flattened', 'conditioned')
+    UNION ALL
+    SELECT * FROM fga._compiled_emit_setop(store_id, model_id,
+      target, p.type_name, p.relation_name)
+    WHERE p.strategy = 'setop'
     UNION ALL
     SELECT * FROM fga._compiled_emit_recursive(store_id, model_id,
       target, p.type_name, p.relation_name)
