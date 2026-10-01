@@ -475,13 +475,24 @@ DECLARE
   grp_key text;
   grp_err text;
   grp_valid boolean := false;
+  -- The parent types that define the computed relation, read once
+  -- rather than once per linked parent.
+  defining text[] := ARRAY(
+    SELECT mr.type_name FROM fga.model_relation mr
+    WHERE mr.store = store_id
+      AND mr.model_id = _check_ttu.model_id
+      AND mr.relation_name = computed);
 BEGIN
   -- Condition errors on tupleset tuples follow the same
   -- per-edge filtered-iterator rule as usersets (see
-  -- _check_direct), grouped by the parent's type.
+  -- _check_direct), grouped by the parent's type. A parent of a
+  -- type lacking the computed relation is skipped before its
+  -- condition evaluates; a whole group shares one type, so it is
+  -- skipped whole and leaves no held error behind.
   FOR u IN
     SELECT * FROM fga._read_tupleset(
       store_id, model_id, ot, oid, tupleset_rel, ctx)
+    WHERE subject_type = ANY (defining)
     ORDER BY subject_type
   LOOP
     IF grp_key IS DISTINCT FROM u.subject_type THEN
@@ -491,15 +502,6 @@ BEGIN
       grp_key := u.subject_type;
       grp_err := NULL;
       grp_valid := false;
-    END IF;
-    IF NOT EXISTS (
-      SELECT FROM fga.model_relation mr
-      WHERE mr.store = store_id
-        AND mr.model_id = _check_ttu.model_id
-        AND mr.type_name = u.subject_type
-        AND mr.relation_name = computed
-    ) THEN
-      CONTINUE;
     END IF;
     IF coalesce(u.condition_name, '') <> '' THEN
       SELECT * INTO ev FROM fga._eval_condition(
