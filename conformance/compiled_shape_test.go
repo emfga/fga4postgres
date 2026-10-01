@@ -1,0 +1,260 @@
+package conformance
+
+import (
+	"context"
+	"fmt"
+	"regexp"
+	"strings"
+	"testing"
+
+	"github.com/emfga/fga4postgres/internal/testdb"
+)
+
+// flatDSL compiles entirely to the flattened strategy: direct
+// grants, a wildcard, a userset restriction, computed usersets and
+// a tuple-to-userset edge, with no cycle and no set operation.
+const flatDSL = `model
+  schema 1.1
+type user
+type group
+  relations
+    define member: [user]
+type folder
+  relations
+    define owner: [user]
+    define viewer: [user, user:*, group#member] or owner
+type doc
+  relations
+    define parent: [folder]
+    define owner: [user]
+    define editor: [user] or owner
+    define viewer: [user, group#member] or editor or viewer from parent
+`
+
+// compiledFn is one registered function: its kind, its qualified
+// name for calling, and its catalog row.
+type compiledFn struct {
+	typeName, relation, kind, strategy string
+	call                               string
+	oid                                uint32
+}
+
+func registeredFns(t testing.TB, storeID string) []compiledFn {
+	t.Helper()
+	rows, err := testdb.Pool(t).Query(context.Background(), `
+		SELECT r.type_name, r.relation_name, k.kind, r.strategy,
+		       format('%I.%I', n.nspname, p.proname), p.oid::int8
+		FROM fga.compiled_relation r
+		CROSS JOIN LATERAL (VALUES
+		  ('objects', r.objects_fn), ('subjects', r.subjects_fn),
+		  ('check', r.check_fn)) AS k(kind, fn)
+		JOIN pg_proc p ON p.oid = k.fn
+		JOIN pg_namespace n ON n.oid = p.pronamespace
+		WHERE r.store = $1
+		ORDER BY 1, 2, 3`, storeID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var out []compiledFn
+	for rows.Next() {
+		var f compiledFn
+		var oid int64
+		if err := rows.Scan(&f.typeName, &f.relation, &f.kind,
+			&f.strategy, &f.call, &oid); err != nil {
+			t.Fatal(err)
+		}
+		f.oid = uint32(oid)
+		out = append(out, f)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	return out
+}
+
+// namingModel holds every naming case of decision 11: a plain
+// pair, two pairs that meet at "a__b__c" when joined, a 254-byte
+// type name, and a name that is not a plain identifier.
+func namingModel() string {
+	long := strings.Repeat("l", 254)
+	td := func(typ, rel string) string {
+		return fmt.Sprintf(`{"type": %q, "relations": {%q: {"this": {}}},
+		  "metadata": {"relations": {%q: {
+		    "directly_related_user_types": [{"type": "user"}]}}}}`,
+			typ, rel, rel)
+	}
+	return `{"schema_version": "1.1", "type_definitions": [
+	  {"type": "user"},` +
+		td("doc", "viewer") + "," +
+		td("a__b", "c") + "," +
+		td("a", "b__c") + "," +
+		td(long, "viewer") + "," +
+		td("Doc-Type", "can_view") + `]}`
+}
+
+func TestCompiledNaming(t *testing.T) {
+	ctx := context.Background()
+	pool := testdb.Pool(t)
+	client := compiledEngine(t)
+	storeID, _ := setup(t, client, "model\n  schema 1.1\ntype user\n",
+		nil)
+	t.Cleanup(func() { _ = client.DeleteStore(ctx, storeID) })
+	enableCompiled(t, storeID, compiledSchema(t))
+	_, err := pool.Exec(ctx,
+		"SELECT fga.write_authorization_model($1, $2)",
+		storeID, namingModel())
+	if err != nil {
+		t.Fatalf("write model: %v", err)
+	}
+
+	fns := registeredFns(t, storeID)
+	if len(fns) != 15 {
+		t.Fatalf("registered functions = %d, want 15", len(fns))
+	}
+	hashed := regexp.MustCompile(
+		`_[0-9a-f]{8}_(objects|subjects|check)$`)
+	seen := map[string]string{}
+	for _, f := range fns {
+		name := f.call[strings.Index(f.call, ".")+1:]
+		name = strings.Trim(name, `"`)
+		key := f.typeName + "#" + f.relation + "/" + f.kind
+		if prev, dup := seen[name]; dup {
+			t.Errorf("%s and %s share the name %s", prev, key, name)
+		}
+		seen[name] = key
+		if len(name) > 63 {
+			t.Errorf("%s: name %q is %d bytes", key, name, len(name))
+		}
+		if f.typeName == "doc" {
+			want := "doc__viewer__" + f.kind
+			if name != want {
+				t.Errorf("%s: name %q, want %q", key, name, want)
+			}
+			continue
+		}
+		if !hashed.MatchString(name) ||
+			!strings.HasSuffix(name, "_"+f.kind) {
+			t.Errorf("%s: name %q lacks the hash suffix", key, name)
+		}
+	}
+}
+
+func TestCompiledComment(t *testing.T) {
+	ctx := context.Background()
+	pool := testdb.Pool(t)
+	client := compiledEngine(t)
+	storeID, _ := setup(t, client, "model\n  schema 1.1\ntype user\n",
+		nil)
+	t.Cleanup(func() { _ = client.DeleteStore(ctx, storeID) })
+	enableCompiled(t, storeID, compiledSchema(t))
+	var modelID string
+	err := pool.QueryRow(ctx,
+		"SELECT fga.write_authorization_model($1, $2) "+
+			"->> 'authorization_model_id'",
+		storeID, namingModel()).Scan(&modelID)
+	if err != nil {
+		t.Fatalf("write model: %v", err)
+	}
+
+	for _, f := range registeredFns(t, storeID) {
+		var comment string
+		err := pool.QueryRow(ctx,
+			"SELECT coalesce(obj_description($1, 'pg_proc'), '')",
+			f.oid).Scan(&comment)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, want := range []string{
+			"type: " + f.typeName + ";",
+			"relation: " + f.relation + ";",
+			"kind: " + f.kind + ";",
+			"store: " + storeID + ";",
+			"model id: " + modelID + ";",
+			"strategy: " + f.strategy,
+			"generated by fga4postgres",
+			"do not edit",
+		} {
+			if !strings.Contains(comment, want) {
+				t.Errorf("%s#%s/%s: comment %q lacks %q",
+					f.typeName, f.relation, f.kind, comment, want)
+			}
+		}
+	}
+}
+
+// Every generated function has the shape PostgreSQL inlines, and a
+// flattened __objects / __subjects called in FROM actually inlines:
+// its plan has no Function Scan left.
+func TestCompiledInlinable(t *testing.T) {
+	ctx := context.Background()
+	pool := testdb.Pool(t)
+	client := compiledEngine(t)
+	storeID, _ := setup(t, client, flatDSL, nil)
+	t.Cleanup(func() { _ = client.DeleteStore(ctx, storeID) })
+	enableCompiled(t, storeID, compiledSchema(t))
+
+	fns := registeredFns(t, storeID)
+	if len(fns) != 3*7 {
+		t.Fatalf("registered functions = %d, want 21", len(fns))
+	}
+	const anyID = "0199a0a0-0000-7000-8000-000000000001"
+	for _, f := range fns {
+		key := f.typeName + "#" + f.relation + "/" + f.kind
+		if f.strategy != "flattened" {
+			t.Errorf("%s: strategy %s, want flattened", key,
+				f.strategy)
+		}
+		var config, secdef, sqlLang bool
+		var volatility string
+		err := pool.QueryRow(ctx, `
+			SELECT p.proconfig IS NOT NULL, p.prosecdef,
+			       p.provolatile::text, l.lanname = 'sql'
+			FROM pg_proc p JOIN pg_language l ON l.oid = p.prolang
+			WHERE p.oid = $1`, f.oid).Scan(
+			&config, &secdef, &volatility, &sqlLang)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if config || secdef || volatility != "s" || !sqlLang {
+			t.Errorf("%s: proconfig set=%v secdef=%v volatile=%s "+
+				"sql=%v, want unset/false/s/true",
+				key, config, secdef, volatility, sqlLang)
+		}
+
+		var call string
+		switch f.kind {
+		case "objects":
+			call = fmt.Sprintf("SELECT x FROM %s('user', '%s') x",
+				f.call, anyID)
+		case "subjects":
+			call = fmt.Sprintf("SELECT x FROM %s('%s', 'user') x",
+				f.call, anyID)
+		default:
+			continue
+		}
+		plan := explain(t, call)
+		if strings.Contains(plan, "Function Scan") {
+			t.Errorf("%s: not inlined:\n%s", key, plan)
+		}
+	}
+}
+
+func explain(t testing.TB, query string) string {
+	t.Helper()
+	rows, err := testdb.Pool(t).Query(context.Background(),
+		"EXPLAIN (COSTS OFF) "+query)
+	if err != nil {
+		t.Fatalf("explain %s: %v", query, err)
+	}
+	defer rows.Close()
+	var b strings.Builder
+	for rows.Next() {
+		var line string
+		if err := rows.Scan(&line); err != nil {
+			t.Fatal(err)
+		}
+		b.WriteString(line + "\n")
+	}
+	return b.String()
+}

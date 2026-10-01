@@ -10,6 +10,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	openfgav1 "github.com/openfga/api/proto/openfga/v1"
 	parser "github.com/openfga/language/pkg/go/transformer"
+	"google.golang.org/protobuf/encoding/protojson"
 
 	"github.com/emfga/fga4postgres/internal/sqlclient"
 	"github.com/emfga/fga4postgres/internal/testdb"
@@ -27,6 +28,17 @@ func compiledSchema(t testing.TB) string {
 	name := fmt.Sprintf("fgac_%016x", h.Sum64())
 	pool := testdb.Pool(t)
 	ctx := context.Background()
+	// A run that died mid-test can leave its opt-in behind.
+	for _, stmt := range []string{
+		`DELETE FROM fga.compiled_relation WHERE store IN (
+		  SELECT store FROM fga.compiled_store
+		  WHERE target_schema = $1)`,
+		`DELETE FROM fga.compiled_store WHERE target_schema = $1`,
+	} {
+		if _, err := pool.Exec(ctx, stmt, name); err != nil {
+			t.Fatal(err)
+		}
+	}
 	_, err := pool.Exec(ctx,
 		"DROP SCHEMA IF EXISTS "+name+" CASCADE; "+
 			"CREATE SCHEMA "+name)
@@ -108,4 +120,19 @@ func setupModel(
 		t.Fatalf("write model: %v", err)
 	}
 	return storeID, wm.GetAuthorizationModelId()
+}
+
+// modelJSON converts a DSL model into the engine's request JSON.
+func modelJSON(t testing.TB, dsl string) string {
+	t.Helper()
+	model, err := parser.TransformDSLToProto(dsl)
+	if err != nil {
+		t.Fatalf("bad DSL: %v", err)
+	}
+	b, err := protojson.MarshalOptions{UseProtoNames: true}.
+		Marshal(model)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(b)
 }
