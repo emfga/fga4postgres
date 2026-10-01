@@ -16,10 +16,17 @@ CREATE OR REPLACE FUNCTION fga.streamed_list_objects(
   request jsonb
 )
 RETURNS SETOF jsonb
-LANGUAGE sql
+LANGUAGE plpgsql
 STABLE PARALLEL SAFE
 SET search_path = fga, pg_temp
 AS $$
-  SELECT jsonb_build_object('object', o)
-  FROM unnest(fga._list_objects(store_id, request, 0)) AS o;
+DECLARE
+  -- The search is held in a variable, not written as unnest()'s
+  -- argument: unnest's row estimate evaluates a stable argument while
+  -- the statement is planned, which ran the whole search twice.
+  objects text[] := fga._list_objects(store_id, request, 0);
+BEGIN
+  RETURN QUERY
+  SELECT jsonb_build_object('object', o) FROM unnest(objects) AS o;
+END;
 $$;

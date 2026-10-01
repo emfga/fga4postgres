@@ -285,3 +285,27 @@ func TestListMaxResultsSetting(t *testing.T) {
 		}
 	}
 }
+
+// streamed_list_objects searches once per call. Its result feeds
+// unnest(), whose row estimate evaluates a stable argument while the
+// statement is planned, so a search written inline as that argument
+// ran twice: once for the planner, once for the answer.
+func TestStreamedListObjectsSearchesOnce(t *testing.T) {
+	s := newCostStore(t, `model
+  schema 1.1
+type user
+type doc
+  relations
+    define viewer: [user]`,
+		[]*openfgav1.TupleKey{tk("doc:d1", "viewer", "user:anne")})
+	req := jsonArg(t, map[string]any{
+		"type": "doc", "relation": "viewer",
+		"user": s.user("user", "anne"),
+	})
+	calls := callCounts(t,
+		"SELECT * FROM fga.streamed_list_objects($1, $2)", s.id, req)
+	if got := calls["fga._list_objects"]; got != 1 {
+		t.Errorf("fga._list_objects calls = %d, want 1 (all: %v)",
+			got, calls)
+	}
+}
