@@ -85,10 +85,12 @@ func flatAnswers(
 	return out
 }
 
-// Generated bodies run under the caller's search_path, because a
-// SET clause would stop them inlining. A schema ahead of
-// pg_catalog holding a table named tuple and an always-true
-// uuid = uuid operator must not change one answer (decision 21).
+// Generated __objects and __subjects run under the caller's
+// search_path, because a SET clause would stop them inlining; __check
+// sets its own (decision 29), and every body is qualified anyway. A
+// schema ahead of pg_catalog holding a table named tuple and an
+// always-true uuid = uuid operator must not change one answer of any
+// kind (decision 21).
 func TestCompiledSearchPathIndependent(t *testing.T) {
 	ctx := context.Background()
 	client := compiledEngine(t)

@@ -15,11 +15,13 @@
 -- functions the engine owns: cleanup drops exactly what is
 -- registered.
 --
--- Generated functions carry no SET clause (it would block
--- inlining into the caller's query), so their bodies
--- schema-qualify every table, function, type and operator
--- instead. The hand-written functions in this file keep the
--- usual SET search_path.
+-- Generated __objects and __subjects carry no SET clause (it would
+-- block inlining into the caller's query), so every generated body
+-- schema-qualifies every table, function, type and operator
+-- instead. A __check never inlines and keeps SET search_path =
+-- fga, pg_temp (see _compiled_ddl); its body is qualified all the
+-- same. The hand-written functions in this file keep the usual SET
+-- search_path.
 --
 -- Strategies: each relation compiles to its own emitter.
 --   flattened    a UNION of fixed joins over fga.tuple (direct
@@ -411,6 +413,12 @@ $$;
 
 -- The function's definition around a body. LANGUAGE sql, STABLE,
 -- SECURITY INVOKER and no SET clause: the shape PostgreSQL inlines.
+-- A __check never inlines (it is scalar and reads tuples), so it
+-- takes the usual SET search_path: with it the planner of the
+-- calling statement no longer parses the body to find that out, on
+-- every planning — and a plpgsql EXECUTE, as dispatch from
+-- fga.check uses, plans on every call: such a check went from 0.56
+-- to 0.26 ms on a four-level ladder.
 CREATE OR REPLACE FUNCTION fga._compiled_ddl(
   target text, name text, kind text, body text
 )
@@ -421,10 +429,12 @@ SET search_path = fga, pg_temp
 AS $$
   SELECT format(
     'CREATE OR REPLACE FUNCTION %I.%I(%s) RETURNS %s '
-    'LANGUAGE sql STABLE PARALLEL SAFE SECURITY INVOKER AS %L',
+    'LANGUAGE sql STABLE PARALLEL SAFE SECURITY INVOKER %sAS %L',
     target, name, fga._compiled_params(kind),
     CASE kind WHEN 'check' THEN 'pg_catalog.bool'
               ELSE 'SETOF pg_catalog.uuid' END,
+    CASE kind WHEN 'check' THEN 'SET search_path = fga, pg_temp '
+              ELSE '' END,
     body);
 $$;
 
@@ -1150,31 +1160,11 @@ AS $$
       ' OPERATOR(pg_catalog.=) ', type_name, relation_name);
 $$;
 
--- The statement a body that cannot be inlined starts with, so the
--- planner gives up inlining it before analysing it (see
--- _compiled_assemble).
-CREATE OR REPLACE FUNCTION fga._compiled_no_inline()
-RETURNS text
-LANGUAGE sql
-IMMUTABLE PARALLEL SAFE
-SET search_path = fga, pg_temp
-AS $$
-  SELECT E'SELECT;\n';
-$$;
-
 -- The three bodies around a relation's arms: validation first (it
 -- raises, never filters) in each counterpart's order — contextual
 -- tuples before the subject for the list APIs, after it for check
 -- — then the union of the arms. A check with held condition errors
 -- raises the first of them when no arm grants.
---
--- A check body starts with an empty statement (_compiled_no_inline).
--- PostgreSQL never inlines a check that reads tuples (its EXISTS
--- stops it), but finds that out only after parsing and analysing
--- the body, on every planning of the statement calling it; with two
--- statements it stops after the raw parse. A plpgsql EXECUTE plans
--- its statement on every call (dispatch calls __check that way), and
--- on the tenant bench a check so called went from 0.37 ms to 0.21.
 CREATE OR REPLACE FUNCTION fga._compiled_assemble(
   store_id uuid, model_id uuid,
   objs text[], subs text[], checks text[], check_errs text[],
@@ -1198,9 +1188,9 @@ AS $$
     || (SELECT string_agg(format(
          E'\nUNION\nSELECT a.x FROM (%s) AS a(x)', a), '' ORDER BY i)
         FROM unnest(subs) WITH ORDINALITY AS u(a, i)),
-    format('%sSELECT fga._compiled_sid(p_subject_id, p_any_subject, '
+    format('SELECT fga._compiled_sid(p_subject_id, p_any_subject, '
       'p_subject_relation) IS NOT NULL AND fga._compiled_oid(p_object) '
-      'IS NOT NULL AND %s AND %s', fga._compiled_no_inline(), ctx_check,
+      'IS NOT NULL AND %s AND %s', ctx_check,
       CASE
       WHEN cardinality(check_errs) = 0
       THEN format('(%s)', array_to_string(checks, E'\n  OR '))
@@ -2422,7 +2412,7 @@ BEGIN
 
   risky := '(SELECT pg_catalog.count(*) FROM (SELECT DISTINCT w.t, '
     'w.o, w.r FROM w) AS n) OPERATOR(pg_catalog.>=) 26';
-  check_body := fga._compiled_no_inline() || format(
+  check_body := format(
     E'%s\nSELECT fga._compiled_sid(p_subject_id, p_any_subject, '
     || 'p_subject_relation) IS NOT NULL AND fga._compiled_oid(p_object) '
     'IS NOT NULL AND CASE WHEN NOT %s THEN (%s) '

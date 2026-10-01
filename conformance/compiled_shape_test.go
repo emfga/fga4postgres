@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"regexp"
+	"slices"
 	"strings"
 	"testing"
 
@@ -183,12 +184,51 @@ func TestCompiledComment(t *testing.T) {
 	}
 }
 
-// Every generated function has the shape PostgreSQL inlines, and a
-// flattened __objects / __subjects called in FROM actually inlines:
-// its plan has no Function Scan left.
+// checkSearchPath is the one SET clause a generated __check carries
+// (decision 29): a scalar check never inlines, and without the
+// clause PostgreSQL parses its body on every planning of the
+// statement calling it.
+const checkSearchPath = "search_path=fga, pg_temp"
+
+// fnShape asserts one generated function's catalog shape: LANGUAGE
+// sql, STABLE, SECURITY INVOKER, no SET clause on the set-returning
+// kinds (one would stop them inlining) and exactly checkSearchPath
+// on __check.
+func fnShape(t *testing.T, f compiledFn) {
+	t.Helper()
+	key := f.typeName + "#" + f.relation + "/" + f.kind
+	var config []string
+	var secdef, sqlLang bool
+	var volatility string
+	err := testdb.Pool(t).QueryRow(context.Background(), `
+		SELECT coalesce(p.proconfig, '{}'), p.prosecdef,
+		       p.provolatile::text, l.lanname = 'sql'
+		FROM pg_proc p JOIN pg_language l ON l.oid = p.prolang
+		WHERE p.oid = $1`, f.oid).Scan(
+		&config, &secdef, &volatility, &sqlLang)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{}
+	if f.kind == "check" {
+		want = []string{checkSearchPath}
+	}
+	if !slices.Equal(config, want) {
+		t.Errorf("%s (%s): proconfig %q, want %q",
+			key, f.strategy, config, want)
+	}
+	if secdef || volatility != "s" || !sqlLang {
+		t.Errorf("%s (%s): secdef=%v volatile=%s sql=%v, "+
+			"want false/s/true", key, f.strategy, secdef, volatility,
+			sqlLang)
+	}
+}
+
+// Every generated function has its kind's shape, and a flattened
+// __objects / __subjects called in FROM actually inlines: its plan
+// has no Function Scan left.
 func TestCompiledInlinable(t *testing.T) {
 	ctx := context.Background()
-	pool := testdb.Pool(t)
 	client := compiledEngine(t)
 	storeID, _ := setup(t, client, flatDSL, nil)
 	t.Cleanup(func() { _ = client.DeleteStore(ctx, storeID) })
@@ -205,22 +245,7 @@ func TestCompiledInlinable(t *testing.T) {
 			t.Errorf("%s: strategy %s, want flattened", key,
 				f.strategy)
 		}
-		var config, secdef, sqlLang bool
-		var volatility string
-		err := pool.QueryRow(ctx, `
-			SELECT p.proconfig IS NOT NULL, p.prosecdef,
-			       p.provolatile::text, l.lanname = 'sql'
-			FROM pg_proc p JOIN pg_language l ON l.oid = p.prolang
-			WHERE p.oid = $1`, f.oid).Scan(
-			&config, &secdef, &volatility, &sqlLang)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if config || secdef || volatility != "s" || !sqlLang {
-			t.Errorf("%s: proconfig set=%v secdef=%v volatile=%s "+
-				"sql=%v, want unset/false/s/true",
-				key, config, secdef, volatility, sqlLang)
-		}
+		fnShape(t, f)
 
 		var call string
 		switch f.kind {

@@ -115,11 +115,6 @@ func TestCompiledPlanShape(t *testing.T) {
 			t.Errorf("%s: body calls another generated function",
 				key)
 		}
-		// A check never inlines; a second statement makes the
-		// planner give up before analysing the body.
-		if f.kind == "check" && !strings.HasPrefix(src, "SELECT;\n") {
-			t.Errorf("%s: check body is a single statement", key)
-		}
 	}
 
 	for _, q := range []string{
