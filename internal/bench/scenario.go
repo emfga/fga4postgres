@@ -7,11 +7,13 @@
 package bench
 
 import (
+	"context"
 	"embed"
 	"fmt"
 	"sort"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 //go:embed scenarios/*.json
@@ -87,6 +89,37 @@ var Scenarios = []Scenario{
 	directScenario{},
 	hierarchyScenario{},
 	fanoutScenario{},
+	tenantScenario{},
+}
+
+// variantLister is implemented by a scenario that measures its
+// own case list instead of the standard Variants (tenant: the
+// compiled-relations comparison).
+type variantLister interface{ Variants() []Variant }
+
+// ScenarioVariants is the case list one scenario measures.
+func ScenarioVariants(s Scenario) []Variant {
+	if l, ok := s.(variantLister); ok {
+		return l.Variants()
+	}
+	return Variants
+}
+
+// appTableLoader is implemented by a scenario whose cases read a
+// table of the consumer's own beside fga.tuple. Load calls it
+// with the fixture, so the table lives and dies with the store;
+// it must create the schema and leave the table analyzed.
+type appTableLoader interface {
+	LoadAppTables(ctx context.Context, pool *pgxpool.Pool,
+		schema string, seed uint64, size Size) error
+}
+
+// AppSchema names the schema holding one fixture's consumer
+// tables and, while a compiled case runs, its generated
+// functions. One per scenario and size: the engine allows one
+// opted-in store per schema, and sizes load side by side.
+func AppSchema(s Scenario, size Size) string {
+	return "fga_bench_" + s.Name() + "_" + size.Name
 }
 
 func ScenarioByName(name string) (Scenario, error) {

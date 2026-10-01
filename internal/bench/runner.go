@@ -66,7 +66,16 @@ func Run(
 		return nil, err
 	}
 
-	for _, v := range orderedVariants(cfg.Features) {
+	// A compiled case opts the store in for its own duration; a
+	// run killed mid-case leaves it opted in, and the generic
+	// cases must never measure that. A no-op otherwise.
+	if _, err := pool.Exec(ctx,
+		"SELECT fga.disable_compiled_relations($1)",
+		load.Store); err != nil {
+		return nil, err
+	}
+
+	for _, v := range orderedVariants(s, cfg.Features) {
 		call, cleanup, err := newCase(
 			ctx, pool, s, size, load, cfg.Seed, v)
 		if err != nil {
@@ -91,11 +100,13 @@ func Run(
 	return res, nil
 }
 
-// orderedVariants selects and orders the cases: everything
-// read-only in Variants order, then write, then
+// orderedVariants selects and orders the scenario's cases:
+// everything read-only in list order, then write, then
 // write_authorization_model — the two mutating cases always
 // last.
-func orderedVariants(features map[string]bool) []Variant {
+func orderedVariants(
+	s Scenario, features map[string]bool,
+) []Variant {
 	selected := func(v Variant) bool {
 		if !implemented[v.Feature] {
 			return false
@@ -106,7 +117,7 @@ func orderedVariants(features map[string]bool) []Variant {
 		return features[v.Feature]
 	}
 	var reads, mutating []Variant
-	for _, v := range Variants {
+	for _, v := range ScenarioVariants(s) {
 		if !selected(v) {
 			continue
 		}

@@ -102,9 +102,23 @@ func (g *graph) resolves(obj, rel, user string) bool {
 
 const querySamples = 25
 
+// standardScenarios are the scenarios measuring the standard
+// Variants over the doc-viewer shape the resolver above replays;
+// a scenario with its own case list carries its own rule tests
+// (tenant_test.go).
+func standardScenarios() []Scenario {
+	var out []Scenario
+	for _, s := range Scenarios {
+		if _, own := s.(variantLister); !own {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
 func TestQueryDeterministic(t *testing.T) {
 	for _, s := range Scenarios {
-		for _, v := range Variants {
+		for _, v := range ScenarioVariants(s) {
 			for i := 0; i < querySamples; i++ {
 				a := s.Query(1, size100k, v, i)
 				b := s.Query(1, size100k, v, i)
@@ -118,7 +132,7 @@ func TestQueryDeterministic(t *testing.T) {
 }
 
 func TestCheckSelectionRules(t *testing.T) {
-	for _, s := range Scenarios {
+	for _, s := range standardScenarios() {
 		t.Run(s.Name(), func(t *testing.T) {
 			g := buildGraph(t, s, 1)
 			for i := 0; i < querySamples; i++ {
@@ -144,7 +158,7 @@ func TestCheckSelectionRules(t *testing.T) {
 }
 
 func TestFewManySelectionRules(t *testing.T) {
-	for _, s := range Scenarios {
+	for _, s := range standardScenarios() {
 		t.Run(s.Name(), func(t *testing.T) {
 			g := buildGraph(t, s, 1)
 			for i := 0; i < querySamples; i++ {
@@ -175,7 +189,7 @@ func TestFewManySelectionRules(t *testing.T) {
 // resolving every doc, so the TTU and userset paths count. Few
 // samples: the count walks the whole doc set.
 func TestListObjectsManyReachesMany(t *testing.T) {
-	for _, s := range Scenarios {
+	for _, s := range standardScenarios() {
 		t.Run(s.Name(), func(t *testing.T) {
 			g := buildGraph(t, s, 1)
 			for i := 0; i < 3; i++ {
@@ -228,7 +242,7 @@ func TestVariantCoverage(t *testing.T) {
 		"write_authorization_model:model": true,
 	}
 	for _, s := range Scenarios {
-		for _, v := range Variants {
+		for _, v := range ScenarioVariants(s) {
 			q := s.Query(1, size100k, v, 0)
 			if composed[v.Key()] {
 				if q != (Query{}) {

@@ -354,6 +354,16 @@ func Load(
 			return LoadResult{}, err
 		}
 	}
+	if l, ok := s.(appTableLoader); ok {
+		progress("loading %s/%s consumer tables",
+			s.Name(), size.Name)
+		if err := l.LoadAppTables(ctx, pool,
+			AppSchema(s, size), seed, size); err != nil {
+			return LoadResult{}, err
+		}
+	}
+	// Every compiled page shape needs analyzed fga.tuple
+	// statistics; without them a page of 50 runs 0.6–2.5 s.
 	if _, err := pool.Exec(ctx,
 		"ANALYZE fga.tuple"); err != nil {
 		return LoadResult{}, err

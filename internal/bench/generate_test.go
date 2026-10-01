@@ -120,6 +120,24 @@ func TestApportionment(t *testing.T) {
 			"doc.parent@folder":    hDeepDocs * 400,
 			"doc.viewer@user":      hShallow * hGrants * 400,
 		},
+		"tenant": {
+			// 20 accounts, 5,000 leaves at 100k; 94,590
+			// background grants cycle the seven leaf
+			// relations (13,512 rounds of 7, plus 6).
+			"account.parent@platform":           20,
+			"account.admin@user":                20,
+			"environment.parent@project":        5_000,
+			"environment.admin@user":            13_513,
+			"environment.maintainer@user":       13_513,
+			"environment.writer@user":           13_513,
+			"environment.reader@user":           13_513 + 3*20,
+			"environment.deployer@user":         13_513,
+			"environment.can_view_costs@user":   13_513,
+			"environment.can_read_secrets@user": 13_512,
+			"invoice.parent@account":            200,
+			"platform.admin@user":               tAdmins,
+			"project.parent@account":            100,
+		},
 		"fanout": {
 			// 10 units at 100k.
 			"group.member@groupmember": fLeaves * 10,

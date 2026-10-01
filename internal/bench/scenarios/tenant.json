@@ -1,0 +1,888 @@
+{
+  "schema_version": "1.1",
+  "type_definitions": [
+    {
+      "type": "user"
+    },
+    {
+      "type": "platform",
+      "relations": {
+        "admin": {
+          "this": {}
+        },
+        "support": {
+          "union": {
+            "child": [
+              {
+                "this": {}
+              },
+              {
+                "computed_userset": {
+                  "relation": "admin"
+                }
+              }
+            ]
+          }
+        },
+        "auditor": {
+          "union": {
+            "child": [
+              {
+                "this": {}
+              },
+              {
+                "computed_userset": {
+                  "relation": "support"
+                }
+              }
+            ]
+          }
+        },
+        "billing_admin": {
+          "union": {
+            "child": [
+              {
+                "this": {}
+              },
+              {
+                "computed_userset": {
+                  "relation": "admin"
+                }
+              }
+            ]
+          }
+        },
+        "billing_viewer": {
+          "union": {
+            "child": [
+              {
+                "this": {}
+              },
+              {
+                "computed_userset": {
+                  "relation": "billing_admin"
+                }
+              },
+              {
+                "computed_userset": {
+                  "relation": "auditor"
+                }
+              }
+            ]
+          }
+        }
+      },
+      "metadata": {
+        "relations": {
+          "admin": {
+            "directly_related_user_types": [
+              {
+                "type": "user"
+              }
+            ]
+          },
+          "support": {
+            "directly_related_user_types": [
+              {
+                "type": "user"
+              }
+            ]
+          },
+          "auditor": {
+            "directly_related_user_types": [
+              {
+                "type": "user"
+              }
+            ]
+          },
+          "billing_admin": {
+            "directly_related_user_types": [
+              {
+                "type": "user"
+              }
+            ]
+          },
+          "billing_viewer": {
+            "directly_related_user_types": [
+              {
+                "type": "user"
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "type": "account",
+      "relations": {
+        "parent": {
+          "this": {}
+        },
+        "owner": {
+          "union": {
+            "child": [
+              {
+                "this": {}
+              },
+              {
+                "tuple_to_userset": {
+                  "computed_userset": {
+                    "relation": "admin"
+                  },
+                  "tupleset": {
+                    "relation": "parent"
+                  }
+                }
+              }
+            ]
+          }
+        },
+        "admin": {
+          "union": {
+            "child": [
+              {
+                "this": {}
+              },
+              {
+                "computed_userset": {
+                  "relation": "owner"
+                }
+              }
+            ]
+          }
+        },
+        "maintainer": {
+          "union": {
+            "child": [
+              {
+                "this": {}
+              },
+              {
+                "computed_userset": {
+                  "relation": "admin"
+                }
+              },
+              {
+                "tuple_to_userset": {
+                  "computed_userset": {
+                    "relation": "support"
+                  },
+                  "tupleset": {
+                    "relation": "parent"
+                  }
+                }
+              }
+            ]
+          }
+        },
+        "writer": {
+          "union": {
+            "child": [
+              {
+                "this": {}
+              },
+              {
+                "computed_userset": {
+                  "relation": "maintainer"
+                }
+              }
+            ]
+          }
+        },
+        "reader": {
+          "union": {
+            "child": [
+              {
+                "this": {}
+              },
+              {
+                "computed_userset": {
+                  "relation": "writer"
+                }
+              },
+              {
+                "tuple_to_userset": {
+                  "computed_userset": {
+                    "relation": "auditor"
+                  },
+                  "tupleset": {
+                    "relation": "parent"
+                  }
+                }
+              }
+            ]
+          }
+        },
+        "billing_admin": {
+          "union": {
+            "child": [
+              {
+                "this": {}
+              },
+              {
+                "computed_userset": {
+                  "relation": "owner"
+                }
+              },
+              {
+                "tuple_to_userset": {
+                  "computed_userset": {
+                    "relation": "billing_admin"
+                  },
+                  "tupleset": {
+                    "relation": "parent"
+                  }
+                }
+              }
+            ]
+          }
+        },
+        "billing_viewer": {
+          "union": {
+            "child": [
+              {
+                "this": {}
+              },
+              {
+                "computed_userset": {
+                  "relation": "billing_admin"
+                }
+              },
+              {
+                "tuple_to_userset": {
+                  "computed_userset": {
+                    "relation": "billing_viewer"
+                  },
+                  "tupleset": {
+                    "relation": "parent"
+                  }
+                }
+              }
+            ]
+          }
+        },
+        "member_manager": {
+          "union": {
+            "child": [
+              {
+                "this": {}
+              },
+              {
+                "computed_userset": {
+                  "relation": "admin"
+                }
+              }
+            ]
+          }
+        }
+      },
+      "metadata": {
+        "relations": {
+          "parent": {
+            "directly_related_user_types": [
+              {
+                "type": "platform"
+              }
+            ]
+          },
+          "owner": {
+            "directly_related_user_types": [
+              {
+                "type": "user"
+              }
+            ]
+          },
+          "admin": {
+            "directly_related_user_types": [
+              {
+                "type": "user"
+              }
+            ]
+          },
+          "maintainer": {
+            "directly_related_user_types": [
+              {
+                "type": "user"
+              }
+            ]
+          },
+          "writer": {
+            "directly_related_user_types": [
+              {
+                "type": "user"
+              }
+            ]
+          },
+          "reader": {
+            "directly_related_user_types": [
+              {
+                "type": "user"
+              }
+            ]
+          },
+          "billing_admin": {
+            "directly_related_user_types": [
+              {
+                "type": "user"
+              }
+            ]
+          },
+          "billing_viewer": {
+            "directly_related_user_types": [
+              {
+                "type": "user"
+              }
+            ]
+          },
+          "member_manager": {
+            "directly_related_user_types": [
+              {
+                "type": "user"
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "type": "project",
+      "relations": {
+        "parent": {
+          "this": {}
+        },
+        "admin": {
+          "union": {
+            "child": [
+              {
+                "this": {}
+              },
+              {
+                "tuple_to_userset": {
+                  "computed_userset": {
+                    "relation": "admin"
+                  },
+                  "tupleset": {
+                    "relation": "parent"
+                  }
+                }
+              }
+            ]
+          }
+        },
+        "maintainer": {
+          "union": {
+            "child": [
+              {
+                "this": {}
+              },
+              {
+                "computed_userset": {
+                  "relation": "admin"
+                }
+              },
+              {
+                "tuple_to_userset": {
+                  "computed_userset": {
+                    "relation": "maintainer"
+                  },
+                  "tupleset": {
+                    "relation": "parent"
+                  }
+                }
+              }
+            ]
+          }
+        },
+        "writer": {
+          "union": {
+            "child": [
+              {
+                "this": {}
+              },
+              {
+                "computed_userset": {
+                  "relation": "maintainer"
+                }
+              },
+              {
+                "tuple_to_userset": {
+                  "computed_userset": {
+                    "relation": "writer"
+                  },
+                  "tupleset": {
+                    "relation": "parent"
+                  }
+                }
+              }
+            ]
+          }
+        },
+        "reader": {
+          "union": {
+            "child": [
+              {
+                "this": {}
+              },
+              {
+                "computed_userset": {
+                  "relation": "writer"
+                }
+              },
+              {
+                "tuple_to_userset": {
+                  "computed_userset": {
+                    "relation": "reader"
+                  },
+                  "tupleset": {
+                    "relation": "parent"
+                  }
+                }
+              }
+            ]
+          }
+        },
+        "deployer": {
+          "union": {
+            "child": [
+              {
+                "this": {}
+              },
+              {
+                "computed_userset": {
+                  "relation": "maintainer"
+                }
+              }
+            ]
+          }
+        },
+        "cost_viewer": {
+          "union": {
+            "child": [
+              {
+                "this": {}
+              },
+              {
+                "tuple_to_userset": {
+                  "computed_userset": {
+                    "relation": "billing_viewer"
+                  },
+                  "tupleset": {
+                    "relation": "parent"
+                  }
+                }
+              }
+            ]
+          }
+        },
+        "secret_reader": {
+          "union": {
+            "child": [
+              {
+                "this": {}
+              },
+              {
+                "computed_userset": {
+                  "relation": "admin"
+                }
+              }
+            ]
+          }
+        }
+      },
+      "metadata": {
+        "relations": {
+          "parent": {
+            "directly_related_user_types": [
+              {
+                "type": "account"
+              }
+            ]
+          },
+          "admin": {
+            "directly_related_user_types": [
+              {
+                "type": "user"
+              }
+            ]
+          },
+          "maintainer": {
+            "directly_related_user_types": [
+              {
+                "type": "user"
+              }
+            ]
+          },
+          "writer": {
+            "directly_related_user_types": [
+              {
+                "type": "user"
+              }
+            ]
+          },
+          "reader": {
+            "directly_related_user_types": [
+              {
+                "type": "user"
+              }
+            ]
+          },
+          "deployer": {
+            "directly_related_user_types": [
+              {
+                "type": "user"
+              }
+            ]
+          },
+          "cost_viewer": {
+            "directly_related_user_types": [
+              {
+                "type": "user"
+              }
+            ]
+          },
+          "secret_reader": {
+            "directly_related_user_types": [
+              {
+                "type": "user"
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "type": "environment",
+      "relations": {
+        "parent": {
+          "this": {}
+        },
+        "admin": {
+          "union": {
+            "child": [
+              {
+                "this": {}
+              },
+              {
+                "tuple_to_userset": {
+                  "computed_userset": {
+                    "relation": "admin"
+                  },
+                  "tupleset": {
+                    "relation": "parent"
+                  }
+                }
+              }
+            ]
+          }
+        },
+        "maintainer": {
+          "union": {
+            "child": [
+              {
+                "this": {}
+              },
+              {
+                "computed_userset": {
+                  "relation": "admin"
+                }
+              },
+              {
+                "tuple_to_userset": {
+                  "computed_userset": {
+                    "relation": "maintainer"
+                  },
+                  "tupleset": {
+                    "relation": "parent"
+                  }
+                }
+              }
+            ]
+          }
+        },
+        "writer": {
+          "union": {
+            "child": [
+              {
+                "this": {}
+              },
+              {
+                "computed_userset": {
+                  "relation": "maintainer"
+                }
+              },
+              {
+                "tuple_to_userset": {
+                  "computed_userset": {
+                    "relation": "writer"
+                  },
+                  "tupleset": {
+                    "relation": "parent"
+                  }
+                }
+              }
+            ]
+          }
+        },
+        "reader": {
+          "union": {
+            "child": [
+              {
+                "this": {}
+              },
+              {
+                "computed_userset": {
+                  "relation": "writer"
+                }
+              },
+              {
+                "tuple_to_userset": {
+                  "computed_userset": {
+                    "relation": "reader"
+                  },
+                  "tupleset": {
+                    "relation": "parent"
+                  }
+                }
+              }
+            ]
+          }
+        },
+        "deployer": {
+          "union": {
+            "child": [
+              {
+                "this": {}
+              },
+              {
+                "computed_userset": {
+                  "relation": "maintainer"
+                }
+              },
+              {
+                "tuple_to_userset": {
+                  "computed_userset": {
+                    "relation": "deployer"
+                  },
+                  "tupleset": {
+                    "relation": "parent"
+                  }
+                }
+              }
+            ]
+          }
+        },
+        "can_view": {
+          "computed_userset": {
+            "relation": "reader"
+          }
+        },
+        "can_edit": {
+          "computed_userset": {
+            "relation": "writer"
+          }
+        },
+        "can_deploy": {
+          "computed_userset": {
+            "relation": "deployer"
+          }
+        },
+        "can_delete": {
+          "computed_userset": {
+            "relation": "admin"
+          }
+        },
+        "can_view_costs": {
+          "union": {
+            "child": [
+              {
+                "this": {}
+              },
+              {
+                "computed_userset": {
+                  "relation": "admin"
+                }
+              },
+              {
+                "tuple_to_userset": {
+                  "computed_userset": {
+                    "relation": "cost_viewer"
+                  },
+                  "tupleset": {
+                    "relation": "parent"
+                  }
+                }
+              }
+            ]
+          }
+        },
+        "can_read_secrets": {
+          "union": {
+            "child": [
+              {
+                "this": {}
+              },
+              {
+                "computed_userset": {
+                  "relation": "admin"
+                }
+              },
+              {
+                "tuple_to_userset": {
+                  "computed_userset": {
+                    "relation": "secret_reader"
+                  },
+                  "tupleset": {
+                    "relation": "parent"
+                  }
+                }
+              }
+            ]
+          }
+        }
+      },
+      "metadata": {
+        "relations": {
+          "parent": {
+            "directly_related_user_types": [
+              {
+                "type": "project"
+              }
+            ]
+          },
+          "admin": {
+            "directly_related_user_types": [
+              {
+                "type": "user"
+              }
+            ]
+          },
+          "maintainer": {
+            "directly_related_user_types": [
+              {
+                "type": "user"
+              }
+            ]
+          },
+          "writer": {
+            "directly_related_user_types": [
+              {
+                "type": "user"
+              }
+            ]
+          },
+          "reader": {
+            "directly_related_user_types": [
+              {
+                "type": "user"
+              }
+            ]
+          },
+          "deployer": {
+            "directly_related_user_types": [
+              {
+                "type": "user"
+              }
+            ]
+          },
+          "can_view": {
+            "directly_related_user_types": []
+          },
+          "can_edit": {
+            "directly_related_user_types": []
+          },
+          "can_deploy": {
+            "directly_related_user_types": []
+          },
+          "can_delete": {
+            "directly_related_user_types": []
+          },
+          "can_view_costs": {
+            "directly_related_user_types": [
+              {
+                "type": "user"
+              }
+            ]
+          },
+          "can_read_secrets": {
+            "directly_related_user_types": [
+              {
+                "type": "user"
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "type": "invoice",
+      "relations": {
+        "parent": {
+          "this": {}
+        },
+        "viewer": {
+          "union": {
+            "child": [
+              {
+                "this": {}
+              },
+              {
+                "tuple_to_userset": {
+                  "computed_userset": {
+                    "relation": "billing_viewer"
+                  },
+                  "tupleset": {
+                    "relation": "parent"
+                  }
+                }
+              }
+            ]
+          }
+        },
+        "editor": {
+          "union": {
+            "child": [
+              {
+                "this": {}
+              },
+              {
+                "tuple_to_userset": {
+                  "computed_userset": {
+                    "relation": "billing_admin"
+                  },
+                  "tupleset": {
+                    "relation": "parent"
+                  }
+                }
+              }
+            ]
+          }
+        }
+      },
+      "metadata": {
+        "relations": {
+          "parent": {
+            "directly_related_user_types": [
+              {
+                "type": "account"
+              }
+            ]
+          },
+          "viewer": {
+            "directly_related_user_types": [
+              {
+                "type": "user"
+              }
+            ]
+          },
+          "editor": {
+            "directly_related_user_types": [
+              {
+                "type": "user"
+              }
+            ]
+          }
+        }
+      }
+    }
+  ]
+}

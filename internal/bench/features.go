@@ -27,17 +27,23 @@ var implemented = map[string]bool{
 	"write":                     true,
 	"expand":                    true,
 	"write_authorization_model": true,
+	"compiled_check":            true,
+	"check_opted_in":            true,
+	"compiled_objects":          true,
+	"compiled_page":             true,
 }
 
-// ImplementedFeatures lists the runnable features in Variants
-// order, deduplicated.
+// ImplementedFeatures lists the runnable features in registry
+// order (each scenario's case list in turn), deduplicated.
 func ImplementedFeatures() []string {
 	var out []string
 	seen := map[string]bool{}
-	for _, v := range Variants {
-		if implemented[v.Feature] && !seen[v.Feature] {
-			seen[v.Feature] = true
-			out = append(out, v.Feature)
+	for _, s := range Scenarios {
+		for _, v := range ScenarioVariants(s) {
+			if implemented[v.Feature] && !seen[v.Feature] {
+				seen[v.Feature] = true
+				out = append(out, v.Feature)
+			}
 		}
 	}
 	return out
@@ -73,6 +79,9 @@ func newCase(
 		return writeCase(ctx, pool, s, seed)
 	case "write_authorization_model":
 		return modelWriteCase(ctx, pool, s)
+	case "compiled_check", "check_opted_in",
+		"compiled_objects", "compiled_page":
+		return compiledCase(ctx, pool, s, size, load, seed, v)
 	}
 	return nil, nil, fmt.Errorf(
 		"feature %q is not implemented", v.Feature)
