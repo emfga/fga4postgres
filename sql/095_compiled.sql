@@ -26,6 +26,9 @@
 --              grants, wildcards, usersets, computed usersets,
 --              tuple-to-userset) for relations without cycles,
 --              set operations or conditions;
+--   recursive  a WITH RECURSIVE walk over the tuple graph for
+--              relations on (or reaching) a cycle of the relation
+--              graph, or deep enough to meet check's depth limit;
 --   delegated  same signature, body calls the generic resolver;
 --              used for anything no other emitter answers exactly
 --              (the reason column says why).
@@ -726,6 +729,396 @@ BEGIN
 END;
 $$;
 
+-- The recursive emitter: a walk over the relation's reach in the
+-- tuple graph, for relations on a cycle of the relation graph (same-
+-- type parent chains, nested groups, a#m -> b#m -> a#m), relations
+-- reaching one, and chains deep enough to meet check's depth limit.
+-- One WITH RECURSIVE body per kind covers the whole sub-graph the
+-- relation reaches; its edges are VALUES lists read from the model,
+-- so the body calls no other generated function. That is on
+-- purpose: __check must count every dispatch from its own root, and
+-- a callee's __check would start counting again at zero.
+--
+-- The walk's nodes are (type, object, relation); UNION deduplicates
+-- them, so cyclic data ends the walk.
+--   __objects walks down from the subject, like list_objects, and
+--        charges no depth.
+--   __check walks up from the object, recording each node's dispatch
+--        count d (computed usersets cost nothing). A grant at d <= 25
+--        is check's true: the shortest path to it is simple, and
+--        check's search follows every simple path of up to 25
+--        dispatches. Otherwise check answers false or raises YF102,
+--        and it raises only from a simple path of 25 dispatches whose
+--        last node has a row to dispatch, which needs both a walk row
+--        at d = 26 and 26 distinct nodes (the root and 25 distinct
+--        dispatch targets). Without both, false is exact; with both,
+--        the generic resolver decides, so the error is check's own.
+--   __subjects walks up like __check. list_users refuses as soon as
+--        it enters a node 25 dispatches away, whatever it found
+--        elsewhere: a walk row at d = 25 and 26 distinct nodes hand
+--        the call to the generic path, anything less is exact here.
+CREATE OR REPLACE FUNCTION fga._compiled_emit_recursive(
+  store_id uuid, model_id uuid, target text,
+  type_name text, relation_name text,
+  OUT objects_body text, OUT subjects_body text, OUT check_body text
+)
+LANGUAGE plpgsql
+STABLE PARALLEL SAFE
+SET search_path = fga, pg_temp
+AS $$
+DECLARE
+  mid constant uuid := model_id;
+  root_type constant text := type_name;
+  root_rel constant text := relation_name;
+  eq constant text := ' OPERATOR(pg_catalog.=) ';
+  ne constant text := ' OPERATOR(pg_catalog.<>) ';
+  store_lit constant text := format('%L::pg_catalog.uuid', store_id);
+  nil constant text :=
+    '''00000000-0000-0000-0000-000000000000''::pg_catalog.uuid';
+  uncond constant text := '(g.condition_name IS NULL OR '
+    'g.condition_name OPERATOR(pg_catalog.=) '''')';
+  live constant text :=
+    'fga._compiled_no_ctuples(p_contextual_tuples)';
+  sub text[];
+  direct_v text;
+  userset_v text;
+  computed_v text;
+  ttu_v text;
+  down text[] := '{}';
+  seeds text[] := '{}';
+  grant_at text;
+  walk_check text;
+  walk_subjects text;
+  risky text;
+  subs text[] := '{}';
+  sources jsonb;
+  src text[];
+  d record;
+  r record;
+BEGIN
+  SELECT cs.subject_sources INTO sources
+  FROM fga.compiled_store cs WHERE cs.store = store_id;
+  d := fga._compiled_emit_delegated(
+    store_id, model_id, root_type, root_rel);
+
+  -- The sub-graph: every relation the root reaches, and itself.
+  WITH RECURSIVE e AS MATERIALIZED (
+    SELECT * FROM fga._compiled_edges(store_id, mid)
+  ), s(t, r) AS (
+    SELECT root_type, root_rel
+    UNION
+    SELECT e.to_type, e.to_relation
+    FROM s JOIN e ON e.type_name = s.t AND e.relation_name = s.r
+  )
+  SELECT array_agg(s.t || '#' || s.r) INTO sub FROM s;
+
+  -- Grants that end a path: direct restrictions without a relation.
+  SELECT string_agg(format('(%L::pg_catalog.text, %L::pg_catalog.text, '
+      '%L::pg_catalog.text, %L::pg_catalog.bool)',
+      x.t, x.r, x.st, x.wild), ', ' ORDER BY x.t, x.r, x.st, x.wild)
+  INTO direct_v
+  FROM (
+    SELECT DISTINCT tr.type_name AS t, tr.relation_name AS r,
+           tr.subject_type AS st, tr.is_wildcard AS wild
+    FROM fga.model_type_restriction tr
+    WHERE tr.store = store_id AND tr.model_id = mid
+      AND tr.type_name || '#' || tr.relation_name = ANY (sub)
+      AND tr.subject_relation = ''
+      AND EXISTS (
+        SELECT FROM fga.model_relation mr,
+             fga._rewrite_nodes(mr.rewrite) AS n
+        WHERE mr.store = store_id AND mr.model_id = mid
+          AND mr.type_name = tr.type_name
+          AND mr.relation_name = tr.relation_name AND n ? 'this')
+  ) AS x;
+
+  -- Userset restrictions: a dispatch to the subject's relation.
+  SELECT string_agg(format('(%L::pg_catalog.text, %L::pg_catalog.text, '
+      '%L::pg_catalog.text, %L::pg_catalog.text)',
+      x.t, x.r, x.st, x.sr), ', ' ORDER BY x.t, x.r, x.st, x.sr)
+  INTO userset_v
+  FROM (
+    SELECT DISTINCT tr.type_name AS t, tr.relation_name AS r,
+           tr.subject_type AS st, tr.subject_relation AS sr
+    FROM fga.model_type_restriction tr
+    WHERE tr.store = store_id AND tr.model_id = mid
+      AND tr.type_name || '#' || tr.relation_name = ANY (sub)
+      AND tr.subject_relation <> ''
+      AND EXISTS (
+        SELECT FROM fga.model_relation mr,
+             fga._rewrite_nodes(mr.rewrite) AS n
+        WHERE mr.store = store_id AND mr.model_id = mid
+          AND mr.type_name = tr.type_name
+          AND mr.relation_name = tr.relation_name AND n ? 'this')
+  ) AS x;
+
+  -- Computed usersets: the same object, another relation.
+  SELECT string_agg(format('(%L::pg_catalog.text, %L::pg_catalog.text, '
+      '%L::pg_catalog.text)', x.t, x.r, x.r2), ', '
+      ORDER BY x.t, x.r, x.r2)
+  INTO computed_v
+  FROM (
+    SELECT DISTINCT mr.type_name AS t, mr.relation_name AS r,
+           n -> 'computed_userset' ->> 'relation' AS r2
+    FROM fga.model_relation mr, fga._rewrite_nodes(mr.rewrite) AS n
+    WHERE mr.store = store_id AND mr.model_id = mid
+      AND mr.type_name || '#' || mr.relation_name = ANY (sub)
+      AND n ? 'computed_userset'
+  ) AS x;
+
+  -- Tuple-to-userset: each parent type the tupleset admits that
+  -- defines the computed relation (a parent type without it adds
+  -- nothing, as in check).
+  SELECT string_agg(format('(%L::pg_catalog.text, %L::pg_catalog.text, '
+      '%L::pg_catalog.text, %L::pg_catalog.text, %L::pg_catalog.text)',
+      x.t, x.r, x.ts, x.pt, x.cr), ', '
+      ORDER BY x.t, x.r, x.ts, x.pt, x.cr)
+  INTO ttu_v
+  FROM (
+    SELECT DISTINCT mr.type_name AS t, mr.relation_name AS r,
+      n -> 'tuple_to_userset' -> 'tupleset' ->> 'relation' AS ts,
+      tr.subject_type AS pt,
+      n -> 'tuple_to_userset' -> 'computed_userset' ->> 'relation'
+        AS cr
+    FROM fga.model_relation mr
+    CROSS JOIN LATERAL fga._rewrite_nodes(mr.rewrite) AS n
+    JOIN fga.model_type_restriction tr
+      ON tr.store = store_id AND tr.model_id = mid
+     AND tr.type_name = mr.type_name
+     AND tr.relation_name
+           = n -> 'tuple_to_userset' -> 'tupleset' ->> 'relation'
+    WHERE mr.store = store_id AND mr.model_id = mid
+      AND mr.type_name || '#' || mr.relation_name = ANY (sub)
+      AND n ? 'tuple_to_userset'
+      AND tr.subject_relation = '' AND NOT tr.is_wildcard
+      AND EXISTS (
+        SELECT FROM fga.model_relation p
+        WHERE p.store = store_id AND p.model_id = mid
+          AND p.type_name = tr.subject_type
+          AND p.relation_name = n -> 'tuple_to_userset'
+                -> 'computed_userset' ->> 'relation')
+  ) AS x;
+
+  -- __objects: down from the subject. Seeds are the rows granting
+  -- it directly (a wildcard row grants every subject of its type)
+  -- and, for a userset subject, the subject itself.
+  IF direct_v IS NOT NULL THEN
+    seeds := seeds || format(
+      'SELECT a.t, g.object_id, a.r FROM (VALUES %2$s) AS a(t, r, st, '
+      'wild) JOIN fga.tuple AS g ON g.store%1$s%3$s AND '
+      'g.subject_type%1$sa.st AND g.subject_id%1$sCASE WHEN a.wild '
+      'THEN %4$s ELSE p_subject_id END AND g.subject_relation%1$s'''' '
+      'AND g.relation%1$sa.r AND g.object_type%1$sa.t '
+      'WHERE a.st%1$sp_subject_type AND p_subject_relation%1$s'''' '
+      'AND (a.wild OR NOT p_any_subject) AND %5$s',
+      eq, direct_v, store_lit, nil, uncond);
+  END IF;
+  seeds := seeds || format(
+    'SELECT p_subject_type, p_subject_id, p_subject_relation '
+    'WHERE p_subject_relation%s'''' AND NOT p_any_subject', ne);
+  IF computed_v IS NOT NULL THEN
+    down := down || format(
+      'SELECT c.t, w.o, c.r FROM (VALUES %2$s) AS c(t, r, r2) '
+      'WHERE c.t%1$sw.t AND c.r2%1$sw.r', eq, computed_v);
+  END IF;
+  IF userset_v IS NOT NULL THEN
+    down := down || format(
+      'SELECT u.t, g.object_id, u.r FROM (VALUES %2$s) AS u(t, r, st, '
+      'sr) JOIN fga.tuple AS g ON g.store%1$s%3$s AND '
+      'g.subject_type%1$sw.t AND g.subject_id%1$sw.o AND '
+      'g.subject_relation%1$sw.r AND g.relation%1$su.r AND '
+      'g.object_type%1$su.t WHERE u.st%1$sw.t AND u.sr%1$sw.r AND %4$s',
+      eq, userset_v, store_lit, uncond);
+  END IF;
+  IF ttu_v IS NOT NULL THEN
+    down := down || format(
+      'SELECT p.t, g.object_id, p.r FROM (VALUES %2$s) AS p(t, r, ts, '
+      'pt, cr) JOIN fga.tuple AS g ON g.store%1$s%3$s AND '
+      'g.subject_type%1$sw.t AND g.subject_id%1$sw.o AND '
+      'g.subject_relation%1$s'''' AND g.relation%1$sp.ts AND '
+      'g.object_type%1$sp.t WHERE p.pt%1$sw.t AND p.cr%1$sw.r AND %4$s',
+      eq, ttu_v, store_lit, uncond);
+  END IF;
+  objects_body := format(
+    E'WITH RECURSIVE w(t, o, r) AS (\n%s\nUNION\n'
+    || 'SELECT n.t, n.o, n.r FROM w CROSS JOIN LATERAL (%s) AS n(t, o, r)'
+    || E'\n)\nSELECT NULL::pg_catalog.uuid WHERE fga._compiled_sid('
+    || 'p_subject_id, p_any_subject, p_subject_relation) IS NULL'
+    || E'\nUNION\n%s WHERE NOT %s'
+    || E'\nUNION\nSELECT w.o FROM w WHERE %s AND w.t%s%L AND w.r%s%L',
+    array_to_string(seeds, E'\nUNION\n'),
+    array_to_string(down, ' UNION ALL '),
+    d.objects_body, live, live, eq, root_type, eq, root_rel);
+
+  -- __check and __subjects: up from the object, counting dispatches
+  -- up to a limit one past the counterpart's boundary.
+  walk_check := fga._compiled_walk_up(store_id, root_type, root_rel,
+    computed_v, userset_v, ttu_v, 26);
+  walk_subjects := fga._compiled_walk_up(store_id, root_type,
+    root_rel, computed_v, userset_v, ttu_v, 25);
+
+  -- A grant at node w: w is the subject itself, or a row of w names
+  -- the subject (a wildcard row any subject of its type).
+  grant_at := format('(w.t%1$sp_subject_type AND w.o%1$sp_subject_id '
+    'AND w.r%1$sp_subject_relation AND NOT p_any_subject)', eq);
+  IF direct_v IS NOT NULL THEN
+    grant_at := grant_at || format(
+      ' OR EXISTS (SELECT FROM (VALUES %2$s) AS a(t, r, st, wild) '
+      'JOIN fga.tuple AS g ON g.store%1$s%3$s AND g.object_type%1$sw.t '
+      'AND g.object_id%1$sw.o AND g.relation%1$sw.r AND '
+      'g.subject_type%1$sa.st AND g.subject_id%1$sCASE WHEN a.wild '
+      'THEN %4$s ELSE p_subject_id END AND g.subject_relation%1$s'''' '
+      'WHERE a.t%1$sw.t AND a.r%1$sw.r AND a.st%1$sp_subject_type AND '
+      'p_subject_relation%1$s'''' AND (a.wild OR NOT p_any_subject) '
+      'AND %5$s)', eq, direct_v, store_lit, nil, uncond);
+  END IF;
+  IF userset_v IS NOT NULL THEN
+    grant_at := grant_at || format(
+      ' OR EXISTS (SELECT FROM (VALUES %2$s) AS u(t, r, st, sr) '
+      'JOIN fga.tuple AS g ON g.store%1$s%3$s AND g.object_type%1$sw.t '
+      'AND g.object_id%1$sw.o AND g.relation%1$sw.r AND '
+      'g.subject_type%1$su.st AND g.subject_id%1$sp_subject_id AND '
+      'g.subject_relation%1$su.sr WHERE u.t%1$sw.t AND u.r%1$sw.r AND '
+      'u.st%1$sp_subject_type AND u.sr%1$sp_subject_relation AND NOT '
+      'p_any_subject AND %4$s)', eq, userset_v, store_lit, uncond);
+  END IF;
+
+  risky := '(SELECT pg_catalog.count(*) FROM (SELECT DISTINCT w.t, '
+    'w.o, w.r FROM w) AS n) OPERATOR(pg_catalog.>=) 26';
+  check_body := format(
+    E'%s\nSELECT fga._compiled_sid(p_subject_id, p_any_subject, '
+    || 'p_subject_relation) IS NOT NULL AND fga._compiled_oid(p_object) '
+    'IS NOT NULL AND CASE WHEN NOT %s THEN (%s) '
+    'WHEN EXISTS (SELECT FROM w WHERE w.d OPERATOR(pg_catalog.<=) 25 '
+    'AND (%s)) THEN true '
+    'WHEN EXISTS (SELECT FROM w WHERE w.d OPERATOR(pg_catalog.>=) 26) '
+    'AND %s THEN (%s) ELSE false END',
+    walk_check, live, substr(d.check_body, length('SELECT ') + 1),
+    grant_at, risky, substr(d.check_body, length('SELECT ') + 1));
+
+  -- __subjects: the nodes of the asked userset type themselves,
+  -- plain rows of the asked type, and wildcard rows expanded over
+  -- the registered subject source.
+  subs := subs || format('SELECT w.o FROM w WHERE w.t%1$sp_subject_type '
+    'AND w.r%1$sp_subject_relation', eq);
+  IF direct_v IS NOT NULL THEN
+    subs := subs || format(
+      'SELECT g.subject_id FROM w JOIN (VALUES %2$s) AS a(t, r, st, '
+      'wild) ON a.t%1$sw.t AND a.r%1$sw.r JOIN fga.tuple AS g ON '
+      'g.store%1$s%3$s AND g.object_type%1$sw.t AND g.object_id%1$sw.o '
+      'AND g.relation%1$sw.r AND g.subject_type%1$sa.st AND '
+      'g.subject_relation%1$s'''' WHERE NOT a.wild AND '
+      'a.st%1$sp_subject_type AND p_subject_relation%1$s'''' AND '
+      'g.subject_id%4$s%5$s AND %6$s',
+      eq, direct_v, store_lit, ne, nil, uncond);
+  END IF;
+  FOR r IN
+    SELECT DISTINCT tr.subject_type AS st
+    FROM fga.model_type_restriction tr
+    WHERE tr.store = store_id AND tr.model_id = mid
+      AND tr.type_name || '#' || tr.relation_name = ANY (sub)
+      AND tr.is_wildcard
+    ORDER BY 1
+  LOOP
+    src := fga._compiled_parse_source(sources ->> r.st);
+    IF src IS NOT NULL THEN
+      subs := subs || format(
+        'SELECT s.%2$I FROM %3$I.%4$I AS s WHERE '
+        'p_subject_type%1$s%5$L AND p_subject_relation%1$s'''' AND '
+        'EXISTS (SELECT FROM w JOIN (VALUES %6$s) AS a(t, r, st, wild) '
+        'ON a.t%1$sw.t AND a.r%1$sw.r JOIN fga.tuple AS g ON '
+        'g.store%1$s%7$s AND g.object_type%1$sw.t AND '
+        'g.object_id%1$sw.o AND g.relation%1$sw.r AND '
+        'g.subject_type%1$sa.st AND g.subject_id%1$s%8$s AND '
+        'g.subject_relation%1$s'''' WHERE a.wild AND a.st%1$s%5$L AND '
+        '%9$s)', eq, src[3], src[1], src[2], r.st, direct_v,
+        store_lit, nil, uncond);
+    ELSE
+      subs := subs || format(
+        'SELECT g.subject_id FROM w JOIN (VALUES %2$s) AS a(t, r, st, '
+        'wild) ON a.t%1$sw.t AND a.r%1$sw.r JOIN fga.tuple AS g ON '
+        'g.store%1$s%3$s AND g.object_type%1$sw.t AND '
+        'g.object_id%1$sw.o AND g.relation%1$sw.r AND '
+        'g.subject_type%1$sa.st AND g.subject_id%1$s%4$s AND '
+        'g.subject_relation%1$s'''' WHERE a.wild AND a.st%1$s%5$L AND '
+        'p_subject_type%1$s%5$L AND p_subject_relation%1$s'''' AND %6$s '
+        'AND fga._compiled_no_source(%5$L, g.ulid)',
+        eq, direct_v, store_lit, nil, r.st, uncond);
+    END IF;
+  END LOOP;
+
+  risky := format('(EXISTS (SELECT FROM w WHERE w.d '
+    'OPERATOR(pg_catalog.>=) 25) AND %s)', risky);
+  subjects_body := format(
+    E'%s\nSELECT NULL::pg_catalog.uuid WHERE '
+    || 'fga._compiled_oid(p_object) IS NULL'
+    || E'\nUNION\n%s WHERE NOT %s OR %s', walk_subjects,
+    d.subjects_body, live, risky)
+    || (SELECT string_agg(format(
+         E'\nUNION\nSELECT a.x FROM (%s) AS a(x) WHERE %s AND NOT %s',
+         a, live, risky), '' ORDER BY i)
+        FROM unnest(subs) WITH ORDINALITY AS u(a, i));
+END;
+$$;
+
+-- The upward walk shared by __check and __subjects: a WITH RECURSIVE
+-- named w(t, o, r, d) from the generated function's p_object, where
+-- d counts dispatches; a node at the limit dispatches no further,
+-- which ends the walk on cyclic data too.
+CREATE OR REPLACE FUNCTION fga._compiled_walk_up(
+  store_id uuid, root_type text, root_rel text,
+  computed_v text, userset_v text, ttu_v text, depth_limit integer
+)
+RETURNS text
+LANGUAGE plpgsql
+IMMUTABLE PARALLEL SAFE
+SET search_path = fga, pg_temp
+AS $$
+DECLARE
+  eq constant text := ' OPERATOR(pg_catalog.=) ';
+  store_lit constant text := format('%L::pg_catalog.uuid', store_id);
+  next_d constant text := 'w.d OPERATOR(pg_catalog.+) 1';
+  below constant text := format('w.d OPERATOR(pg_catalog.<) %s',
+    depth_limit);
+  uncond constant text := '(g.condition_name IS NULL OR '
+    'g.condition_name OPERATOR(pg_catalog.=) '''')';
+  up text[] := '{}';
+BEGIN
+  IF computed_v IS NOT NULL THEN
+    up := up || format(
+      'SELECT w.t, w.o, c.r2, w.d FROM (VALUES %2$s) AS c(t, r, r2) '
+      'WHERE c.t%1$sw.t AND c.r%1$sw.r', eq, computed_v);
+  END IF;
+  IF userset_v IS NOT NULL THEN
+    up := up || format(
+      'SELECT g.subject_type, g.subject_id, g.subject_relation, %5$s '
+      'FROM (VALUES %2$s) AS u(t, r, st, sr) JOIN fga.tuple AS g ON '
+      'g.store%1$s%3$s AND g.object_type%1$sw.t AND g.object_id%1$sw.o '
+      'AND g.relation%1$sw.r AND g.subject_type%1$su.st AND '
+      'g.subject_relation%1$su.sr WHERE u.t%1$sw.t AND u.r%1$sw.r AND '
+      '%6$s AND %4$s', eq, userset_v, store_lit, uncond, next_d, below);
+  END IF;
+  IF ttu_v IS NOT NULL THEN
+    up := up || format(
+      'SELECT p.pt, g.subject_id, p.cr, %5$s FROM (VALUES %2$s) AS '
+      'p(t, r, ts, pt, cr) JOIN fga.tuple AS g ON g.store%1$s%3$s AND '
+      'g.object_type%1$sw.t AND g.object_id%1$sw.o AND '
+      'g.relation%1$sp.ts AND g.subject_type%1$sp.pt AND '
+      'g.subject_relation%1$s'''' AND g.subject_id '
+      'OPERATOR(pg_catalog.<>) '
+      '''00000000-0000-0000-0000-000000000000''::pg_catalog.uuid '
+      'WHERE p.t%1$sw.t AND p.r%1$sw.r AND %6$s AND %4$s',
+      eq, ttu_v, store_lit, uncond, next_d, below);
+  END IF;
+  RETURN format(
+    E'WITH RECURSIVE w(t, o, r, d) AS (\nSELECT %L::pg_catalog.text, '
+    || E'p_object, %L::pg_catalog.text, 0\nUNION\n'
+    'SELECT n.t, n.o, n.r, n.d FROM w CROSS JOIN LATERAL (%s) '
+    || E'AS n(t, o, r, d)\n)',
+    root_type, root_rel, array_to_string(up, ' UNION ALL '));
+END;
+$$;
+
 -- "g.store = S AND g.object_type = T AND g.relation = R" for one
 -- (type, relation), qualified.
 CREATE OR REPLACE FUNCTION fga._compiled_rows(
@@ -821,8 +1214,9 @@ $$;
 -- grants, computed usersets and tuple-to-usersets, it grants
 -- through no condition, and every relation it reaches flattens
 -- too. A relation on a cycle of the relation graph — or reaching
--- one — needs recursion, and a dispatch chain that may reach the
--- resolution limit needs check's depth error: both delegate.
+-- one — or whose dispatch chain may reach the resolution limit
+-- compiles to the recursive strategy instead, when nothing it
+-- reaches needs delegation for another reason.
 CREATE OR REPLACE FUNCTION fga._compiled_plan(
   store_id uuid, model_id uuid
 )
@@ -935,16 +1329,32 @@ AS $$
            max(w.hops) AS hops, max(w.len) AS len
     FROM walk w GROUP BY 1, 2
   )
-  SELECT v.type_name, v.relation_name,
-    CASE WHEN v.reason IS NULL AND d.hops < 24
-         THEN 'flattened' ELSE 'delegated' END,
-    coalesce(v.reason, CASE WHEN d.hops >= 24 THEN
-      'dispatch depth may reach the resolution limit' END),
-    CASE WHEN v.reason IS NULL AND d.hops < 24
-         THEN 1 + d.len ELSE 0 END
+  SELECT v.type_name, v.relation_name, k.strategy,
+    CASE WHEN k.strategy = 'delegated' THEN b.reason END,
+    CASE WHEN k.strategy = 'flattened' THEN 1 + d.len ELSE 0 END
   FROM verdict v
   LEFT JOIN depth d
-    ON d.root_type = v.type_name AND d.root_relation = v.relation_name;
+    ON d.root_type = v.type_name AND d.root_relation = v.relation_name
+  -- What only the generic resolver answers, in the relation or in
+  -- anything it reaches. A cycle or a deep chain is not on this
+  -- list: the recursive strategy takes those.
+  CROSS JOIN LATERAL (SELECT coalesce((
+      SELECT o.reason FROM own o
+      WHERE o.type_name = v.type_name
+        AND o.relation_name = v.relation_name), (
+      SELECT 'reaches ' || x.to_type || '#' || x.to_relation
+             || ' (' || o.reason || ')'
+      FROM reach x
+      JOIN own o
+        ON o.type_name = x.to_type AND o.relation_name = x.to_relation
+      WHERE x.type_name = v.type_name
+        AND x.relation_name = v.relation_name
+        AND o.reason IS NOT NULL
+      ORDER BY 1 LIMIT 1)) AS reason) AS b
+  CROSS JOIN LATERAL (SELECT CASE
+    WHEN v.reason IS NULL AND d.hops < 24 THEN 'flattened'
+    WHEN b.reason IS NULL THEN 'recursive'
+    ELSE 'delegated' END AS strategy) AS k;
 $$;
 
 -- The note a relation's registry reason carries when its
@@ -1054,6 +1464,10 @@ AS $$
     SELECT * FROM fga._compiled_emit_flattened(store_id, model_id,
       target, p.type_name, p.relation_name)
     WHERE p.strategy = 'flattened'
+    UNION ALL
+    SELECT * FROM fga._compiled_emit_recursive(store_id, model_id,
+      target, p.type_name, p.relation_name)
+    WHERE p.strategy = 'recursive'
     UNION ALL
     SELECT * FROM fga._compiled_emit_delegated(store_id, model_id,
       p.type_name, p.relation_name)
