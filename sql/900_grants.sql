@@ -33,6 +33,7 @@ BEGIN
     fga.check(uuid, jsonb),
     fga.batch_check(uuid, jsonb),
     fga.list_objects(uuid, jsonb),
+    fga.streamed_list_objects(uuid, jsonb),
     fga.list_users(uuid, jsonb),
     fga.expand(uuid, jsonb),
     fga.read(uuid, jsonb),
@@ -79,7 +80,9 @@ BEGIN
     fga.write(uuid, jsonb),
     fga.write_authorization_model(uuid, jsonb),
     fga.create_store(text),
-    fga.delete_store(uuid)
+    fga.delete_store(uuid),
+    fga.enable_compiled_relations(uuid, text, jsonb),
+    fga.disable_compiled_relations(uuid)
     TO fga_writer;
   GRANT INSERT, UPDATE, DELETE
     ON ALL TABLES IN SCHEMA fga TO fga_writer;

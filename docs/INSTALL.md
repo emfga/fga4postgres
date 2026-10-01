@@ -74,6 +74,32 @@ psql -c 'CREATE EXTENSION fga4postgres;' "$DB_URL"
 first (on RDS/Aurora, `pg_tle` ships preinstalled; grant
 `pgtle_admin` to your master user).
 
+## Settings
+
+`fga.setting` holds the database-wide engine configuration, the
+counterpart of upstream's server flags. Two rows exist today:
+
+| name | default | meaning |
+|---|---|---|
+| `list_objects_max_results` | 1000 | cap on `fga.list_objects` |
+| `list_users_max_results` | 1000 | cap on `fga.list_users` |
+
+`0` means unlimited, as upstream; a negative value is refused.
+Change one with a plain `UPDATE` (the writer role can):
+
+```sql
+UPDATE fga.setting SET value = 5000
+WHERE name = 'list_objects_max_results';
+```
+
+Re-running the installer never resets a value you set. The cap
+ends the search as soon as it is reached, so a lower cap is also
+a cheaper call. `fga.streamed_list_objects` is never capped,
+like upstream's `StreamedListObjects`: it returns one row per
+object, `{"object": "doc:<id>"}`, for callers that need the
+whole set. It computes the whole answer before returning the
+first row; it is uncapped, not incremental.
+
 ## Consumer privileges
 
 `sql/900_grants.sql` is a no-op until you create two group
@@ -93,12 +119,14 @@ GRANT fga_writer TO app_admin_user;
 ```
 
 `fga_reader` can call `fga.check`, `fga.batch_check`,
-`fga.list_objects`, `fga.list_users`, `fga.expand`, `fga.read`
-and `fga.version` — including on standbys and in read-only
-transactions — but has no DML on the `fga` tables, so the write
-entry points fail for it at the table layer. `fga_writer` adds
-`fga.write`, `fga.write_authorization_model`,
-`fga.create_store` and `fga.delete_store`.
+`fga.list_objects`, `fga.streamed_list_objects`,
+`fga.list_users`, `fga.expand`, `fga.read` and `fga.version` —
+including on standbys and in read-only transactions — but has
+no DML on the `fga` tables, so the write entry points fail for
+it at the table layer. `fga_writer` adds `fga.write`,
+`fga.write_authorization_model`, `fga.create_store`,
+`fga.delete_store`, `fga.enable_compiled_relations` and
+`fga.disable_compiled_relations`, and can change `fga.setting`.
 
 Entry points run with caller rights (no SECURITY DEFINER); the
 trust model is the database's own. Hardening beyond the

@@ -31,7 +31,8 @@ documented in [docs/CONFORMANCE.md](docs/CONFORMANCE.md).
 ## v1 surface
 
 - `check` (including `batch_check`), `expand`, `list_objects`,
-  `list_users`
+  `streamed_list_objects`, `list_users`, with upstream's
+  configurable result caps (`fga.setting`)
 - `write_authorization_model` — whole-model, upstream JSON shape,
   immutable and versioned
 - Tuple `write`/`delete` with upstream error semantics

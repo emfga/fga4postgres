@@ -161,6 +161,42 @@ jobs:
             -v ON_ERROR_STOP=1 -tAc \
             "SET ROLE fga_writer;
              SELECT (fga.create_store('ok')).id;"
+          # EXECUTE is granted to PUBLIC by default, so a missing
+          # grant would not fail a call: assert the template names
+          # every public entry point instead.
+          ungranted=$(docker exec relcheck psql -U fga -d fga \
+            -v ON_ERROR_STOP=1 -tAc \
+            "SELECT p.oid::regprocedure
+             FROM pg_proc p
+             JOIN pg_namespace n ON n.oid = p.pronamespace
+             WHERE n.nspname = 'fga'
+               AND p.proname NOT LIKE E'\\\\_%'
+               AND NOT EXISTS (
+                 SELECT FROM aclexplode(p.proacl) a
+                 WHERE a.privilege_type = 'EXECUTE'
+                   AND a.grantee IN ('fga_reader'::regrole,
+                                     'fga_writer'::regrole))")
+          if [ -n "$ungranted" ]; then
+            echo "not in sql/900_grants.sql: $ungranted" >&2
+            exit 1
+          fi
+          docker exec -i relcheck psql -U fga -d fga \
+            -v ON_ERROR_STOP=1 -tA <<'SQL'
+          SET ROLE fga_writer;
+          SELECT (fga.create_store('stream')).id AS store \gset
+          SELECT fga.write_authorization_model(:'store',
+            '{"schema_version": "1.1", "type_definitions": [
+              {"type": "user"},
+              {"type": "doc",
+               "relations": {"viewer": {"this": {}}},
+               "metadata": {"relations": {"viewer": {
+                 "directly_related_user_types": [{"type": "user"}]
+               }}}}]}') IS NOT NULL;
+          SET ROLE fga_reader;
+          SELECT count(*) FROM fga.streamed_list_objects(:'store',
+            '{"type": "doc", "relation": "viewer",
+              "user": "user:00000000-0000-0000-0000-000000000001"}');
+          SQL
           docker rm -f relcheck >/dev/null
 
       - name: Install through pg_tle

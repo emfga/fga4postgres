@@ -31,13 +31,17 @@ All planned v1 APIs are implemented. Current verified surface:
   upstream YAML corpus (`consolidated_1_1_tests.yaml` +
   `abac_tests.yaml`) passes differentially against the oracle, in
   both the normal and contextual-tuples replay variants.
-- `list_objects` (unary and the streamed adapter): every
+- `list_objects` and `streamed_list_objects`: every
   non-condition corpus case passes differentially, each returned
-  object confirmed by a forward check; the 1000-result cap is
-  probed on both engines. The engine mirrors upstream's measured
-  envelope: reverse expansion charges no tuple-hop depth (a
-  100-link chain lists completely even where a forward check on
-  the same chain refuses as too complex).
+  object confirmed by a forward check; the default 1000-result
+  cap is probed on both engines, and the streamed function is
+  probed uncapped against upstream's `StreamedListObjects`. The
+  caps are `fga.setting` rows (0 = unlimited), engine-tested
+  only: the oracle's cap is fixed by its server flags. The
+  engine mirrors upstream's measured envelope: reverse expansion
+  charges no tuple-hop depth (a 100-link chain lists completely
+  even where a forward check on the same chain refuses as too
+  complex).
 - `list_objects` returns complete results or an error — there is
   no deadline machinery, and it is verified that no corpus case
   depends on upstream's partial-results-on-deadline behaviour
@@ -107,7 +111,7 @@ All planned v1 APIs are implemented. Current verified surface:
 
 ## Exclusions (out of v1 scope)
 
-Streamed list-objects, read-changes, the assertions API, the
+Read-changes, the assertions API, the
 read-models API and its paging (`ReadAuthorizationModels`), the
 HTTP/gRPC layer, DSL parsing in-engine (DSL→JSON stays in the
 harness), store-level auth and multi-tenant isolation machinery.
