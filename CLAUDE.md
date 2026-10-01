@@ -24,7 +24,8 @@ a bug.
 **In scope (v1):**
 
 - `check` (including batch check over one resolution scope)
-- `list_objects` and `list_users`
+- `list_objects`, `streamed_list_objects` and `list_users`, with
+  upstream's result caps as database-wide settings (`fga.setting`)
 - `expand`
 - `write_authorization_model` — whole-model, upstream JSON shape,
   immutable and versioned
@@ -35,6 +36,13 @@ a bug.
 - A minimal store namespace: `create_store`/`delete_store` plus a store
   column. It exists for conformance isolation (fresh store per corpus
   test) and namespacing, not multi-tenancy.
+- Compiled relations, an additive non-upstream surface: a store opts
+  in with `fga.enable_compiled_relations`, and every model write then
+  generates per relation plain SQL functions (`__objects`,
+  `__subjects`, `__check`) in a schema the application owns, so an
+  application pages authorised rows in its own query. Every answer
+  equals the generic resolver's; a shape that cannot be compiled
+  exactly is delegated to it, and the corpus replays through them.
 
 **Out of scope (v1):**
 
@@ -44,8 +52,8 @@ a bug.
 - `read_changes`. Deferred, not rejected: every tuple mutation goes
   through one function so a changelog can be added without rework
   (decision 8).
-- HTTP/gRPC layer, assertions API, streamed list-objects, watch API,
-  multi-tenant isolation machinery, store-level auth.
+- HTTP/gRPC layer, assertions API, watch API, multi-tenant isolation
+  machinery, store-level auth.
 
 ## Decisions
 
@@ -124,7 +132,14 @@ a future contributor will otherwise reopen.
    and under parallel query. Only actual writers are `VOLATILE`.
    Never label a table-reading function `IMMUTABLE` to win an index;
    cel4postgres logs exactly that as a review item, not a pattern.
-   Every function carries `SET search_path = fga, pg_temp`.
+   Every function carries `SET search_path = fga, pg_temp` — except
+   the generated compiled-relation functions, which carry no `SET`
+   clause because one stops PostgreSQL from inlining them into the
+   caller's query, which is their reason to exist. Their bodies
+   schema-qualify every table, function, type and operator instead
+   (`fga.tuple`, `OPERATOR(pg_catalog.=)`), so a caller's
+   `search_path` cannot substitute a decoy; `TestCompiledInlinable`
+   and `TestCompiledSearchPathIndependent` enforce both halves.
 10. **The id domain is native `uuid`; PostgreSQL 18 is the version
     floor.** Object and subject ids are `uuid` columns, accepted in
     canonical lower-case hyphenated spelling only — Postgres's uuid
