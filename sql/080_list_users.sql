@@ -431,9 +431,15 @@ BEGIN
 END;
 $$;
 
-CREATE OR REPLACE FUNCTION fga.list_users(
+-- The search behind fga.list_users: the request's users, at most
+-- cap of them (0 = unlimited), in upstream's response shape. The
+-- uncapped form serves the compiled relations' delegated
+-- __subjects, which is a set the application filters in its own
+-- query and must not be silently truncated.
+CREATE OR REPLACE FUNCTION fga._list_users(
   store_id uuid,
-  request jsonb
+  request jsonb,
+  cap integer
 )
 RETURNS jsonb
 LANGUAGE plpgsql
@@ -456,7 +462,6 @@ DECLARE
   uset fga._lu_set;
   users fga._lu_user[];
   result jsonb;
-  cap integer := fga._setting_int('list_users_max_results');
 BEGIN
   mid := fga._resolve_model(
     store_id, request ->> 'authorization_model_id');
@@ -554,6 +559,19 @@ BEGIN
 
   RETURN jsonb_build_object('users', result);
 END;
+$$;
+
+CREATE OR REPLACE FUNCTION fga.list_users(
+  store_id uuid,
+  request jsonb
+)
+RETURNS jsonb
+LANGUAGE sql
+STABLE PARALLEL SAFE
+SET search_path = fga, pg_temp
+AS $$
+  SELECT fga._list_users(store_id, request,
+    fga._setting_int('list_users_max_results'));
 $$;
 
 -- Iterator over ALL rows of one object#relation (plain, wildcard
