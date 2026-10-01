@@ -186,3 +186,66 @@ func BenchmarkCheckDeepDeny(b *testing.B) {
 	benchCheck(b, client, store, model,
 		"environment:e0", "can_read", "user:anne", false, false)
 }
+
+// raisingDirectDSL gives each set operator a direct child that can
+// raise — a condition missing its parameter, or a userset chain
+// past the depth limit — next to a sibling that may swallow it.
+const raisingDirectDSL = `model
+  schema 1.1
+type user
+type group
+  relations
+    define owner: [user]
+    define member: [user, group#member] or owner
+type doc
+  relations
+    define editor: [user]
+    define viewer: [user with open] or editor
+    define gated: [user with open] and editor
+condition open(x: int) {
+  x == 1
+}`
+
+// Skipping the subtransaction around a direct child is only safe
+// when the child cannot raise; these are the children that can,
+// and the engine must still defer their error exactly as the
+// oracle does. A deep negative on the userset chain is left out:
+// upstream answers it by strategy (PIN-DEPTH-1).
+func TestProbeDirectChildErrorDeferred(t *testing.T) {
+	tuples := append(groupChain(30),
+		tk("group:g30", "owner", "user:anne"),
+		tk("doc:1", "editor", "user:anne"))
+	for _, d := range []string{"doc:1", "doc:2"} {
+		for _, rel := range []string{"viewer", "gated"} {
+			tuples = append(tuples, &openfgav1.TupleKey{
+				Object: d, Relation: rel, User: "user:anne",
+				Condition: &openfgav1.RelationshipCondition{
+					Name: "open"},
+			})
+		}
+	}
+	cases := []struct{ object, relation, user string }{
+		{"doc:1", "viewer", "user:anne"},     // sibling grants
+		{"doc:2", "viewer", "user:anne"},     // error surfaces
+		{"doc:1", "gated", "user:anne"},      // error surfaces
+		{"doc:2", "gated", "user:anne"},      // false swallows
+		{"group:g30", "member", "user:anne"}, // owner grants
+	}
+	sides := bothSides(t, "direct-child-error")
+	for i := range sides {
+		sides[i].storeID, sides[i].modelID = setup(
+			t, sides[i].client, raisingDirectDSL, tuples)
+	}
+	for _, c := range cases {
+		var got [2]checkResult
+		for i, s := range sides {
+			got[i] = doCheck(t, s.client, s.storeID, s.modelID,
+				c.object, c.relation, c.user, nil, nil)
+		}
+		if got[0].allowed != got[1].allowed ||
+			got[0].code != got[1].code {
+			t.Errorf("%s#%s@%s: engine %v, oracle %v",
+				c.object, c.relation, c.user, got[0], got[1])
+		}
+	}
+}
