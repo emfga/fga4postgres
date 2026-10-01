@@ -127,3 +127,44 @@ type doc
 		}
 	}
 }
+
+// Dispatch from list_objects reaches a generated __objects function
+// through a dynamic statement, which PostgreSQL plans on every
+// execution. Inlined into that statement, the function's body was
+// planned with it on every call: on a wide model that planning cost
+// ten times the execution. Called as a function, its own plan is
+// cached for the session and only the call is planned.
+//
+// Whether a SQL function was inlined is visible in its call count:
+// an inlined body never runs as a function, so track_functions
+// counts nothing. Both entry points dispatch, and both must count
+// one call each.
+func TestCompiledDispatchCallsTheFunction(t *testing.T) {
+	schema := compiledSchema(t)
+	storeID, ids := compiledStore(t, schema, `model
+  schema 1.1
+type user
+type doc
+  relations
+    define editor: [user]
+    define viewer: [user] or editor`,
+		[]*openfgav1.TupleKey{
+			tk("doc:d1", "viewer", "user:anne"),
+			tk("doc:d2", "editor", "user:anne"),
+		})
+	request := fmt.Sprintf(
+		`{"type": "doc", "relation": "viewer", "user": "user:%s"}`,
+		ids.ID("anne"))
+	generated := schema + ".doc__viewer__objects"
+	for _, call := range []string{
+		"SELECT fga.list_objects($1, $2::jsonb)",
+		"SELECT fga.streamed_list_objects($1, $2::jsonb)",
+	} {
+		calls := callCounts(t, call, storeID, request)
+		if got := calls[generated]; got != 1 {
+			t.Errorf("%s: %s ran as a function %d times, want 1 "+
+				"(0 means dispatch inlined it; all: %v)",
+				call, generated, got, calls)
+		}
+	}
+}

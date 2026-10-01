@@ -65,6 +65,14 @@ $$;
 -- fga._dispatching setting keeps the generated body's hand-offs to
 -- the generic resolver generic (see fga._check_compiled).
 --
+-- The call is dynamic (the function is found in the registry), and
+-- PostgreSQL plans a dynamic statement on every execution. WITH
+-- ORDINALITY keeps the generated function out of that plan: the
+-- planner never inlines a set-returning function asked for its row
+-- numbers, so it runs as a function and its own plan is cached for
+-- the session. Inlined, its body was planned anew on every call,
+-- which on a wide model cost ten times the execution.
+--
 -- Past the cap the generic search tolerates condition errors,
 -- while a generated body refuses on any it meets, so a capped call
 -- the generated function refuses returns NULL: the caller then
@@ -84,7 +92,8 @@ AS $$
 DECLARE
   q constant text := format(
     'SELECT coalesce(array_agg(%L || x::text), ''{}'') FROM ('
-    'SELECT x FROM %s($1, $2, $3, $4, $5, $6) AS x LIMIT $7) AS l',
+    'SELECT x FROM %s($1, $2, $3, $4, $5, $6) WITH ORDINALITY'
+    ' AS f(x, n) LIMIT $7) AS l',
     object_type || ':', fn::oid::regproc);
   objects text[];
 BEGIN
