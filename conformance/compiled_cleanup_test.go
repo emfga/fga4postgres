@@ -58,4 +58,9 @@ func TestCompiledDropAfterSchemaDropped(t *testing.T) {
 		WHERE store IN ($1, $2)`, storeID, other); got != 0 {
 		t.Errorf("opted-in stores left behind: %d", got)
 	}
+	if got := queryInt(t, `SELECT count(*)::int
+		FROM fga.compiled_contextual
+		WHERE store IN ($1, $2)`, storeID, other); got != 0 {
+		t.Errorf("contextual-tuple statements left behind: %d", got)
+	}
 }

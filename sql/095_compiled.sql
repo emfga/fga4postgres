@@ -69,6 +69,21 @@ CREATE TABLE IF NOT EXISTS fga.compiled_relation (
   PRIMARY KEY (store, model_id, type_name, relation_name)
 );
 
+-- The dynamic statement each flattened or conditioned function runs
+-- for a call that carries contextual tuples (_compiled_ctx_set),
+-- kept out of the function bodies: a body is parsed whenever the
+-- caller's statement is planned, and the statements would triple
+-- it for the call that carries none.
+CREATE TABLE IF NOT EXISTS fga.compiled_contextual (
+  store uuid NOT NULL,
+  model_id uuid NOT NULL,
+  type_name text NOT NULL,
+  relation_name text NOT NULL,
+  kind text NOT NULL,
+  stmt text NOT NULL,
+  PRIMARY KEY (store, model_id, type_name, relation_name, kind)
+);
+
 -- The generated function name for one (type, relation, kind)
 -- (decision 11). Readable when both source names are plain
 -- lower-case words joined by single underscores and the result
@@ -707,7 +722,8 @@ BEGIN
     JOIN pg_namespace n ON n.oid = p.pronamespace
     WHERE n.nspname = 'fga'
       AND p.proname IN ('_compiled_leaf', '_compiled_setop_node',
-                        '_compiled_place')
+                        '_compiled_place', '_compiled_ctx_set',
+                        '_compiled_ctx_bool')
   LOOP
     EXECUTE 'DROP FUNCTION ' || f.sig;
   END LOOP;
@@ -1195,7 +1211,9 @@ $$;
 -- place before it that admit st#sr. A set operation reached on the
 -- way is not walked into: it is kept in opaque, and answered by its
 -- own generated function. Only flattened and conditioned relations
--- come here, so the walk meets no cycle and ends.
+-- come here, so the walk meets no cycle and ends: the plan keeps
+-- them under 24 dispatches, and the bound on the path length only
+-- guards the walk itself.
 CREATE OR REPLACE FUNCTION fga._compiled_places(
   store_id uuid, model_id uuid, type_name text, relation_name text
 )
@@ -1632,13 +1650,39 @@ $$;
 
 -- A call's contextual tuples are answered by a dynamic statement:
 -- the same arms over fga.tuple and the call's validated contextual
--- tuples (k), run only when a call carries some. Inline, those arms
--- would double every body the planner reads for the common call that
--- carries none; as a literal they cost nothing until run. The
--- statement binds the generated function's parameters as
--- $1 .. $7, columns of p.
+-- tuples (k), run only when a call carries some, and stored in
+-- fga.compiled_contextual under the function's own key. The
+-- statement binds the generated function's parameters as $1 .. $7,
+-- columns of p.
+CREATE OR REPLACE FUNCTION fga._compiled_ctx_find(
+  store_id uuid, model_id uuid, type_name text, relation_name text,
+  kind text
+)
+RETURNS text
+LANGUAGE plpgsql
+STABLE PARALLEL SAFE
+SET search_path = fga, pg_temp
+AS $$
+DECLARE
+  stmt text;
+BEGIN
+  SELECT c.stmt INTO stmt FROM fga.compiled_contextual c
+  WHERE c.store = store_id AND c.model_id = _compiled_ctx_find.model_id
+    AND c.type_name = _compiled_ctx_find.type_name
+    AND c.relation_name = _compiled_ctx_find.relation_name
+    AND c.kind = _compiled_ctx_find.kind;
+  IF stmt IS NULL THEN
+    RAISE EXCEPTION 'compiled relations: no contextual-tuple '
+      'statement registered for %#% (%), model %', type_name,
+      relation_name, kind, model_id USING ERRCODE = 'internal_error';
+  END IF;
+  RETURN stmt;
+END;
+$$;
+
 CREATE OR REPLACE FUNCTION fga._compiled_ctx_set(
-  stmt text, p_object uuid, p_subject_type text, p_subject_id uuid,
+  store_id uuid, model_id uuid, type_name text, relation_name text,
+  kind text, p_object uuid, p_subject_type text, p_subject_id uuid,
   p_subject_relation text, p_any_subject boolean, p_context jsonb,
   p_contextual_tuples jsonb
 )
@@ -1649,14 +1693,16 @@ COST 1 ROWS 10
 SET search_path = fga, pg_temp
 AS $$
 BEGIN
-  RETURN QUERY EXECUTE stmt USING p_object, p_subject_type,
-    p_subject_id, p_subject_relation, p_any_subject, p_context,
-    p_contextual_tuples;
+  RETURN QUERY EXECUTE fga._compiled_ctx_find(store_id, model_id,
+    type_name, relation_name, kind)
+  USING p_object, p_subject_type, p_subject_id, p_subject_relation,
+    p_any_subject, p_context, p_contextual_tuples;
 END;
 $$;
 
 CREATE OR REPLACE FUNCTION fga._compiled_ctx_bool(
-  stmt text, p_object uuid, p_subject_type text, p_subject_id uuid,
+  store_id uuid, model_id uuid, type_name text, relation_name text,
+  p_object uuid, p_subject_type text, p_subject_id uuid,
   p_subject_relation text, p_any_subject boolean, p_context jsonb,
   p_contextual_tuples jsonb
 )
@@ -1669,9 +1715,11 @@ AS $$
 DECLARE
   answer boolean;
 BEGIN
-  EXECUTE stmt INTO answer USING p_object, p_subject_type,
-    p_subject_id, p_subject_relation, p_any_subject, p_context,
-    p_contextual_tuples;
+  EXECUTE fga._compiled_ctx_find(store_id, model_id, type_name,
+    relation_name, 'check')
+  INTO answer
+  USING p_object, p_subject_type, p_subject_id, p_subject_relation,
+    p_any_subject, p_context, p_contextual_tuples;
   RETURN answer;
 END;
 $$;
@@ -1721,6 +1769,73 @@ AS $$
     E'\n  OR '), ''), 'false') AS core) AS v;
 $$;
 
+-- Every arm of a flattened relation, over one source
+-- (_compiled_chain): the objects and subjects arms, and the check
+-- expression.
+CREATE OR REPLACE FUNCTION fga._compiled_flat_arms(
+  store_id uuid, model_id uuid, target text,
+  type_name text, relation_name text, ctx boolean,
+  OUT objs text[], OUT subs text[], OUT check_expr text
+)
+LANGUAGE plpgsql
+STABLE PARALLEL SAFE
+SET search_path = fga, pg_temp
+AS $$
+DECLARE
+  prefixes jsonb := '{}';
+  pl record;
+  s record;
+  arms text[] := '{}';
+  bools text[] := '{}';
+  errs text[] := '{}';
+BEGIN
+  objs := '{}';
+  subs := '{}';
+  FOR pl IN
+    SELECT * FROM fga._compiled_places(store_id, model_id,
+      _compiled_flat_arms.type_name,
+      _compiled_flat_arms.relation_name) AS p
+    ORDER BY jsonb_array_length(p.path), p.path::text
+  LOOP
+    prefixes := prefixes || jsonb_build_object(pl.path::text,
+      to_jsonb(pl.rels));
+    s := fga._compiled_place(store_id, model_id, target, pl.path,
+      pl.place_type, pl.rels, pl.opaque, prefixes, ctx);
+    objs := objs || s.objs;
+    subs := subs || s.subs;
+    arms := arms || s.check_arms;
+    bools := bools || s.check_bools;
+    errs := errs || s.check_errs;
+  END LOOP;
+  check_expr := fga._compiled_check_expr(bools, arms, errs);
+END;
+$$;
+
+-- The contextual-tuple statements of a flattened relation, one per
+-- kind, for fga.compiled_contextual.
+CREATE OR REPLACE FUNCTION fga._compiled_ctx_stmts(
+  store_id uuid, model_id uuid, target text,
+  type_name text, relation_name text
+)
+RETURNS TABLE (kind text, stmt text)
+LANGUAGE sql
+STABLE PARALLEL SAFE
+SET search_path = fga, pg_temp
+AS $$
+  SELECT v.kind, v.stmt
+  FROM fga._compiled_flat_arms(store_id, model_id, target, type_name,
+         relation_name, true) AS a
+  CROSS JOIN LATERAL (VALUES
+    ('objects', fga._compiled_ctx_stmt(store_id, model_id, 'YF100',
+      'z.x', format(' CROSS JOIN LATERAL (%s) AS z(x)',
+        array_to_string(a.objs, E'\nUNION\n')))),
+    ('subjects', fga._compiled_ctx_stmt(store_id, model_id, 'YF100',
+      'z.x', format(' CROSS JOIN LATERAL (%s) AS z(x)',
+        array_to_string(a.subs, E'\nUNION\n')))),
+    ('check', fga._compiled_ctx_stmt(store_id, model_id, 'YF127',
+      a.check_expr, NULL))) AS v(kind, stmt);
+$$;
+
 -- The flattened emitter, which also serves the conditioned
 -- strategy: one body over every place the relation reaches
 -- (_compiled_places), with one dedup over the whole set, calling no
@@ -1733,10 +1848,11 @@ $$;
 --
 -- Each kind is the arms over fga.tuple, run by a call without
 -- contextual tuples (the test folds away when the call passes the
--- default), and a dynamic statement over both sources for a call
--- with some (_compiled_ctx_set). A check is not inlined (its EXISTS
--- runs as its own statement), so its arms share one EXISTS: every
--- subplan of a plan starts on every call, run or not.
+-- default), and for a call with some the dynamic statement over
+-- both sources that _compiled_generate registers
+-- (_compiled_ctx_stmts). A check is not inlined (its EXISTS runs as
+-- its own statement), so its arms share one EXISTS: every subplan
+-- of a plan starts on every call, run or not.
 CREATE OR REPLACE FUNCTION fga._compiled_emit_flattened(
   store_id uuid, model_id uuid, target text,
   type_name text, relation_name text,
@@ -1747,71 +1863,29 @@ STABLE PARALLEL SAFE
 SET search_path = fga, pg_temp
 AS $$
 DECLARE
-  mid constant uuid := model_id;
   live constant text := fga._compiled_no_ctuples_sql();
   args constant text := 'p_subject_type, p_subject_id, '
     'p_subject_relation, p_any_subject, p_context, '
     'p_contextual_tuples';
-  prefixes jsonb := '{}';
-  s record;
-  c record;
-  pl record;
+  key constant text := format('%L::pg_catalog.uuid, '
+    '%L::pg_catalog.uuid, %L, %L', store_id, model_id, type_name,
+    relation_name);
+  f record := fga._compiled_flat_arms(store_id, model_id, target,
+    type_name, relation_name, false);
   b record;
-  objs text[] := '{}';
-  subs text[] := '{}';
-  arms text[] := '{}';
-  bools text[] := '{}';
-  errs text[] := '{}';
-  c_objs text[] := '{}';
-  c_subs text[] := '{}';
-  c_arms text[] := '{}';
-  c_bools text[] := '{}';
-  c_errs text[] := '{}';
 BEGIN
-  FOR pl IN
-    SELECT * FROM fga._compiled_places(store_id, mid,
-      _compiled_emit_flattened.type_name,
-      _compiled_emit_flattened.relation_name) AS p
-    ORDER BY jsonb_array_length(p.path), p.path::text
-  LOOP
-    prefixes := prefixes || jsonb_build_object(pl.path::text,
-      to_jsonb(pl.rels));
-    s := fga._compiled_place(store_id, mid, target, pl.path,
-      pl.place_type, pl.rels, pl.opaque, prefixes, false);
-    c := fga._compiled_place(store_id, mid, target, pl.path,
-      pl.place_type, pl.rels, pl.opaque, prefixes, true);
-    objs := objs || s.objs;
-    subs := subs || s.subs;
-    arms := arms || s.check_arms;
-    bools := bools || s.check_bools;
-    errs := errs || s.check_errs;
-    c_objs := c_objs || c.objs;
-    c_subs := c_subs || c.subs;
-    c_arms := c_arms || c.check_arms;
-    c_bools := c_bools || c.check_bools;
-    c_errs := c_errs || c.check_errs;
-  END LOOP;
-
-  b := fga._compiled_assemble(store_id, mid,
+  b := fga._compiled_assemble(store_id, model_id,
     ARRAY(SELECT format('SELECT a.x FROM (%s) AS a(x) WHERE %s', a, live)
-          FROM unnest(objs) WITH ORDINALITY AS u(a, i) ORDER BY i)
-    || format('SELECT x FROM fga._compiled_ctx_set(%L, NULL, %s) AS x '
-      'WHERE NOT %s', fga._compiled_ctx_stmt(store_id, mid, 'YF100',
-        'z.x', format(' CROSS JOIN LATERAL (%s) AS z(x)',
-          array_to_string(c_objs, E'\nUNION\n'))), args, live),
+          FROM unnest(f.objs) WITH ORDINALITY AS u(a, i) ORDER BY i)
+    || format('SELECT x FROM fga._compiled_ctx_set(%s, ''objects'', '
+      'NULL, %s) AS x WHERE NOT %s', key, args, live),
     ARRAY(SELECT format('SELECT a.x FROM (%s) AS a(x) WHERE %s', a, live)
-          FROM unnest(subs) WITH ORDINALITY AS u(a, i) ORDER BY i)
-    || format('SELECT x FROM fga._compiled_ctx_set(%L, p_object, '
-      'p_subject_type, NULL, p_subject_relation, false, p_context, '
-      'p_contextual_tuples) AS x WHERE NOT %s',
-      fga._compiled_ctx_stmt(store_id, mid, 'YF100', 'z.x', format(
-        ' CROSS JOIN LATERAL (%s) AS z(x)',
-        array_to_string(c_subs, E'\nUNION\n'))), live),
+          FROM unnest(f.subs) WITH ORDINALITY AS u(a, i) ORDER BY i)
+    || format('SELECT x FROM fga._compiled_ctx_set(%s, ''subjects'', '
+      'p_object, p_subject_type, NULL, p_subject_relation, false, '
+      'p_context, p_contextual_tuples) AS x WHERE NOT %s', key, live),
     ARRAY[format(E'CASE WHEN %s THEN %s\n  ELSE fga._compiled_ctx_bool('
-      '%L, p_object, %s) END', live,
-      fga._compiled_check_expr(bools, arms, errs),
-      fga._compiled_ctx_stmt(store_id, mid, 'YF127',
-        fga._compiled_check_expr(c_bools, c_arms, c_errs), NULL), args)],
+      '%s, p_object, %s) END', live, f.check_expr, key, args)],
     '{}');
   objects_body := b.objects_body;
   subjects_body := b.subjects_body;
@@ -2837,6 +2911,7 @@ BEGIN
     EXECUTE format('DROP FUNCTION %s', fn);
   END LOOP;
   DELETE FROM fga.compiled_relation WHERE store = store_id;
+  DELETE FROM fga.compiled_contextual WHERE store = store_id;
 END;
 $$;
 
@@ -2932,6 +3007,7 @@ BEGIN
   END IF;
 
   DELETE FROM fga.compiled_relation WHERE store = store_id;
+  DELETE FROM fga.compiled_contextual WHERE store = store_id;
 
   FOR fn IN
     SELECT * FROM jsonb_to_recordset(fns) AS x(
@@ -2954,6 +3030,14 @@ BEGIN
     type_name text, relation_name text, kind text, sig text,
     strategy text, reason text)
   GROUP BY x.type_name, x.relation_name;
+
+  INSERT INTO fga.compiled_contextual
+  SELECT store_id, mid, r.type_name, r.relation_name, s.kind, s.stmt
+  FROM fga.compiled_relation r
+  CROSS JOIN LATERAL fga._compiled_ctx_stmts(store_id, mid, target,
+    r.type_name, r.relation_name) AS s
+  WHERE r.store = store_id
+    AND r.strategy IN ('flattened', 'conditioned');
 END;
 $$;
 
