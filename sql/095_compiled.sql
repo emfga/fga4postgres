@@ -2812,13 +2812,16 @@ $$;
 -- model, in the caller's transaction. A no-op for stores that did
 -- not opt in.
 --
--- Functions that survive a model change are replaced in place
--- (CREATE OR REPLACE keeps their oid, so a cached plan that inlined
--- one is invalidated and re-planned rather than left pointing at a
--- dropped function); only registered functions the new model no
--- longer has are dropped. A same-signature function the engine did
--- not register belongs to the application: it refuses the model
--- write instead of being overwritten.
+-- Functions that survive a model change are replaced in place:
+-- CREATE OR REPLACE keeps their oid, so an application's views and
+-- anything else holding a function by oid stay valid (dropping one
+-- would fail the model write with "other objects depend on it").
+-- Cached plans are re-planned either way — a prepared statement
+-- resolves the name again (TestCompiledPlanInvalidation). Only
+-- registered functions the new model no longer has are dropped. A
+-- same-signature function the engine did not register belongs to
+-- the application: it refuses the model write instead of being
+-- overwritten.
 CREATE OR REPLACE FUNCTION fga._compiled_generate(store_id uuid)
 RETURNS void
 LANGUAGE plpgsql
