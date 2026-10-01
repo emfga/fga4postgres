@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"hash/fnv"
 	"math/rand"
+	"regexp"
 	"slices"
 	"sort"
 	"strings"
@@ -54,12 +55,109 @@ func shuffledTuples(
 	return out
 }
 
+// replayMode is how a corpus case is replayed: normal, with the
+// stage tuples handed as contextual tuples (upstream's own second
+// run), or answered by the store's compiled relation functions.
+type replayMode int
+
+const (
+	modeNormal replayMode = iota
+	modeCtxTuples
+	modeCompiled
+)
+
 // engineForCase builds the sqlclient with a per-file uuid map —
-// deterministic across runs, disjoint across files.
-func engineForCase(t *testing.T, file string) *sqlclient.Client {
-	return sqlclient.New(
-		testdb.Pool(t), uuidmap.New("yaml/"+file),
-	)
+// deterministic across runs, disjoint across files. In compiled
+// mode the client opts every store in and answers through the
+// generated functions.
+func engineForCase(
+	t *testing.T, file string, mode replayMode,
+) probeClient {
+	ids := uuidmap.New("yaml/" + file)
+	if mode == modeCompiled {
+		return sqlclient.NewCompiled(testdb.Pool(t), ids)
+	}
+	return sqlclient.New(testdb.Pool(t), ids)
+}
+
+func engineName(mode replayMode) string {
+	if mode == modeCompiled {
+		return "compiled"
+	}
+	return "engine"
+}
+
+// storeDeleter is the engine clients' cleanup hook.
+type storeDeleter interface {
+	DeleteStore(ctx context.Context, storeID string) error
+}
+
+var delegatedVia = regexp.MustCompile(`^reaches \S+ \((.*)\)$`)
+
+// reportDelegated names, through the skip register, every relation
+// of the stage's model the generator left on the delegated
+// strategy: its answers still come from a generated function, but
+// one that calls the generic resolver, so the compiled strategies
+// are not what this case exercised for it.
+func reportDelegated(t *testing.T, engine *side) {
+	t.Helper()
+	rows, err := testdb.Pool(t).Query(context.Background(), `
+		SELECT type_name || '#' || relation_name, reason
+		FROM fga.compiled_relation
+		WHERE store = $1 AND model_id = $2
+		  AND strategy = 'delegated'
+		ORDER BY 1`, engine.storeID, engine.modelID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	type entry struct{ rel, reason string }
+	var delegated []entry
+	for rows.Next() {
+		var e entry
+		if err := rows.Scan(&e.rel, &e.reason); err != nil {
+			t.Fatal(err)
+		}
+		delegated = append(delegated, e)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range delegated {
+		reason := e.reason
+		if m := delegatedVia.FindStringSubmatch(reason); m != nil {
+			reason = "depends on a delegated relation: " + m[1]
+		}
+		t.Run("delegated/"+e.rel, func(t *testing.T) {
+			skiplist.Skip(t, "compiled: relation delegated to the "+
+				"generic resolver: "+reason)
+		})
+	}
+}
+
+// reportGeneric records, after a compiled-mode assertion, what the
+// compiled path did not answer itself.
+func reportGeneric(
+	t *testing.T, engine *side, ctxTuples bool,
+) {
+	t.Helper()
+	c, ok := engine.client.(*sqlclient.Compiled)
+	if !ok {
+		return
+	}
+	if len(c.TakeGeneric()) > 0 {
+		t.Run("generic_validation", func(t *testing.T) {
+			skiplist.Skip(t, "compiled: request refused by the "+
+				"generic API's validation (no generated function "+
+				"takes request strings)")
+		})
+	}
+	if ctxTuples {
+		t.Run("contextual_tuples", func(t *testing.T) {
+			skiplist.Skip(t, "compiled: contextual tuples take "+
+				"the delegated path (P1.6)")
+		})
+	}
 }
 
 type side struct {
@@ -70,10 +168,11 @@ type side struct {
 }
 
 func runCheckReplay(
-	t *testing.T, file string, tc corpus.Test, ctxVariant bool,
+	t *testing.T, file string, tc corpus.Test, mode replayMode,
 ) {
 	ctx := context.Background()
 	rng := caseRand(t.Name())
+	ctxVariant := mode == modeCtxTuples
 
 	if ctxVariant {
 		if len(tc.Stages) > 1 {
@@ -89,7 +188,7 @@ func runCheckReplay(
 	}
 
 	sides := []*side{
-		{name: "engine", client: engineForCase(t, file)},
+		{name: engineName(mode), client: engineForCase(t, file, mode)},
 		{name: "oracle", client: oracle.Client(t)},
 	}
 	for _, s := range sides {
@@ -101,7 +200,7 @@ func runCheckReplay(
 		s.storeID = resp.GetId()
 	}
 	t.Cleanup(func() {
-		_ = sides[0].client.(*sqlclient.Client).
+		_ = sides[0].client.(storeDeleter).
 			DeleteStore(ctx, sides[0].storeID)
 		_, _ = oracle.Client(t).DeleteStore(ctx,
 			&openfgav1.DeleteStoreRequest{StoreId: sides[1].storeID})
@@ -111,6 +210,9 @@ func runCheckReplay(
 		st := stage
 		t.Run(fmt.Sprintf("stage_%d", stageNum), func(t *testing.T) {
 			writeStageBoth(t, rng, sides, st, ctxVariant)
+			if mode == modeCompiled {
+				reportDelegated(t, sides[0])
+			}
 			for i, a := range st.CheckAssertions {
 				name := a.Name
 				if name == "" {
@@ -120,6 +222,8 @@ func runCheckReplay(
 				t.Run(name, func(t *testing.T) {
 					runCheckAssertion(
 						t, rng, sides, st, assertion, ctxVariant)
+					reportGeneric(t, sides[0],
+						len(assertion.ContextualTuples) > 0)
 				})
 			}
 		})
@@ -188,10 +292,11 @@ func writeStageBoth(
 // is exercised implicitly — the sqlclient adapts it over the same
 // unary path — so it carries no separate assert here.
 func runListObjectsReplay(
-	t *testing.T, file string, tc corpus.Test, ctxVariant bool,
+	t *testing.T, file string, tc corpus.Test, mode replayMode,
 ) {
 	ctx := context.Background()
 	rng := caseRand(t.Name())
+	ctxVariant := mode == modeCtxTuples
 
 	if ctxVariant {
 		if len(tc.Stages) > 1 {
@@ -207,7 +312,7 @@ func runListObjectsReplay(
 	}
 
 	sides := []*side{
-		{name: "engine", client: engineForCase(t, file)},
+		{name: engineName(mode), client: engineForCase(t, file, mode)},
 		{name: "oracle", client: oracle.Client(t)},
 	}
 	for _, s := range sides {
@@ -219,7 +324,7 @@ func runListObjectsReplay(
 		s.storeID = resp.GetId()
 	}
 	t.Cleanup(func() {
-		_ = sides[0].client.(*sqlclient.Client).
+		_ = sides[0].client.(storeDeleter).
 			DeleteStore(ctx, sides[0].storeID)
 		_, _ = oracle.Client(t).DeleteStore(ctx,
 			&openfgav1.DeleteStoreRequest{StoreId: sides[1].storeID})
@@ -229,12 +334,17 @@ func runListObjectsReplay(
 		st := stage
 		t.Run(fmt.Sprintf("stage_%d", stageNum), func(t *testing.T) {
 			writeStageBoth(t, rng, sides, st, ctxVariant)
+			if mode == modeCompiled {
+				reportDelegated(t, sides[0])
+			}
 			for i, a := range st.ListObjectsAssertions {
 				assertion := a
 				t.Run(fmt.Sprintf("assertion_%d", i),
 					func(t *testing.T) {
 						runListObjectsAssertion(
 							t, rng, sides, st, assertion, ctxVariant)
+						reportGeneric(t, sides[0],
+							len(assertion.ContextualTuples) > 0)
 					})
 			}
 		})
@@ -330,10 +440,11 @@ func runListObjectsAssertion(
 // runListUsersReplay mirrors the upstream listusers runner:
 // set-compare the formatted users against the expectation.
 func runListUsersReplay(
-	t *testing.T, file string, tc corpus.Test, ctxVariant bool,
+	t *testing.T, file string, tc corpus.Test, mode replayMode,
 ) {
 	ctx := context.Background()
 	rng := caseRand(t.Name())
+	ctxVariant := mode == modeCtxTuples
 
 	if ctxVariant {
 		if len(tc.Stages) > 1 {
@@ -349,7 +460,7 @@ func runListUsersReplay(
 	}
 
 	sides := []*side{
-		{name: "engine", client: engineForCase(t, file)},
+		{name: engineName(mode), client: engineForCase(t, file, mode)},
 		{name: "oracle", client: oracle.Client(t)},
 	}
 	for _, s := range sides {
@@ -361,7 +472,7 @@ func runListUsersReplay(
 		s.storeID = resp.GetId()
 	}
 	t.Cleanup(func() {
-		_ = sides[0].client.(*sqlclient.Client).
+		_ = sides[0].client.(storeDeleter).
 			DeleteStore(ctx, sides[0].storeID)
 		_, _ = oracle.Client(t).DeleteStore(ctx,
 			&openfgav1.DeleteStoreRequest{StoreId: sides[1].storeID})
@@ -371,16 +482,37 @@ func runListUsersReplay(
 		st := stage
 		t.Run(fmt.Sprintf("stage_%d", stageNum), func(t *testing.T) {
 			writeStageBoth(t, rng, sides, st, ctxVariant)
+			if mode == modeCompiled {
+				reportDelegated(t, sides[0])
+			}
 			for i, a := range st.ListUsersAssertions {
 				assertion := a
 				t.Run(fmt.Sprintf("assertion_%d", i),
 					func(t *testing.T) {
+						if mode == modeCompiled &&
+							hasWildcard(assertion.Expectation) {
+							skiplist.Skip(t, "compiled: __subjects "+
+								"returns the final list, so a wildcard "+
+								"answer is compared against per-user "+
+								"check over a subject source (P1.8)")
+						}
 						runListUsersAssertion(
 							t, rng, sides, st, assertion, ctxVariant)
+						reportGeneric(t, sides[0],
+							len(assertion.ContextualTuples) > 0)
 					})
 			}
 		})
 	}
+}
+
+func hasWildcard(users []string) bool {
+	for _, u := range users {
+		if strings.HasSuffix(u, ":*") {
+			return true
+		}
+	}
+	return false
 }
 
 func luFilterProto(f string) *openfgav1.UserTypeFilter {

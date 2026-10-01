@@ -77,10 +77,13 @@ func TestCheckCorpus(t *testing.T) {
 		func(t *testing.T, file string, tc corpus.Test) {
 			t.Parallel()
 			t.Run("normal", func(t *testing.T) {
-				runCheckReplay(t, file, tc, false)
+				runCheckReplay(t, file, tc, modeNormal)
 			})
 			t.Run("ctxTuples", func(t *testing.T) {
-				runCheckReplay(t, file, tc, true)
+				runCheckReplay(t, file, tc, modeCtxTuples)
+			})
+			t.Run("compiled", func(t *testing.T) {
+				runCheckReplay(t, file, tc, modeCompiled)
 			})
 		})
 }
@@ -90,10 +93,13 @@ func TestListObjectsCorpus(t *testing.T) {
 		func(t *testing.T, file string, tc corpus.Test) {
 			t.Parallel()
 			t.Run("normal", func(t *testing.T) {
-				runListObjectsReplay(t, file, tc, false)
+				runListObjectsReplay(t, file, tc, modeNormal)
 			})
 			t.Run("ctxTuples", func(t *testing.T) {
-				runListObjectsReplay(t, file, tc, true)
+				runListObjectsReplay(t, file, tc, modeCtxTuples)
+			})
+			t.Run("compiled", func(t *testing.T) {
+				runListObjectsReplay(t, file, tc, modeCompiled)
 			})
 		})
 }
@@ -103,10 +109,13 @@ func TestListUsersCorpus(t *testing.T) {
 		func(t *testing.T, file string, tc corpus.Test) {
 			t.Parallel()
 			t.Run("normal", func(t *testing.T) {
-				runListUsersReplay(t, file, tc, false)
+				runListUsersReplay(t, file, tc, modeNormal)
 			})
 			t.Run("ctxTuples", func(t *testing.T) {
-				runListUsersReplay(t, file, tc, true)
+				runListUsersReplay(t, file, tc, modeCtxTuples)
+			})
+			t.Run("compiled", func(t *testing.T) {
+				runListUsersReplay(t, file, tc, modeCompiled)
 			})
 		})
 }
