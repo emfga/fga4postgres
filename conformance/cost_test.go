@@ -73,6 +73,27 @@ func listObjectsCount(
 	return n, callCounts(t, stmt, s.id, req)
 }
 
+// listUsersCount is listObjectsCount for fga.list_users.
+func listUsersCount(
+	t *testing.T, s costStore, object, objectID, rel, filter string,
+) (int, map[string]int64) {
+	t.Helper()
+	req := jsonArg(t, map[string]any{
+		"object":       map[string]string{"type": object, "id": objectID},
+		"relation":     rel,
+		"user_filters": []map[string]string{{"type": filter}},
+	})
+	stmt := `SELECT jsonb_array_length(
+	           fga.list_users($1, $2) -> 'users')`
+	var n int
+	err := testdb.Pool(t).QueryRow(context.Background(), stmt,
+		s.id, req).Scan(&n)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return n, callCounts(t, stmt, s.id, req)
+}
+
 // A tuple without a condition has nothing to evaluate: list_objects
 // must not call the condition evaluator for it at all. Evaluating
 // unconditionally cost ~1.3 s of a 7.9 s request on a 5,000-object
@@ -92,5 +113,79 @@ func TestListObjectsSkipsUnconditionedEval(t *testing.T) {
 	}
 	if got := calls["fga._eval_condition"]; got != 0 {
 		t.Errorf("fga._eval_condition calls = %d, want 0", got)
+	}
+}
+
+// capConfirmDSL makes every doc#viewer candidate need confirmation
+// by the forward resolver (an intersection on the path).
+const capConfirmDSL = `model
+  schema 1.1
+type user
+type doc
+  relations
+    define allowed: [user]
+    define viewer: [user] and allowed
+`
+
+// Once the cap is reached the search stops: with 5,005 candidates
+// that each need a forward check and a cap of 1,000, exactly 1,000
+// are confirmed. Before, all 5,005 were checked and the answer was
+// truncated afterwards.
+func TestListObjectsCapStopsEarly(t *testing.T) {
+	grant := func(n int) []*openfgav1.TupleKey {
+		var tuples []*openfgav1.TupleKey
+		for i := 0; i < n; i++ {
+			doc := fmt.Sprintf("doc:d%d", i)
+			tuples = append(tuples,
+				tk(doc, "viewer", "user:anne"),
+				tk(doc, "allowed", "user:anne"))
+		}
+		return tuples
+	}
+
+	// What confirming one candidate costs, measured rather than
+	// assumed, so a change to the forward resolver's shape does not
+	// break this test.
+	one := newCostStore(t, capConfirmDSL, grant(1))
+	n, calls := listObjectsCount(t, one, "doc", "viewer",
+		one.user("user", "anne"))
+	perConfirm := calls["fga._check_node"]
+	if n != 1 || perConfirm == 0 {
+		t.Fatalf("one doc: objects = %d, _check_node calls = %d;"+
+			" the fixture no longer needs confirmation", n, perConfirm)
+	}
+
+	s := newCostStore(t, capConfirmDSL, grant(5005))
+	n, calls = listObjectsCount(t, s, "doc", "viewer",
+		s.user("user", "anne"))
+	if n != 1000 {
+		t.Fatalf("objects = %d, want the 1000 cap", n)
+	}
+	got := calls["fga._check_node"]
+	if want := 1000 * perConfirm; got != want {
+		t.Errorf("fga._check_node calls = %d, want %d "+
+			"(1000 confirmations x %d)", got, want, perConfirm)
+	}
+}
+
+// The same for list_users: 5,005 direct viewers and a cap of 1,000
+// fold exactly 1,000 users into the result. Before, every row was
+// folded in (quadratically, each union re-deduplicates the set) and
+// the answer truncated afterwards.
+func TestListUsersCapStopsEarly(t *testing.T) {
+	var tuples []*openfgav1.TupleKey
+	for i := 0; i < 5005; i++ {
+		tuples = append(tuples, tk(
+			"doc:d", "viewer", fmt.Sprintf("user:u%d", i)))
+	}
+	s := newCostStore(t, plainDSL, tuples)
+
+	n, calls := listUsersCount(t, s, "doc", s.ids.ID("d"), "viewer",
+		"user")
+	if n != 1000 {
+		t.Fatalf("users = %d, want the 1000 cap", n)
+	}
+	if got := calls["fga._lu_union"]; got != 1000 {
+		t.Errorf("fga._lu_union calls = %d, want 1000", got)
 	}
 }

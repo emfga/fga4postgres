@@ -201,3 +201,61 @@ func TestProbeListObjectsResultCap(t *testing.T) {
 		}
 	}
 }
+
+// capUnconfirmedDSL reaches doc#can_view two ways: through
+// restricted, whose candidates need a forward check (intersection),
+// and through a group's owners, one level further out.
+const capUnconfirmedDSL = `model
+  schema 1.1
+type user
+type group
+  relations
+    define member: [user]
+type doc
+  relations
+    define allowed: [user]
+    define restricted: [user] and allowed
+    define owner: [group#member]
+    define can_view: restricted or owner
+`
+
+// The cap counts confirmed objects only. Here 1,000 candidates
+// arrive through restricted and every one fails its forward check
+// (anne is never allowed), while doc:owned is one level further out
+// through the group. Stopping the search on the unconfirmed count
+// would end it before doc:owned is reached and answer nothing.
+func TestProbeListObjectsCapCountsConfirmed(t *testing.T) {
+	ctx := context.Background()
+	for _, sd := range bothSides(t, "lo-cap-confirmed") {
+		tuples := []*openfgav1.TupleKey{
+			tk("group:g", "member", "user:anne"),
+			tk("doc:owned", "owner", "group:g#member"),
+		}
+		for i := 0; i < 1000; i++ {
+			tuples = append(tuples, tk(
+				fmt.Sprintf("doc:d%d", i), "restricted", "user:anne"))
+		}
+		store, model := setup(t, sd.client, capUnconfirmedDSL, tuples)
+		resp, err := sd.client.(interface {
+			ListObjects(context.Context,
+				*openfgav1.ListObjectsRequest,
+				...grpc.CallOption,
+			) (*openfgav1.ListObjectsResponse, error)
+		}).ListObjects(ctx, &openfgav1.ListObjectsRequest{
+			StoreId:              store,
+			AuthorizationModelId: model,
+			Type:                 "doc",
+			Relation:             "can_view",
+			User:                 "user:anne",
+		})
+		if err != nil {
+			t.Fatalf("%s: %v", sd.name, err)
+		}
+		got := resp.GetObjects()
+		t.Logf("OBSERVED(%s): %v", sd.name, got)
+		if len(got) != 1 || got[0] != "doc:owned" {
+			t.Errorf("%s: objects = %v, want [doc:owned]",
+				sd.name, got)
+		}
+	}
+}

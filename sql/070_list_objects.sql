@@ -19,6 +19,10 @@
 --        candidate and raised only when the result count stays
 --        below the 1000 cap (upstream's scoping) — otherwise
 --        tolerated.
+--   Cap: the search stops once the cap is reached, counting
+--        confirmed objects only — a candidate still awaiting its
+--        forward check may yet be refused, so it never ends the
+--        search early.
 --
 -- Candidates whose path crossed a relation containing
 -- intersection or difference carry a sticky taint and are
@@ -78,7 +82,7 @@ DECLARE
   next_frontier fga._lo_node[];
   cands fga._lo_cand[];
   seen fga._lo_node[] := '{}';
-  found uuid[] := '{}';
+  cap integer := 1000;
   clear_ids uuid[] := '{}';
   tainted_ids uuid[] := '{}';
   err_count integer := 0;
@@ -181,11 +185,10 @@ BEGIN
   IF s.subject_relation <> '' AND s.subject_type = target_type
      AND s.subject_relation = target_rel THEN
     clear_ids := clear_ids || sid;
-    found := found || sid;
   END IF;
 
   WHILE coalesce(array_length(frontier, 1), 0) > 0
-        AND coalesce(array_length(found, 1), 0) < 1000
+        AND cardinality(clear_ids) < cap
   LOOP
     seen := seen || frontier;
 
@@ -378,17 +381,16 @@ BEGIN
       WHERE nn.ntype = target_type AND nn.nrel = target_rel
         AND nn.tainted
     ) nn;
-    SELECT coalesce(array_agg(DISTINCT x), '{}') INTO found
-    FROM unnest(clear_ids || tainted_ids) x;
-
     frontier := next_frontier;
   END LOOP;
 
   -- Confirm tainted candidates with the forward resolver, fresh
-  -- budget each; a refusal there joins the per-candidate error
-  -- pool under the same scoping.
-  FOREACH cid IN ARRAY tainted_ids LOOP
-    CONTINUE WHEN cid = ANY (clear_ids);
+  -- budget each, until the cap is reached; a refusal there joins
+  -- the per-candidate error pool under the same scoping.
+  FOR cid IN
+    SELECT unnest(tainted_ids) EXCEPT SELECT unnest(clear_ids)
+  LOOP
+    EXIT WHEN cardinality(clear_ids) >= cap;
     BEGIN
       r := fga._check_node(
         store_id, mid, target_type, cid, target_rel,
@@ -406,7 +408,7 @@ BEGIN
   END LOOP;
 
   IF err_count > 0
-     AND coalesce(array_length(clear_ids, 1), 0) < 1000 THEN
+     AND cardinality(clear_ids) < cap THEN
     RAISE EXCEPTION '%', first_err USING ERRCODE = 'YF100';
   END IF;
 
@@ -414,7 +416,7 @@ BEGIN
     target_type || ':' || x.id), '{}')
   INTO objects
   FROM (
-    SELECT DISTINCT unnest(clear_ids) AS id LIMIT 1000
+    SELECT DISTINCT unnest(clear_ids) AS id LIMIT cap
   ) x;
 
   RETURN jsonb_build_object('objects',

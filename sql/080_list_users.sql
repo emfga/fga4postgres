@@ -21,6 +21,12 @@
 --     (2000) — never dropped for a granting sibling (unlike
 --     check) and never tolerated by result count (unlike
 --     list_objects);
+--   - the cap stops the search: once a node reached only through
+--     unions holds as many users as the cap, its remaining rows
+--     and children are not read (so an error there is never
+--     met — upstream likewise stops collecting at the cap). Under
+--     an intersection or exclusion every operand is computed in
+--     full, since the operation may still remove users.
 --   - depth: the userset ladder errors at 25 links where check
 --     errors at 26 — list_users charges one hop more; cycles
 --     yield nothing (fail-closed).
@@ -205,7 +211,8 @@ CREATE OR REPLACE FUNCTION fga._lu_expand(
   req_ctx jsonb,
   depth integer,
   visited text[],
-  rw jsonb
+  rw jsonb,
+  cap integer
 )
 RETURNS fga._lu_set
 LANGUAGE plpgsql
@@ -225,6 +232,8 @@ BEGIN
       SELECT * FROM fga._read_all_tuples(
         store_id, model_id, ot, oid, rel, ctx)
     LOOP
+      EXIT WHEN cap > 0
+        AND cardinality(acc.plus) + acc.wild::integer >= cap;
       -- Relevance (path pruning) precedes condition evaluation:
       -- a tuple that cannot lead to a filter match is never
       -- touched, so its condition never errors.
@@ -254,7 +263,7 @@ BEGIN
           store_id, model_id,
           row.subject_type, row.subject_id,
           row.subject_relation,
-          f_type, f_rel, ctx, req_ctx, depth, visited));
+          f_type, f_rel, ctx, req_ctx, depth, visited, cap));
       ELSIF row.subject_id
               = '00000000-0000-0000-0000-000000000000' THEN
         acc.wild := true;
@@ -271,15 +280,17 @@ BEGIN
     RETURN fga._lu_node(
       store_id, model_id,
       ot, oid, rw -> 'computed_userset' ->> 'relation',
-      f_type, f_rel, ctx, req_ctx, depth - 1, visited);
+      f_type, f_rel, ctx, req_ctx, depth - 1, visited, cap);
 
   ELSIF rw ? 'union' THEN
     FOR child IN
       SELECT * FROM jsonb_array_elements(rw -> 'union' -> 'child')
     LOOP
+      EXIT WHEN cap > 0
+        AND cardinality(acc.plus) + acc.wild::integer >= cap;
       acc := fga._lu_union(acc, fga._lu_expand(
         store_id, model_id, ot, oid, rel,
-        f_type, f_rel, ctx, req_ctx, depth, visited, child));
+        f_type, f_rel, ctx, req_ctx, depth, visited, child, cap));
     END LOOP;
     RETURN acc;
 
@@ -290,7 +301,7 @@ BEGIN
     LOOP
       child_set := fga._lu_expand(
         store_id, model_id, ot, oid, rel,
-        f_type, f_rel, ctx, req_ctx, depth, visited, child);
+        f_type, f_rel, ctx, req_ctx, depth, visited, child, 0);
       IF first THEN
         acc := child_set;
         first := false;
@@ -305,11 +316,11 @@ BEGIN
       fga._lu_expand(
         store_id, model_id, ot, oid, rel,
         f_type, f_rel, ctx, req_ctx, depth, visited,
-        rw -> 'difference' -> 'base'),
+        rw -> 'difference' -> 'base', 0),
       fga._lu_expand(
         store_id, model_id, ot, oid, rel,
         f_type, f_rel, ctx, req_ctx, depth, visited,
-        rw -> 'difference' -> 'subtract'));
+        rw -> 'difference' -> 'subtract', 0));
 
   ELSIF rw ? 'tuple_to_userset' THEN
     FOR row IN
@@ -318,6 +329,8 @@ BEGIN
         rw -> 'tuple_to_userset' -> 'tupleset' ->> 'relation',
         ctx)
     LOOP
+      EXIT WHEN cap > 0
+        AND cardinality(acc.plus) + acc.wild::integer >= cap;
       IF NOT EXISTS (
         SELECT FROM fga.model_relation mr
         WHERE mr.store = store_id
@@ -349,7 +362,7 @@ BEGIN
         row.subject_type, row.subject_id,
         rw -> 'tuple_to_userset'
           -> 'computed_userset' ->> 'relation',
-        f_type, f_rel, ctx, req_ctx, depth, visited));
+        f_type, f_rel, ctx, req_ctx, depth, visited, cap));
     END LOOP;
     RETURN acc;
 
@@ -370,7 +383,8 @@ CREATE OR REPLACE FUNCTION fga._lu_node(
   ctx fga._tuple_key[],
   req_ctx jsonb,
   depth integer,
-  visited text[]
+  visited text[],
+  cap integer
 )
 RETURNS fga._lu_set
 LANGUAGE plpgsql
@@ -402,7 +416,7 @@ BEGIN
 
   acc := fga._lu_expand(
     store_id, model_id, ot, oid, rel, f_type, f_rel,
-    ctx, req_ctx, depth + 1, visited || node_key, rw);
+    ctx, req_ctx, depth + 1, visited || node_key, rw, cap);
 
   -- Reflexive emission: this node itself matches a userset
   -- filter.
@@ -440,6 +454,7 @@ DECLARE
   uset fga._lu_set;
   users fga._lu_user[];
   result jsonb;
+  cap integer := 1000;
 BEGIN
   mid := fga._resolve_model(
     store_id, request ->> 'authorization_model_id');
@@ -506,7 +521,7 @@ BEGIN
 
   uset := fga._lu_node(
     store_id, mid, target_type, oid, target_rel,
-    f_type, f_rel, ctx, req_ctx, -1, '{}');
+    f_type, f_rel, ctx, req_ctx, -1, '{}', cap);
 
   users := uset.plus;
   IF uset.wild THEN
@@ -532,7 +547,7 @@ BEGIN
             'type', x.utype, 'id', x.uid::text))
       END AS u
     FROM unnest(users) x
-    LIMIT 1000
+    LIMIT cap
   ) s;
 
   RETURN jsonb_build_object('users', result);
