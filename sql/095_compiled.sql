@@ -2783,6 +2783,23 @@ AS $$
     p.type_name, p.relation_name, k.kind) AS name) AS n;
 $$;
 
+-- Serialises the generator's work on one store, for the rest of
+-- the transaction. The two-int advisory lock form, with a class id
+-- hashed from a constant naming this purpose, so the key cannot meet
+-- an application's single-bigint advisory locks (another lock space)
+-- and is unlikely to meet its two-int ones; the second int hashes the
+-- store. Two stores whose hashes collide only wait for each other.
+CREATE OR REPLACE FUNCTION fga._compiled_lock(store_id uuid)
+RETURNS void
+LANGUAGE sql
+VOLATILE
+SET search_path = fga, pg_temp
+AS $$
+  SELECT pg_advisory_xact_lock(
+    hashtext('fga4postgres compiled relations'),
+    hashtext(store_id::text));
+$$;
+
 -- Drops every registered function of a store and its registry
 -- rows. Only registered functions: anything else in the schema
 -- belongs to the application.
@@ -2795,6 +2812,7 @@ AS $$
 DECLARE
   fn regprocedure;
 BEGIN
+  PERFORM fga._compiled_lock(store_id);
   FOR fn IN
     SELECT DISTINCT v.f
     FROM fga.compiled_relation r,
@@ -2822,6 +2840,13 @@ $$;
 -- same-signature function the engine did not register belongs to
 -- the application: it refuses the model write instead of being
 -- overwritten.
+--
+-- Two model writes to one store regenerate the same functions, so
+-- they are serialised on the store's lock (_compiled_lock): the
+-- second waits for the first to commit, then reads the registry it
+-- left. Unserialised, the second regenerated from a registry that
+-- did not show the first's rows, and left them (and their
+-- functions) behind.
 CREATE OR REPLACE FUNCTION fga._compiled_generate(store_id uuid)
 RETURNS void
 LANGUAGE plpgsql
@@ -2840,6 +2865,10 @@ BEGIN
   IF NOT FOUND THEN
     RETURN;
   END IF;
+  -- Every statement below reads what a write that held the lock
+  -- before us committed (a VOLATILE function's statements each take
+  -- a new snapshot).
+  PERFORM fga._compiled_lock(store_id);
 
   SELECT m.id INTO mid FROM fga.model m
   WHERE m.store = store_id ORDER BY m.id DESC LIMIT 1;
