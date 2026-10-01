@@ -189,8 +189,8 @@ AS $$
   )) ->> 'allowed')::boolean;
 $$;
 
--- Delegated objects go through list_objects, so they carry its
--- result cap until an uncapped resolver entry point exists.
+-- Delegated objects go through streamed_list_objects, which is
+-- uncapped like every generated __objects.
 CREATE OR REPLACE FUNCTION fga._compiled_objects(
   store_id uuid, model_id uuid, object_type text, relation text,
   subject_type text, subject_id uuid, subject_relation text,
@@ -201,8 +201,8 @@ LANGUAGE sql
 STABLE PARALLEL SAFE
 SET search_path = fga, pg_temp
 AS $$
-  SELECT split_part(o, ':', 2)::uuid
-  FROM jsonb_array_elements_text(fga.list_objects(store_id,
+  SELECT split_part(o ->> 'object', ':', 2)::uuid
+  FROM fga.streamed_list_objects(store_id,
     jsonb_build_object(
       'authorization_model_id', model_id::text,
       'type', object_type,
@@ -212,7 +212,7 @@ AS $$
       'context', context,
       'contextual_tuples', jsonb_build_object(
         'tuple_keys', coalesce(contextual_tuples, '[]'::jsonb))
-    )) -> 'objects') AS o;
+    )) AS o;
 $$;
 
 -- The rows of a registered subject source ("schema.table(column)").
