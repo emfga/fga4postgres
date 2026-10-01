@@ -124,7 +124,10 @@ func reportDelegated(t *testing.T, engine *side) {
 		t.Fatal(err)
 	}
 	for _, e := range delegated {
-		reason := e.reason
+		// The missing-subject-source note is not a strategy reason:
+		// corpus stores register no source, and the note would split
+		// every delegated reason in the register.
+		reason, _, _ := strings.Cut(e.reason, "; __subjects:")
 		if m := delegatedVia.FindStringSubmatch(reason); m != nil {
 			reason = "depends on a delegated relation: " + m[1]
 		}
@@ -491,10 +494,9 @@ func runListUsersReplay(
 					func(t *testing.T) {
 						if mode == modeCompiled &&
 							hasWildcard(assertion.Expectation) {
-							skiplist.Skip(t, "compiled: __subjects "+
-								"returns the final list, so a wildcard "+
-								"answer is compared against per-user "+
-								"check over a subject source (P1.8)")
+							runListUsersWildcardCompiled(t, rng, sides,
+								tc.Stages[:stageNum+1], assertion)
+							return
 						}
 						runListUsersAssertion(
 							t, rng, sides, st, assertion, ctxVariant)
@@ -504,6 +506,109 @@ func runListUsersReplay(
 			}
 		})
 	}
+}
+
+// runListUsersWildcardCompiled replays a list_users assertion whose
+// answer holds a typed wildcard. The oracle still answers the
+// corpus expectation; __subjects instead returns the final list
+// (decision 8), so the store registers a subject source — every id
+// of the filter type the stages and the request mention, plus ids
+// nothing grants to directly — and the list must equal the source
+// subjects the engine's check allows, one at a time. Upstream's
+// answer cannot be the reference: user:* hides who is excluded.
+func runListUsersWildcardCompiled(
+	t *testing.T, rng *rand.Rand, sides []*side,
+	stages []*corpus.Stage, a *corpus.ListUsersAssertion,
+) {
+	ctx := context.Background()
+	runListUsersAssertion(t, rng, sides[1:], stages[len(stages)-1], a,
+		false)
+
+	c := sides[0].client.(*sqlclient.Compiled)
+	ftype := a.Request.Filters[0]
+	if strings.Contains(ftype, "#") {
+		t.Fatalf("wildcard answer for userset filter %s", ftype)
+	}
+	seen := map[string]bool{}
+	var source []string
+	add := func(user string) {
+		typ, id, ok := strings.Cut(user, ":")
+		if !ok || typ != ftype || id == "*" ||
+			strings.Contains(id, "#") || seen[id] {
+			return
+		}
+		seen[id] = true
+		source = append(source, id)
+	}
+	for _, st := range stages {
+		for _, k := range st.Tuples {
+			add(k.GetUser())
+		}
+	}
+	for _, k := range a.ContextualTuples {
+		add(k.GetUser())
+	}
+	for _, u := range a.Expectation {
+		add(u)
+	}
+	add(ftype + ":compiled-source-only-1")
+	add(ftype + ":compiled-source-only-2")
+	err := c.RegisterSubjectSource(ctx, sides[0].storeID, ftype, source)
+	if err != nil {
+		t.Fatalf("register subject source: %v", err)
+	}
+
+	var ctxTuples *openfgav1.ContextualTupleKeys
+	if len(a.ContextualTuples) > 0 {
+		ctxTuples = &openfgav1.ContextualTupleKeys{
+			TupleKeys: a.ContextualTuples,
+		}
+	}
+	var want []string
+	for _, id := range source {
+		resp, err := c.Client.Check(ctx, &openfgav1.CheckRequest{
+			StoreId:              sides[0].storeID,
+			AuthorizationModelId: sides[0].modelID,
+			TupleKey: &openfgav1.CheckRequestTupleKey{
+				Object:   a.Request.Object,
+				Relation: a.Request.Relation,
+				User:     ftype + ":" + id,
+			},
+			Context:          a.Context,
+			ContextualTuples: ctxTuples,
+		})
+		if err != nil {
+			t.Fatalf("reference check for %s:%s: %v", ftype, id, err)
+		}
+		if resp.GetAllowed() {
+			want = append(want, ftype+":"+id)
+		}
+	}
+
+	objType, objID, _ := strings.Cut(a.Request.Object, ":")
+	resp, err := c.ListUsers(ctx, &openfgav1.ListUsersRequest{
+		StoreId:              sides[0].storeID,
+		AuthorizationModelId: sides[0].modelID,
+		Object:               &openfgav1.Object{Type: objType, Id: objID},
+		Relation:             a.Request.Relation,
+		UserFilters:          []*openfgav1.UserTypeFilter{{Type: ftype}},
+		Context:              a.Context,
+		ContextualTuples:     a.ContextualTuples,
+	})
+	if err != nil {
+		t.Fatalf("%s: unexpected error: %v", sides[0].name, err)
+	}
+	var got []string
+	for _, u := range resp.GetUsers() {
+		got = append(got, luUserString(u))
+	}
+	sort.Strings(got)
+	sort.Strings(want)
+	if !slices.Equal(got, want) {
+		t.Errorf("%s: subjects %v, check allows %v over the source",
+			sides[0].name, got, want)
+	}
+	reportGeneric(t, sides[0], len(a.ContextualTuples) > 0)
 }
 
 func hasWildcard(users []string) bool {

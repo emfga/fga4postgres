@@ -399,3 +399,48 @@ func (c *Compiled) ListUsers(
 	}
 	return resp, nil
 }
+
+// RegisterSubjectSource plays the application's part in decision
+// 8: it creates a table in the store's schema holding the given
+// ids (request strings, mapped like any other) of one subject type
+// and registers it as that type's subject source, which regenerates
+// the store's functions. Calling it again for the same type adds
+// ids to the same table.
+func (c *Compiled) RegisterSubjectSource(
+	ctx context.Context, storeID, subjectType string, ids []string,
+) error {
+	schema := compiledSchema(storeID)
+	table := fmt.Sprintf("source_%x", []byte(subjectType))
+	if len(table) > 63 {
+		return fmt.Errorf("subject type %q: table name too long",
+			subjectType)
+	}
+	mapped := make([]string, len(ids))
+	for i, id := range ids {
+		mapped[i] = id
+		if c.ids != nil {
+			mapped[i] = c.ids.ID(id)
+		}
+	}
+	_, err := c.pool.Exec(ctx, fmt.Sprintf(
+		"CREATE TABLE IF NOT EXISTS %s.%s (subject_id uuid PRIMARY KEY)",
+		schema, table))
+	if err != nil {
+		return translate(err)
+	}
+	_, err = c.pool.Exec(ctx, fmt.Sprintf(`
+		INSERT INTO %s.%s
+		SELECT DISTINCT unnest($1::uuid[]) ON CONFLICT DO NOTHING`,
+		schema, table), mapped)
+	if err != nil {
+		return translate(err)
+	}
+	_, err = c.pool.Exec(ctx, `
+		SELECT fga.enable_compiled_relations(cs.store,
+		  cs.target_schema, coalesce(cs.subject_sources, '{}')
+		    || jsonb_build_object($2::text, format('%s.%s(subject_id)',
+		         cs.target_schema, $3::text)))
+		FROM fga.compiled_store cs WHERE cs.store = $1::uuid`,
+		storeID, subjectType, table)
+	return translate(err)
+}
