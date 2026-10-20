@@ -78,6 +78,7 @@ BEGIN
   GRANT USAGE ON SCHEMA cel TO fga_writer;
   GRANT EXECUTE ON FUNCTION
     fga.write(uuid, jsonb),
+    fga.delete_tuples(uuid, text, uuid[], text[], text, uuid[], text),
     fga.write_authorization_model(uuid, jsonb),
     fga.create_store(text),
     fga.delete_store(uuid),

@@ -112,6 +112,62 @@ object, `{"object": "doc:<id>"}`, for callers that need the
 whole set. It computes the whole answer before returning the
 first row; it is uncapped, not incremental.
 
+## Deleting tuples in bulk
+
+`fga.write` deletes by full key, at most 100 per call, as
+upstream does. `fga.delete_tuples` goes beyond upstream: it
+deletes every tuple matching a filter in one statement and returns
+the rows it deleted, conditions included, so a caller can audit
+exactly what was revoked.
+
+```sql
+-- Everything Anne holds, anywhere in the store.
+SELECT * FROM fga.delete_tuples(store_id,
+  subject_type => 'user', subject_ids => ARRAY[anne_id]);
+
+-- Only her viewer and editor grants on two documents.
+SELECT * FROM fga.delete_tuples(store_id,
+  subject_type => 'user', subject_ids => ARRAY[anne_id],
+  object_type => 'document', object_ids => ARRAY[doc1, doc2],
+  relations => ARRAY['viewer', 'editor']);
+```
+
+The filter must name a subject (`subject_type` and `subject_ids`)
+or an object (`object_type` and `object_ids`); every other
+argument narrows it, and a filter naming neither is refused, so no
+call can mean "the whole store". An empty array matches nothing.
+Leaving `subject_relation` out matches every subject relation —
+deleting group `g1` also removes grants to `group:g1#member` —
+while `''` keeps to direct subjects. A wildcard subject
+(`user:*`) is the nil uuid, in the filter as in the result. The
+filter is never checked against the model, like `fga.write`'s
+deletes, so tuples a model change stranded stay deletable.
+
+Because the engine lives in the same database, the application's
+own deletes can take their tuples with them, in the same
+transaction:
+
+```sql
+CREATE FUNCTION app.document_deleted() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+  PERFORM fga.delete_tuples(
+    (SELECT id FROM fga.store WHERE name = 'docs'),
+    object_type => 'document',
+    object_ids => ARRAY(SELECT id FROM gone));
+  RETURN NULL;
+END;
+$$;
+
+CREATE TRIGGER document_deleted AFTER DELETE ON app.document
+  REFERENCING OLD TABLE AS gone
+  FOR EACH STATEMENT EXECUTE FUNCTION app.document_deleted();
+```
+
+Two transactions deleting the same tuples behave as two `DELETE
+... RETURNING` statements do: the second waits for the first and,
+once it commits, returns nothing.
+
 ## Consumer privileges
 
 `sql/900_grants.sql` is a no-op until you create two group
@@ -136,7 +192,7 @@ GRANT fga_writer TO app_admin_user;
 including on standbys and in read-only transactions — but has
 no DML on the `fga` tables, so the write entry points fail for
 it at the table layer. `fga_writer` adds `fga.write`,
-`fga.write_authorization_model`, `fga.create_store`,
+`fga.delete_tuples`, `fga.write_authorization_model`, `fga.create_store`,
 `fga.delete_store`, `fga.enable_compiled_relations` and
 `fga.disable_compiled_relations`, and can change `fga.setting`.
 

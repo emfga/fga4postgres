@@ -38,6 +38,10 @@ documented in [docs/CONFORMANCE.md](docs/CONFORMANCE.md).
 - Tuple `write`/`delete` with upstream error semantics
   (including `on_duplicate`/`on_missing`), and `read` with keyset
   pagination
+- `delete_tuples`, beyond upstream: delete every tuple of a
+  subject or of an object in one statement, and get the deleted
+  rows back; see
+  [docs/INSTALL.md](docs/INSTALL.md#deleting-tuples-in-bulk).
 - A minimal store namespace (`create_store`/`delete_store`)
 - Compiled relations, beyond upstream: opt a store in and every
   relation also becomes plain SQL functions an application calls

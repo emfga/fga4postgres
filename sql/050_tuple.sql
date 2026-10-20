@@ -68,6 +68,26 @@ EXCEPTION WHEN duplicate_object THEN
 END;
 $$;
 
+-- A deleted tuple, as fga.delete_tuples returns it: the stored
+-- columns, a wildcard subject as the nil uuid. A public type, so
+-- the result does not depend on fga.tuple's layout.
+DO $$
+BEGIN
+  CREATE TYPE fga.deleted_tuple AS (
+    object_type text,
+    object_id uuid,
+    relation text,
+    subject_type text,
+    subject_id uuid,
+    subject_relation text,
+    condition_name text,
+    condition_context jsonb
+  );
+EXCEPTION WHEN duplicate_object THEN
+  NULL;
+END;
+$$;
+
 -- ULID per tuple: 48-bit millisecond timestamp + 80 random bits,
 -- Crockford base32. Entropy from random() only — core Postgres,
 -- no pgcrypto, so the install stays dependency-free. Uniqueness
@@ -448,8 +468,78 @@ BEGIN
 END;
 $$;
 
--- The single tuple write path: every mutation goes through here,
--- so a changelog is addable without rework.
+-- Every tuple delete: fga.write's deletes and fga.delete_tuples
+-- both remove rows here, so a changelog has one insert site
+-- (fga.write) and one delete site to hook. fga.delete_store drops
+-- a store's tuples with the store itself. A NULL
+-- argument does not filter; an empty array matches nothing; a NULL
+-- subject relation matches every relation, '' only direct
+-- subjects. The caller decides which filters are enough.
+--
+-- A filter naming every column is fga.write's delete of one key,
+-- and runs a static statement whose plan is cached for the
+-- session. Any other filter builds its statement from the filters
+-- given, so it plans with only the predicates that apply and an
+-- index serves it: a cached plan for "($2 IS NULL OR object_type =
+-- $2)" cannot use one. Built for every key, the statement doubled
+-- the cost of a 100-key delete.
+CREATE OR REPLACE FUNCTION fga._delete_tuples(
+  store_id uuid,
+  of_type text, of_ids uuid[], of_relations text[],
+  by_type text, by_ids uuid[], by_relation text
+)
+RETURNS SETOF fga.deleted_tuple
+LANGUAGE plpgsql
+VOLATILE
+SET search_path = fga, pg_temp
+AS $$
+DECLARE
+  q text := 'DELETE FROM fga.tuple t WHERE t.store = $1';
+BEGIN
+  IF num_nulls(of_type, of_ids, of_relations,
+               by_type, by_ids, by_relation) = 0 THEN
+    RETURN QUERY
+    DELETE FROM fga.tuple t
+    WHERE t.store = store_id
+      AND t.object_type = of_type AND t.object_id = ANY (of_ids)
+      AND t.relation = ANY (of_relations)
+      AND t.subject_type = by_type AND t.subject_id = ANY (by_ids)
+      AND t.subject_relation = by_relation
+    RETURNING t.object_type, t.object_id, t.relation,
+      t.subject_type, t.subject_id, t.subject_relation,
+      t.condition_name, t.condition_context;
+    RETURN;
+  END IF;
+
+  IF of_type IS NOT NULL THEN
+    q := q || ' AND t.object_type = $2';
+  END IF;
+  IF of_ids IS NOT NULL THEN
+    q := q || ' AND t.object_id = ANY ($3)';
+  END IF;
+  IF of_relations IS NOT NULL THEN
+    q := q || ' AND t.relation = ANY ($4)';
+  END IF;
+  IF by_type IS NOT NULL THEN
+    q := q || ' AND t.subject_type = $5';
+  END IF;
+  IF by_ids IS NOT NULL THEN
+    q := q || ' AND t.subject_id = ANY ($6)';
+  END IF;
+  IF by_relation IS NOT NULL THEN
+    q := q || ' AND t.subject_relation = $7';
+  END IF;
+  RETURN QUERY EXECUTE q || ' RETURNING t.object_type, t.object_id,'
+    ' t.relation, t.subject_type, t.subject_id, t.subject_relation,'
+    ' t.condition_name, t.condition_context'
+  USING store_id, of_type, of_ids, of_relations,
+    by_type, by_ids, by_relation;
+END;
+$$;
+
+-- The single tuple write path: every insert happens here, and
+-- every delete through fga._delete_tuples, so a changelog is
+-- addable without rework.
 -- Request is upstream's WriteRequest JSON shape,
 -- including writes.on_duplicate / deletes.on_missing (measured
 -- against the pinned oracle): "ignore" tolerates the identical
@@ -624,13 +714,9 @@ BEGIN
       RAISE EXCEPTION 'invalid tuple in deletes: %', tkj
         USING ERRCODE = 'YF100';
     END IF;
-    DELETE FROM fga.tuple t
-    WHERE t.store = store_id
-      AND t.object_type = d.object_type AND t.object_id = d.oid
-      AND t.relation = tkj ->> 'relation'
-      AND t.subject_type = d.subject_type
-      AND t.subject_id = d.sid
-      AND t.subject_relation = d.subject_relation;
+    PERFORM FROM fga._delete_tuples(store_id,
+      d.object_type, ARRAY[d.oid], ARRAY[tkj ->> 'relation'],
+      d.subject_type, ARRAY[d.sid], d.subject_relation);
     IF NOT FOUND AND on_miss <> 'ignore' THEN
       RAISE EXCEPTION
         'cannot delete a tuple which does not exist: %', tkj
@@ -639,6 +725,52 @@ BEGIN
   END LOOP;
 
   RETURN '{}'::jsonb;
+END;
+$$;
+
+-- Delete every tuple matching a filter, in one statement, and
+-- return what was deleted. Beyond upstream, which deletes by full
+-- key only: revoking everything a subject holds, or everything on
+-- an object being deleted (from a trigger on the application's own
+-- table, say), would otherwise be a read, then deletes 100 at a
+-- time.
+--
+-- Every argument narrows; together they must name a subject
+-- (subject_type and subject_ids) or an object (object_type and
+-- object_ids), so no filter can mean "the whole store". See
+-- fga._delete_tuples for NULL, empty arrays and subject_relation;
+-- the nil uuid in subject_ids matches a wildcard subject, as the
+-- result spells it. Like fga.write's deletes, the filter is never
+-- checked against the model, so rows a model change stranded
+-- stay deletable. A row a concurrent transaction deletes first
+-- is waited for and then not returned, as DELETE ... RETURNING
+-- does.
+CREATE OR REPLACE FUNCTION fga.delete_tuples(
+  store_id uuid,
+  object_type text DEFAULT NULL,
+  object_ids uuid[] DEFAULT NULL,
+  relations text[] DEFAULT NULL,
+  subject_type text DEFAULT NULL,
+  subject_ids uuid[] DEFAULT NULL,
+  subject_relation text DEFAULT NULL
+)
+RETURNS SETOF fga.deleted_tuple
+LANGUAGE plpgsql
+VOLATILE
+SET search_path = fga, pg_temp
+AS $$
+BEGIN
+  IF NOT (object_type IS NOT NULL AND object_ids IS NOT NULL
+          OR subject_type IS NOT NULL AND subject_ids IS NOT NULL)
+  THEN
+    RAISE EXCEPTION
+      'delete_tuples needs a subject (subject_type and '
+      'subject_ids) or an object (object_type and object_ids)'
+      USING ERRCODE = 'YF100';
+  END IF;
+  RETURN QUERY SELECT * FROM fga._delete_tuples(store_id,
+    object_type, object_ids, relations,
+    subject_type, subject_ids, subject_relation);
 END;
 $$;
 

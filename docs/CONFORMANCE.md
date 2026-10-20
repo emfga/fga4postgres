@@ -173,6 +173,14 @@ corpus-visible):
   interleaved writes.
 - PostgreSQL 18+ is the platform floor (native `uuidv7()`); this
   is a platform bound, not a semantic divergence.
+- `fga.delete_tuples` (`docs/INSTALL.md`, "Deleting tuples in
+  bulk") is an additive surface upstream does not have: a delete
+  by filter, anchored on a subject or an object, that returns the
+  deleted rows. With no upstream counterpart there is nothing to
+  compare it with; conformance/delete_tuples_test.go pins its own
+  contract. `fga.write`'s deletes run through the same delete and
+  keep upstream's semantics, which the corpus and the write probes
+  check.
 - Compiled relations (`docs/INSTALL.md`, "Compiled relations") are
   an additive surface upstream does not have: per-relation SQL
   functions an application calls inside its own queries. They make
