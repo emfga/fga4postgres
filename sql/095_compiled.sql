@@ -202,12 +202,11 @@ $$;
 -- is the one the function was compiled from, so a delegated
 -- answer never comes from another model.
 --
--- These hand-offs set fga._dispatching (see fga._check_compiled)
--- for their own duration, so the public entry point they call
--- answers generically: on an opted-in store it would otherwise
--- dispatch straight back to the generated function that handed
--- the question off (a recursive relation given contextual tuples,
--- called directly), which would hand it off again.
+-- These hand-offs ask with dispatch off (see fga._check), so they
+-- are answered generically: on an opted-in store they would
+-- otherwise dispatch straight back to the generated function that
+-- handed the question off (a recursive relation given contextual
+-- tuples, called directly), which would hand it off again.
 CREATE OR REPLACE FUNCTION fga._compiled_check(
   store_id uuid, model_id uuid, object_type text, relation text,
   object_id uuid, subject_type text, subject_id uuid,
@@ -218,9 +217,8 @@ RETURNS boolean
 LANGUAGE sql
 STABLE PARALLEL SAFE
 SET search_path = fga, pg_temp
-SET fga._dispatching = 'on'
 AS $$
-  SELECT (fga.check(store_id, jsonb_build_object(
+  SELECT (fga._check(store_id, jsonb_build_object(
     'authorization_model_id', model_id::text,
     'tuple_key', jsonb_build_object(
       'object', object_type || ':' || fga._compiled_oid(object_id),
@@ -230,24 +228,24 @@ AS $$
     'context', context,
     'contextual_tuples', jsonb_build_object(
       'tuple_keys', coalesce(contextual_tuples, '[]'::jsonb))
-  )) ->> 'allowed')::boolean;
+  ), false) ->> 'allowed')::boolean;
 $$;
 
--- Delegated objects go through streamed_list_objects, which is
--- uncapped like every generated __objects.
+-- Delegated objects run the search behind streamed_list_objects,
+-- uncapped like every generated __objects. The search is held in a
+-- variable for the reason fga.streamed_list_objects gives.
 CREATE OR REPLACE FUNCTION fga._compiled_objects(
   store_id uuid, model_id uuid, object_type text, relation text,
   subject_type text, subject_id uuid, subject_relation text,
   any_subject boolean, context jsonb, contextual_tuples jsonb
 )
 RETURNS SETOF uuid
-LANGUAGE sql
+LANGUAGE plpgsql
 STABLE PARALLEL SAFE
 SET search_path = fga, pg_temp
-SET fga._dispatching = 'on'
 AS $$
-  SELECT split_part(o ->> 'object', ':', 2)::uuid
-  FROM fga.streamed_list_objects(store_id,
+DECLARE
+  objects text[] := fga._list_objects(store_id,
     jsonb_build_object(
       'authorization_model_id', model_id::text,
       'type', object_type,
@@ -257,7 +255,11 @@ AS $$
       'context', context,
       'contextual_tuples', jsonb_build_object(
         'tuple_keys', coalesce(contextual_tuples, '[]'::jsonb))
-    )) AS o;
+    ), 0, false);
+BEGIN
+  RETURN QUERY
+  SELECT split_part(o, ':', 2)::uuid FROM unnest(objects) AS o;
+END;
 $$;
 
 -- The rows of a registered subject source ("schema.table(column)").
@@ -303,7 +305,6 @@ RETURNS SETOF uuid
 LANGUAGE plpgsql
 STABLE PARALLEL SAFE
 SET search_path = fga, pg_temp
-SET fga._dispatching = 'on'
 AS $$
 DECLARE
   users jsonb;

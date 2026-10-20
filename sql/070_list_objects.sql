@@ -59,11 +59,12 @@ EXCEPTION WHEN duplicate_object THEN
 END;
 $$;
 
+-- Releases up to 0.1.1 took no dispatch argument.
+DROP FUNCTION IF EXISTS fga._list_objects(uuid, jsonb, integer);
+
 -- A compiled relation's __objects function (sql/095_compiled.sql),
 -- called by the search below once the request has passed its
--- validation, with the cap applied on top (0 = uncapped). The
--- fga._dispatching setting keeps the generated body's hand-offs to
--- the generic resolver generic (see fga._check_compiled).
+-- validation, with the cap applied on top (0 = uncapped).
 --
 -- The call is dynamic (the function is found in the registry), and
 -- PostgreSQL plans a dynamic statement on every execution. WITH
@@ -87,7 +88,6 @@ RETURNS text[]
 LANGUAGE plpgsql
 STABLE PARALLEL SAFE
 SET search_path = fga, pg_temp
-SET fga._dispatching = 'on'
 AS $$
 DECLARE
   q constant text := format(
@@ -117,11 +117,14 @@ $$;
 -- The search behind fga.list_objects and fga.streamed_list_objects:
 -- the request's objects, at most cap of them (0 = unlimited). One
 -- body for both is what keeps their validation, error codes and
--- answers identical apart from the cap.
+-- answers identical apart from the cap. Dispatch to generated
+-- functions is off for a generated function's own hand-off
+-- (fga._compiled_objects), as in fga._check.
 CREATE OR REPLACE FUNCTION fga._list_objects(
   store_id uuid,
   request jsonb,
-  cap integer
+  cap integer,
+  dispatch boolean
 )
 RETURNS text[]
 LANGUAGE plpgsql
@@ -232,10 +235,9 @@ BEGIN
   END IF;
 
   -- An opted-in store's latest model answers through the
-  -- relation's generated __objects (see fga.check); delegated
+  -- relation's generated __objects (see fga._check); delegated
   -- relations are skipped, their __objects runs this search.
-  IF current_setting('fga._dispatching', true)
-     IS DISTINCT FROM 'on' THEN
+  IF dispatch THEN
     SELECT cr.objects_fn INTO fn
     FROM fga.compiled_relation cr
     WHERE cr.store = store_id AND cr.model_id = mid
@@ -522,5 +524,5 @@ SET search_path = fga, pg_temp
 AS $$
   SELECT jsonb_build_object('objects', to_jsonb(fga._list_objects(
     store_id, request,
-    fga._setting_int('list_objects_max_results'))));
+    fga._setting_int('list_objects_max_results'), true)));
 $$;

@@ -13,8 +13,8 @@ import (
 // fga.check would dispatch straight back to the same generated
 // function, which would hand off again — one wasted level per call.
 //
-// Mutation: drop the SET fga._dispatching clause from _compiled_check
-// or _compiled_objects and the generated function runs twice.
+// Mutation: pass dispatch true from _compiled_check or
+// _compiled_objects and the generated function runs twice.
 func TestCompiledHandOffIsGeneric(t *testing.T) {
 	s := newDispatchStore(t, true)
 	ctxTuples := jsonArg(t, []map[string]string{{

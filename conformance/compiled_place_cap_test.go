@@ -3,7 +3,6 @@ package conformance
 import (
 	"context"
 	"fmt"
-	"sort"
 	"strings"
 	"testing"
 
@@ -136,51 +135,11 @@ func (f compiledFixture) registry(
 	return s, r
 }
 
-// generic runs a query with dispatch to generated functions off, so
-// fga.check and fga.streamed_list_objects answer through the generic
-// resolver, and renders its rows like outcome.
-func (f compiledFixture) generic(
-	t *testing.T, query string, args ...any,
-) string {
-	t.Helper()
-	ctx := context.Background()
-	conn, err := testdb.Pool(t).Acquire(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer conn.Release()
-	if _, err := conn.Exec(ctx, "SET fga._dispatching = 'on'; "+
-		"SET statement_timeout = '5s'"); err != nil {
-		t.Fatal(err)
-	}
-	defer func() {
-		_, _ = conn.Exec(ctx,
-			"RESET fga._dispatching; RESET statement_timeout")
-	}()
-	rows, err := conn.Query(ctx, query, args...)
-	if err != nil {
-		return "error " + sqlState(err)
-	}
-	var got []string
-	for rows.Next() {
-		var v string
-		if err := rows.Scan(&v); err != nil {
-			t.Fatal(err)
-		}
-		got = append(got, f.ids.Back(v))
-	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
-		return "error " + sqlState(err)
-	}
-	sort.Strings(got)
-	return strings.Join(got, ",")
-}
-
 // agreesWithGeneric asserts an l0 relation's generated __check and
-// __objects answer what the generic fga.check and
-// fga.streamed_list_objects answer on the chain's tuples, and that
-// anne's objects are not trivially empty.
+// __objects answer what the generic resolver answers on the chain's
+// tuples (fga._check and fga._list_objects with dispatch off, which
+// on this opted-in store would otherwise call the very functions
+// under test), and that anne's objects are not trivially empty.
 func agreesWithGeneric(t *testing.T, f compiledFixture, rel string) {
 	t.Helper()
 	for _, o := range []string{"o0", "x"} {
@@ -190,11 +149,11 @@ func agreesWithGeneric(t *testing.T, f compiledFixture, rel string) {
 		got := f.outcome(t, fmt.Sprintf(
 			"SELECT x::text FROM %s.l0__%s__objects('user', $1::uuid) x",
 			f.schema, rel), f.ids.ID(user))
-		want := f.generic(t, `
-			SELECT split_part(o ->> 'object', ':', 2)
-			FROM fga.streamed_list_objects($1, jsonb_build_object(
+		want := f.outcome(t, `
+			SELECT split_part(o, ':', 2)
+			FROM unnest(fga._list_objects($1, jsonb_build_object(
 			  'type', 'l0', 'relation', $3::text,
-			  'user', 'user:' || $2)) o`,
+			  'user', 'user:' || $2), 0, false)) o`,
 			f.storeID, f.ids.ID(user), rel)
 		if got != want {
 			t.Errorf("%s objects %s = %q, generic %q",
@@ -203,11 +162,11 @@ func agreesWithGeneric(t *testing.T, f compiledFixture, rel string) {
 		got = f.outcome(t, fmt.Sprintf(
 			"SELECT %s.l0__%s__check($1::uuid, 'user', $2::uuid)::text",
 			f.schema, rel), f.ids.ID("o0"), f.ids.ID(user))
-		want = f.generic(t, `
-			SELECT (fga.check($1, jsonb_build_object('tuple_key',
+		want = f.outcome(t, `
+			SELECT (fga._check($1, jsonb_build_object('tuple_key',
 			  jsonb_build_object('object', 'l0:' || $2,
-			    'relation', $4::text, 'user', 'user:' || $3)))
-			  ->> 'allowed')`,
+			    'relation', $4::text, 'user', 'user:' || $3)),
+			  false) ->> 'allowed')`,
 			f.storeID, f.ids.ID("o0"), f.ids.ID(user), rel)
 		if got != want {
 			t.Errorf("%s check o0 %s = %q, generic %q",

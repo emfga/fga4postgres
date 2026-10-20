@@ -551,14 +551,6 @@ $$;
 -- called on behalf of fga.check once the request has passed check's
 -- own validation. The function is found in the registry, so the
 -- call is dynamic.
---
--- The SET of fga._dispatching is what keeps dispatch from
--- recursing: some generated bodies hand a question back to the
--- generic resolver by calling fga.check (a delegated relation, a
--- recursive one given contextual tuples or nearing the depth
--- limit), and while this function runs every public entry point
--- answers generically. The setting is restored on exit, error or
--- not.
 CREATE OR REPLACE FUNCTION fga._check_compiled(
   fn regprocedure, object_id uuid, subject_type text,
   subject_id uuid, subject_relation text, any_subject boolean,
@@ -568,7 +560,6 @@ RETURNS boolean
 LANGUAGE plpgsql
 STABLE PARALLEL SAFE
 SET search_path = fga, pg_temp
-SET fga._dispatching = 'on'
 AS $$
 DECLARE
   allowed boolean;
@@ -582,19 +573,29 @@ BEGIN
 END;
 $$;
 
--- The public check entry point. Request is upstream's
--- CheckRequest JSON shape (snake_case): tuple_key,
--- contextual_tuples.tuple_keys, context, authorization_model_id.
+-- The check behind fga.check. Request is upstream's CheckRequest
+-- JSON shape (snake_case): tuple_key, contextual_tuples.tuple_keys,
+-- context, authorization_model_id.
 --
--- On a store opted in to compiled relations, a request on the
--- model the functions were compiled from (the latest) is answered
--- by the relation's generated __check, after the validation below:
--- the registry is keyed by model id, so a request pinned to an
--- older model finds no row and resolves generically. Delegated
--- relations are skipped — their __check calls fga.check.
-CREATE OR REPLACE FUNCTION fga.check(
+-- With dispatch on, a store opted in to compiled relations answers
+-- a request on the model the functions were compiled from (the
+-- latest) through the relation's generated __check, after the
+-- validation below: the registry is keyed by model id, so a
+-- request pinned to an older model finds no row and resolves
+-- generically. Delegated relations are skipped — their __check
+-- comes back here.
+--
+-- Dispatch is off when a generated function hands a question back
+-- to the generic resolver (fga._compiled_check): on an opted-in
+-- store it would otherwise dispatch straight back to the function
+-- that handed it off. It is an argument rather than a session
+-- setting because a function definition carrying a custom setting
+-- (SET fga.x = ...) can only be created by a superuser, which a
+-- managed PostgreSQL never grants.
+CREATE OR REPLACE FUNCTION fga._check(
   store_id uuid,
-  request jsonb
+  request jsonb,
+  dispatch boolean
 )
 RETURNS jsonb
 LANGUAGE plpgsql
@@ -716,8 +717,7 @@ BEGIN
       tkj -> 'condition' -> 'context')::fga._tuple_key;
   END LOOP;
 
-  IF current_setting('fga._dispatching', true)
-     IS DISTINCT FROM 'on' THEN
+  IF dispatch THEN
     SELECT cr.check_fn INTO fn
     FROM fga.compiled_relation cr
     WHERE cr.store = store_id AND cr.model_id = mid
@@ -742,6 +742,19 @@ BEGIN
 
   RETURN jsonb_build_object('allowed', r.allowed);
 END;
+$$;
+
+-- The public check entry point; see fga._check.
+CREATE OR REPLACE FUNCTION fga.check(
+  store_id uuid,
+  request jsonb
+)
+RETURNS jsonb
+LANGUAGE sql
+STABLE PARALLEL SAFE
+SET search_path = fga, pg_temp
+AS $$
+  SELECT fga._check(store_id, request, true);
 $$;
 
 -- Batch check (measured contract; re-verified by
