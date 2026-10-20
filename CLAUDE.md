@@ -33,6 +33,11 @@ a bug.
   missing behaviour, the type-restriction write gate, condition
   validation at write time)
 - Tuple `read` — filtered listing with keyset pagination
+- `delete_tuples`, an additive non-upstream surface: delete every
+  tuple matching a filter anchored on a whole subject or a whole
+  object, in one statement, returning the deleted rows. It serves
+  offboarding and resource deletion (from a trigger on the
+  application's own table) without a read and 100-key deletes.
 - A minimal store namespace: `create_store`/`delete_store` plus a store
   column. It exists for conformance isolation (fresh store per corpus
   test) and namespacing, not multi-tenancy.
@@ -50,8 +55,8 @@ a bug.
   DSL→JSON stays in the Go harness (decision 2). A PL/pgSQL DSL parser
   is a possible post-conformance milestone, not a v1 blocker.
 - `read_changes`. Deferred, not rejected: every tuple mutation goes
-  through one function so a changelog can be added without rework
-  (decision 8).
+  through one insert site and one delete site so a changelog can be
+  added without rework (decision 8).
 - HTTP/gRPC layer, assertions API, watch API, multi-tenant isolation
   machinery, store-level auth.
 
@@ -128,8 +133,14 @@ a future contributor will otherwise reopen.
    late-committing writes to pagination, and its job (syncing data
    *out*) is served natively by triggers, LISTEN/NOTIFY, or logical
    replication when the engine is already in Postgres. Routing every
-   tuple mutation through one function keeps the changelog addable
-   without rework. Owner-confirmed.
+   tuple mutation through one place keeps the changelog addable
+   without rework: every insert is in `fga.write`, and every delete,
+   `fga.write`'s and `fga.delete_tuples`'s, goes through
+   `fga._delete_tuples` (`fga.delete_store` drops a store's tuples
+   with the store itself). One insert site and one delete site, not
+   one function: folding the bulk delete into `fga.write` would
+   have put a made-up key into an upstream-shaped request.
+   Owner-confirmed.
 9. **Purity labels are a product feature, applied honestly.** Pure
    computation over jsonb is `IMMUTABLE PARALLEL SAFE`. Anything that
    reads tuples, models, or the cel registry is `STABLE PARALLEL
