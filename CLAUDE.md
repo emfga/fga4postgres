@@ -115,7 +115,12 @@ a future contributor will otherwise reopen.
    `COPY … FROM PROGRAM`, an untrusted language, a
    `shared_preload_libraries` change, or filesystem access of any
    kind. A change introducing one of these breaks the product claim.
-   Owner-confirmed.
+   Nor may any statement need superuser: a managed service's master
+   user has `CREATEDB` and `CREATEROLE`, not `SUPERUSER`. The trap
+   that broke 0.1.1 is a custom setting in a function definition
+   (`SET fga.x = …`), which only a superuser can create; pass the
+   state as an argument instead. `TestInstallWithoutSuperuser`
+   installs as such a role. Owner-confirmed.
 8. **`read` in v1; `read_changes` deferred behind a single write
    path.** Read is a filtered SELECT with keyset pagination — cheap
    and genuinely useful in-database. ReadChanges needs a changelog
