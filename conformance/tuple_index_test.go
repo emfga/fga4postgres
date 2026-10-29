@@ -8,6 +8,9 @@ import (
 	"path/filepath"
 	"slices"
 	"testing"
+	"time"
+
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/emfga/fga4postgres/internal/testdb"
 	"github.com/emfga/fga4postgres/internal/uuidmap"
@@ -99,7 +102,9 @@ func TestTupleReverseIndexReinstall(t *testing.T) {
 // ladder walks one parent edge per leaf. With condition_name in the
 // index every edge is answered from the index alone; without it,
 // each is a heap fetch. After a VACUUM the visibility map is set,
-// so an index-only scan reports zero heap fetches.
+// so an index-only scan reports zero heap fetches — provided no
+// other session could still need the rows' old versions; see
+// awaitVisibleToAll.
 func TestTupleReverseIndexCoversParentEdges(t *testing.T) {
 	ctx := context.Background()
 	pool := testdb.Pool(t)
@@ -146,6 +151,7 @@ func TestTupleReverseIndexCoversParentEdges(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	awaitVisibleToAll(t, pool, storeID)
 	if _, err := pool.Exec(ctx, "VACUUM (ANALYZE) fga.tuple"); err != nil {
 		t.Fatal(err)
 	}
@@ -199,6 +205,56 @@ func TestTupleReverseIndexCoversParentEdges(t *testing.T) {
 	}
 	if t.Failed() {
 		t.Logf("plan:\n%s", raw)
+	}
+}
+
+// awaitVisibleToAll waits until every row the test inserted for
+// store is visible to every other session in the database. VACUUM
+// marks a page all-visible only when its rows are older than the
+// oldest snapshot or transaction id any backend of this database
+// still holds; until then it leaves the visibility map unset, and
+// index-only scans pay a heap fetch per row. The suite's packages
+// run in parallel processes against one database (internal/bench
+// loads fixtures beside the conformance suite), so a statement in
+// flight elsewhere can hold that horizon for a moment — which made
+// the heap-fetch assertion fail at random. Waiting for those
+// sessions to move past the insert makes the following VACUUM
+// deterministic; a session that never does is named.
+func awaitVisibleToAll(t *testing.T, pool *pgxpool.Pool,
+	storeID string,
+) {
+	t.Helper()
+	ctx := context.Background()
+	var xmin string
+	if err := pool.QueryRow(ctx,
+		"SELECT xmin::text FROM fga.tuple WHERE store = $1 LIMIT 1",
+		storeID).Scan(&xmin); err != nil {
+		t.Fatal(err)
+	}
+	const blockers = `
+		SELECT coalesce(string_agg(format('pid %s (%s, %s): %s',
+		    pid, coalesce(nullif(application_name, ''), backend_type),
+		    state, left(query, 60)), '; '), '')
+		FROM pg_stat_activity
+		WHERE datname = current_database()
+		  AND pid <> pg_backend_pid()
+		  AND (age(backend_xmin) >= age($1::xid)
+		    OR age(backend_xid) >= age($1::xid))`
+	deadline := time.Now().Add(time.Minute)
+	for {
+		var held string
+		if err := pool.QueryRow(ctx, blockers, xmin).Scan(
+			&held); err != nil {
+			t.Fatal(err)
+		}
+		if held == "" {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("sessions still hold a snapshot older than "+
+				"the test's rows after a minute: %s", held)
+		}
+		time.Sleep(50 * time.Millisecond)
 	}
 }
 
