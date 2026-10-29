@@ -4,6 +4,6 @@
 // cel4postgres SQL bundle, not Go modules,
 // and without this file every go command fails with "inconsistent
 // vendoring".
-go 1.25.7
+go 1.27
 
 use .

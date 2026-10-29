@@ -116,7 +116,7 @@ curl -fsS http://localhost:8080/healthz
 If a port is taken on your machine, set `POSTGRES_PORT`,
 `OPENFGA_HTTP_PORT`, or `OPENFGA_GRPC_PORT` in `.env`.
 
-Run the tests:
+Run the tests; the host route needs Go 1.27 or newer:
 
 ```bash
 go test ./...                  # from the host
