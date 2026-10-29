@@ -1,0 +1,75 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    ":disableRateLimiting",
+    ":docker",
+    ":enableVulnerabilityAlerts",
+    ":pinAllExceptPeerDependencies",
+    ":rebaseStalePrs",
+    ":renovatePrefix",
+    ":timezone(America/Sao_Paulo)",
+    "config:best-practices",
+    "schedule:earlyMondays",
+    "security:openssf-scorecard"
+  ],
+  "commitMessageAction": "Bump",
+  "commitMessageExtra": "",
+  "commitMessageLowerCase": "never",
+  "commitMessageTopic": "{{depName}}",
+  "semanticCommits": "disabled",
+  "ignorePaths": ["**/vendor/**", ".claude/**", "bench-results/**", "dist/**"],
+  "postUpdateOptions": ["gomodTidy", "gomodUpdateImportPaths"],
+  "vulnerabilityAlerts": {
+    "addLabels": ["security"]
+  },
+  "customManagers": [
+    {
+      "description": "Track the go directive in go.work, which must move with go.mod's",
+      "customType": "regex",
+      "managerFilePatterns": ["/(^|/)go\\.work$/"],
+      "matchStrings": ["\\ngo (?<currentValue>\\d+\\.\\d+(?:\\.\\d+)?)\\n"],
+      "depNameTemplate": "go",
+      "datasourceTemplate": "golang-version"
+    },
+    {
+      "description": "Track pg_tle, pinned as a build arg in the validation image",
+      "customType": "regex",
+      "managerFilePatterns": ["/(^|/)docker/[^/]*Dockerfile$/"],
+      "matchStrings": ["ARG PG_TLE_VERSION=(?<currentValue>v\\S+)"],
+      "depNameTemplate": "aws/pg_tle",
+      "datasourceTemplate": "github-releases"
+    }
+  ],
+  "packageRules": [
+    {
+      "description": "One PR for all GitHub Actions bumps, not one per action per digest",
+      "matchManagers": ["github-actions"],
+      "matchDepTypes": ["action"],
+      "groupName": "github-actions",
+      "commitMessageTopic": "GitHub Actions"
+    },
+    {
+      "description": "One PR for image digest refreshes",
+      "matchDatasources": ["docker"],
+      "matchUpdateTypes": ["digest"],
+      "groupName": "docker digests"
+    },
+    {
+      "description": "The go directive in go.mod and go.work move together: a workspace cannot declare an older go than its modules",
+      "matchDepNames": ["go"],
+      "matchDatasources": ["golang-version"],
+      "groupName": "go directive",
+      "commitMessageTopic": "the go directive"
+    },
+    {
+      "description": "The conformance target (CLAUDE.md decision 1): the openfga module, the modules it pins and the oracle image move together with the corpus and Ref: permalinks, or not at all, so they arrive as one PR. Merging it means retargeting conformance, not just bumping versions.",
+      "matchPackageNames": [
+        "github.com/openfga/openfga",
+        "github.com/openfga/api/proto",
+        "github.com/openfga/language/pkg/go",
+        "openfga/openfga"
+      ],
+      "groupName": "openfga conformance target"
+    }
+  ]
+}
