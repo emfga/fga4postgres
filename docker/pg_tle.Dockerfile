@@ -9,7 +9,7 @@ ARG BASE_IMAGE=postgres:18-alpine
 FROM ${BASE_IMAGE}
 
 # Pinned like every other reference: a bump is a deliberate change.
-ARG PG_TLE_VERSION=v1.5.2
+ARG PG_TLE_VERSION=v1.5.3
 
 RUN apk add --no-cache --virtual .build \
        build-base git flex bison openssl-dev krb5-dev \
