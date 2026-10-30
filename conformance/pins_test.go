@@ -3,6 +3,7 @@ package conformance
 import (
 	"context"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	openfgav1 "github.com/openfga/api/proto/openfga/v1"
@@ -346,5 +347,60 @@ func TestPinnedDeepRecursionStrategy(t *testing.T) {
 	if ec != 2002 || oc != 2002 {
 		t.Errorf("absent user at 25 hops: engine code %d, oracle "+
 			"code %d, want 2002 on both", ec, oc)
+	}
+}
+
+// PIN-COST-1 — a GRANTING divergence, accepted and pinned until
+// cel4postgres can close it (emfga/cel4postgres#16): upstream
+// evaluates every condition under a runtime CEL cost limit (100)
+// and refuses 2000 when it is exceeded, by the expression (nested
+// comprehensions) or by its inputs (a long string). cel4postgres
+// has no cost accounting and the engine cannot add one without
+// reimplementing CEL (decision 4), so it answers.
+func TestPinnedConditionCostLimit(t *testing.T) {
+	const dsl = `model
+  schema 1.1
+type user
+type doc
+  relations
+    define heavy: [user with nested]
+    define light: [user with has_a]
+condition nested(x: string) {
+  [1,2,3,4,5,6,7,8,9,10].all(i, [1,2,3,4,5,6,7,8,9,10].all(j, i*j > 0))
+}
+condition has_a(x: string) {
+  x.contains('a')
+}`
+	tuples := []*openfgav1.TupleKey{
+		tkc("doc:1", "heavy", "user:anne", "nested", nil),
+		tkc("doc:1", "light", "user:anne", "has_a", nil),
+	}
+	long := strings.Repeat("b", 5000) + "a"
+	for _, sd := range bothSides(t, "pin-cost") {
+		t.Run(sd.name, func(t *testing.T) {
+			store, model := setup(t, sd.client, dsl, tuples)
+			for _, c := range []struct{ rel, x string }{
+				{"heavy", "a"}, {"light", long},
+			} {
+				ctx, err := structpb.NewStruct(
+					map[string]any{"x": c.x})
+				if err != nil {
+					t.Fatal(err)
+				}
+				r := doCheck(t, sd.client, store, model, "doc:1",
+					c.rel, "user:anne", nil, ctx)
+				got := r.allowed && r.err == nil
+				if sd.name == "engine" && !got {
+					t.Errorf("%s: engine side of PIN-COST-1 "+
+						"moved: got %v, want allowed=true — "+
+						"update docs/CONFORMANCE.md", c.rel, r)
+				}
+				if sd.name == "oracle" && r.code != 2000 {
+					t.Errorf("%s: oracle side of PIN-COST-1 "+
+						"moved: got %v, want 2000 — update "+
+						"docs/CONFORMANCE.md", c.rel, r)
+				}
+			}
+		})
 	}
 }

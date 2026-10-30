@@ -133,8 +133,9 @@ printed in the run's skip register
 ## Pinned divergences
 
 Direction vocabulary: **refusing** = fga4postgres refuses what
-upstream accepts (the safe direction); **granting** would be the
-reverse (none exist, by policy); **different-boundary** = both
+upstream accepts (the safe direction); **granting** is the
+reverse (none should exist, by policy; PIN-COST-1 is one the
+engine cannot close by itself); **different-boundary** = both
 sides refuse, at different limits; **different answer** = both
 sides answer, in a different form.
 
@@ -147,6 +148,7 @@ sides answer, in a different form.
 | PIN-READ-1 | A read continuation token reused under a changed filter is refused (2007); upstream's positional token silently continues at that offset under the new filter | refusing | TestPinnedReadTokenFilter |
 | PIN-CTX-1 | The condition-context write boundary is 32768 bytes of jsonb-normalized text; upstream's is 32768 proto bytes — number-heavy contexts refuse here and pass there, near-boundary strings flip at slightly different lengths | different-boundary | TestPinnedContextBoundary |
 | PIN-LU-1 | `list_users` of a wildcard minus a nested exclusion that removes nobody (`everyone but not (banned but not suspended)`, bob both banned and suspended): upstream lists `user:bob` beside `user:*`, the engine `user:*` alone. Both grant bob; the form differs, not who has access (measured identically at v1.19.0) | different answer | TestPinnedListUsersRedundantUser |
+| PIN-COST-1 | **Granting, accepted until cel4postgres closes it ([emfga/cel4postgres#16](https://github.com/emfga/cel4postgres/issues/16)).** Upstream evaluates every condition under a runtime CEL cost limit of 100 and refuses 2000 past it — through the expression (nested comprehensions) or its inputs (a 5000-character string given to `contains`). cel4postgres has no cost accounting, so the engine evaluates and answers | granting | TestPinnedConditionCostLimit |
 | PIN-EXPR-1 | Inline conditions (`[user with $expression]`): upstream with the experimental `inline_expressions` flag accepts the model and evaluates the CEL expression each tuple carries, and its v1.22.1 corpus exercises that. The engine refuses any such model at write with 2000, as stock upstream (flag off, the oracle's configuration) does; the oracle refusing too is asserted, so the pin turns red if upstream turns the feature on by default | refusing | TestPinnedInlineExpressionRefused |
 | PIN-DEPTH-1 | Upstream picks a check strategy per relation: its default resolver refuses the 25th dispatch, its recursive resolver (simple self-recursive relations, chosen from the weighted graph) admits it and refuses the 26th. The engine refuses the 25th dispatch on every relation, so on recursive-resolver relations it answers 2002 exactly at 25 dispatches where upstream grants; on default-resolver relations both sides agree (`TestProbeDefaultResolverBoundary`). Past the boundary upstream's recursive path may also answer an absent user false at any depth on a minimal store, where the engine refuses 2002. The engine never grants where upstream refuses; its limit is a constant matching upstream's default resolve-node limit of 25 | refusing | TestPinnedDeepRecursionStrategy |
 
@@ -171,6 +173,12 @@ corpus-visible):
 - **Inherited from cel4postgres**: `matches()` runs on POSIX ARE
   rather than RE2; strings cannot contain U+0000 (a Postgres
   substrate limit); plus its measured divergence list.
+- **No cost accounting** (PIN-COST-1). To close it, cel4postgres
+  has to track runtime evaluation cost against a caller-set
+  limit, close enough to cel-go's actual-cost model that the 100
+  boundary agrees, and report an exceeded limit as a distinct
+  error the engine maps to 2000 — tracked as
+  [emfga/cel4postgres#16](https://github.com/emfga/cel4postgres/issues/16).
 - **Sibling-object condition errors (not pinnable)**:
   upstream's user-first iteration can surface a 2000 condition
   error from a conditioned tuple on an object structurally
