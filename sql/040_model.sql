@@ -417,6 +417,19 @@ BEGIN
             -> 'directly_related_user_types')
          WITH ORDINALITY AS tr(value, ord);
 
+  -- Inline conditions ([user with $expression], upstream's
+  -- experimental inline_expressions) are not supported: the model
+  -- is refused with 2000, the code upstream answers with the
+  -- feature off (PIN-EXPR-1).
+  IF EXISTS (
+    SELECT FROM fga.model_type_restriction tr
+    WHERE tr.store = store_id AND tr.model_id = new_id
+      AND tr.condition_name = '$expression'
+  ) THEN
+    RAISE EXCEPTION 'inline $expression conditions are not supported'
+      USING ERRCODE = 'YF100';
+  END IF;
+
   INSERT INTO fga.model_ttu
   SELECT DISTINCT store_id, new_id, r.type_name, r.relation_name,
     n -> 'tuple_to_userset' -> 'tupleset' ->> 'relation',

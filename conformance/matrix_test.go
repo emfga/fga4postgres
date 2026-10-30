@@ -31,7 +31,7 @@ func TestImportedListObjectsRunners(t *testing.T) {
 	client := sqlclient.New(
 		testdb.Pool(t), uuidmap.New("imported/listobjects"))
 	listobjects.RunAllTests(t, client)
-	listobjects.RunMatrixTests(t, "fga4postgres", false, client)
+	listobjects.RunMatrixTests(t, "fga4postgres", "main", client)
 }
 
 func TestImportedListUsersRunners(t *testing.T) {

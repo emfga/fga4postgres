@@ -66,7 +66,7 @@ services:
         - /usr/local/bin/grpc_health_probe
         - -addr=localhost:8081
       timeout: 5s
-    image: openfga/openfga:v1.19.0@sha256:78d1fa601d42340ecb131305d80d3767d0f254f9b1bc3646f9a557e11b24c63a
+    image: openfga/openfga:v1.22.1@sha256:b852071314f1fda1194d341a6ebac0a4f619b3cd87a6626d2ccc7048af4ec671
     ports:
       - ${OPENFGA_HTTP_PORT:-8080}:8080
       - ${OPENFGA_GRPC_PORT:-8081}:8081

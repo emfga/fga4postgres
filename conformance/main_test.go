@@ -4,6 +4,7 @@
 package conformance
 
 import (
+	"flag"
 	"fmt"
 	"os"
 	"strconv"
@@ -28,6 +29,11 @@ var suiteSeed = func() int64 {
 // TestMain prints the generated skip register after every run — the
 // no-silent-scope-reduction mechanism for the suite's own tests.
 func TestMain(m *testing.M) {
+	flag.Parse()
+	if err := skipImportedInlineCases(); err != nil {
+		fmt.Fprintf(os.Stderr, "inline $expression skips: %v\n", err)
+		os.Exit(2)
+	}
 	fmt.Printf("suite seed: %d (reproduce with FGA_SEED=%d)\n",
 		suiteSeed, suiteSeed)
 	code := m.Run()

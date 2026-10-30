@@ -27,6 +27,7 @@ var Files = []string{
 	"pkg/server/commands/write.go",
 	"pkg/typesystem/typesystem.go",
 	"internal/condition/condition.go",
+	"internal/condition/inline.go",
 }
 
 // Cause is one error construction site, identified by its message

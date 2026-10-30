@@ -22,7 +22,7 @@ your application's own tables.
 
 **Status: v1 surface complete, pre-release.** The engine is built
 and verified against a pinned conformance target,
-[openfga/openfga v1.19.0](https://github.com/openfga/openfga/tree/v1.19.0):
+[openfga/openfga v1.22.1](https://github.com/openfga/openfga/tree/v1.22.1):
 the upstream YAML corpus and upstream's own imported test runners
 run green differentially against the live pinned server, and every
 knowing divergence is measured, pinned from both sides, and
@@ -97,7 +97,7 @@ This brings up two disposable services:
   installing the schema is part of bringing the database up. `--wait`
   returns only when `cel.version()` and `fga.version()` answer —
   healthy means installed, not merely listening.
-- **openfga** — the reference OpenFGA server, pinned at v1.19.0, used
+- **openfga** — the reference OpenFGA server, pinned at v1.22.1, used
   as the conformance oracle. The memory datastore makes a restart a
   reset.
 

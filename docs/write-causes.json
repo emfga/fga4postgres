@@ -1,11 +1,12 @@
 {
-  "pin": "v1.19.0",
+  "pin": "v1.22.1",
   "files": [
     "internal/validation/validation.go",
     "pkg/tuple/tuple.go",
     "pkg/server/commands/write.go",
     "pkg/typesystem/typesystem.go",
-    "internal/condition/condition.go"
+    "internal/condition/condition.go",
+    "internal/condition/inline.go"
   ],
   "causes": [
     {
@@ -69,6 +70,48 @@
       "note": "context against a parameterless condition refuses as an undeclared parameter at write (TestWriteGateMatrix)"
     },
     {
+      "file": "internal/condition/inline.go",
+      "message": "%s: context field %q must be a non-empty string",
+      "disposition": "pinned",
+      "note": "inline $expression gate; unreachable here: a model admitting $expression is refused at write (PIN-EXPR-1)"
+    },
+    {
+      "file": "internal/condition/inline.go",
+      "message": "%s: context field %q must be a struct",
+      "disposition": "pinned",
+      "note": "inline $expression gate; unreachable here: a model admitting $expression is refused at write (PIN-EXPR-1)"
+    },
+    {
+      "file": "internal/condition/inline.go",
+      "message": "%s: invalid CEL expression: %w",
+      "disposition": "pinned",
+      "note": "inline $expression gate; unreachable here: a model admitting $expression is refused at write (PIN-EXPR-1)"
+    },
+    {
+      "file": "internal/condition/inline.go",
+      "message": "%s: missing required context field %q",
+      "disposition": "pinned",
+      "note": "inline $expression gate; unreachable here: a model admitting $expression is refused at write (PIN-EXPR-1)"
+    },
+    {
+      "file": "internal/condition/inline.go",
+      "message": "malformed generic type %q: missing closing >",
+      "disposition": "pinned",
+      "note": "inline $expression gate; unreachable here: a model admitting $expression is refused at write (PIN-EXPR-1)"
+    },
+    {
+      "file": "internal/condition/inline.go",
+      "message": "parameter type %q requires a generic element type, e.g. %q",
+      "disposition": "pinned",
+      "note": "inline $expression gate; unreachable here: a model admitting $expression is refused at write (PIN-EXPR-1)"
+    },
+    {
+      "file": "internal/condition/inline.go",
+      "message": "unknown parameter type %q",
+      "disposition": "pinned",
+      "note": "inline $expression gate; unreachable here: a model admitting $expression is refused at write (PIN-EXPR-1)"
+    },
+    {
       "file": "internal/validation/validation.go",
       "message": "'%s#%s' is not an allowed type restriction for '%s#%s'",
       "disposition": "claimed",
@@ -97,6 +140,12 @@
       "message": "context value %q contains forbidden characters",
       "disposition": "claimed",
       "note": "fga._ctx_scan (TestWriteGateMatrix: tab in context string value)"
+    },
+    {
+      "file": "internal/validation/validation.go",
+      "message": "expected $expression got: %s",
+      "disposition": "n/a",
+      "note": "unreachable guard: validateInlineExpressionCondition is only called for a $expression condition"
     },
     {
       "file": "internal/validation/validation.go",

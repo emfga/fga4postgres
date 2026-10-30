@@ -60,7 +60,7 @@ gRPC status code and the corpus asserts with `errorCode:`.
 | YFG10 | gRPC 10 | Aborted (transactional write conflict) |
 | YF502 | 5002 | store_id_not_found |
 
-The v1.19.0 corpus asserts 2000, 2002, 2021, 2022 and 2027; the
+The v1.22.1 corpus asserts 2000, 2002, 2021, 2022 and 2027; the
 rest are codes the engine's own write and lookup paths need. New
 codes are added by the rule, recorded here in the same commit.
 

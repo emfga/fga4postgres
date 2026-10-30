@@ -1,7 +1,7 @@
 # Conformance
 
 What "conformant" claims, what it excludes, and every knowing
-divergence. The conformance target is **openfga/openfga v1.19.0**,
+divergence. The conformance target is **openfga/openfga v1.22.1**,
 pinned everywhere at once — the compose oracle image, the corpus
 the harness replays, and every source citation name the same
 version and are bumped together or not at all. Every claim below
@@ -15,7 +15,8 @@ suite red and demands this file change in the same commit.
 All planned v1 APIs are implemented. Current verified surface:
 
 - Conditions/ABAC: the whole `abac_tests.yaml` corpus passes
-  differentially for check, list_objects and list_users, and
+  differentially for check, list_objects and list_users, apart
+  from its `inline_expression_*` cases (PIN-EXPR-1), and
   upstream's own imported test runners (`tests/check`,
   `tests/listobjects`, `tests/listusers` at the pin — the YAML
   replays plus the generated matrix corpora, list_users
@@ -115,6 +116,14 @@ read-models API and its paging (`ReadAuthorizationModels`), the
 HTTP/gRPC layer, DSL parsing in-engine (DSL→JSON stays in the
 harness), store-level auth and multi-tenant isolation machinery.
 
+Inline conditions (`[user with $expression]`, upstream's
+experimental `inline_expressions` feature, off by default) are not
+supported: a model using one is refused at write with 2000
+(PIN-EXPR-1). The corpus's `inline_expression_*` cases are skipped
+by name in the replays and the imported runners, and every skip is
+printed in the run's skip register
+(`TestImportedRunnerExclusions` lists the runner ones).
+
 ## Pinned divergences
 
 Direction vocabulary: **refusing** = fga4postgres refuses what
@@ -130,6 +139,7 @@ sides refuse, at different limits.
 | PIN-ID-4 | Store/model ids are uuidv7; upstream-shaped ULID ids are refused as not-found, and ids never transfer between engines | refusing | TestPinnedULIDModelID |
 | PIN-READ-1 | A read continuation token reused under a changed filter is refused (2007); upstream's positional token silently continues at that offset under the new filter | refusing | TestPinnedReadTokenFilter |
 | PIN-CTX-1 | The condition-context write boundary is 32768 bytes of jsonb-normalized text; upstream's is 32768 proto bytes — number-heavy contexts refuse here and pass there, near-boundary strings flip at slightly different lengths | different-boundary | TestPinnedContextBoundary |
+| PIN-EXPR-1 | Inline conditions (`[user with $expression]`): upstream with the experimental `inline_expressions` flag accepts the model and evaluates the CEL expression each tuple carries, and its v1.22.1 corpus exercises that. The engine refuses any such model at write with 2000, as stock upstream (flag off, the oracle's configuration) does; the oracle refusing too is asserted, so the pin turns red if upstream turns the feature on by default | refusing | TestPinnedInlineExpressionRefused |
 | PIN-DEPTH-1 | Upstream picks a check strategy per relation: its default resolver refuses the 25th dispatch, its recursive resolver (simple self-recursive relations, chosen from the weighted graph) admits it and refuses the 26th. The engine refuses the 25th dispatch on every relation, so on recursive-resolver relations it answers 2002 exactly at 25 dispatches where upstream grants; on default-resolver relations both sides agree (`TestProbeDefaultResolverBoundary`). Past the boundary upstream's recursive path may also answer an absent user false at any depth on a minimal store, where the engine refuses 2002. The engine never grants where upstream refuses; its limit is a constant matching upstream's default resolve-node limit of 25 | refusing | TestPinnedDeepRecursionStrategy |
 
 Condition-layer divergences (measured or by construction; none
