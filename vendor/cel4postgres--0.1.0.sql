@@ -26,7 +26,7 @@ CREATE TABLE IF NOT EXISTS cel.schema_version (
 );
 
 INSERT INTO cel.schema_version (version)
-VALUES ('0.0.2')
+VALUES ('0.1.0')
 ON CONFLICT (version) DO NOTHING;
 
 -- The installed schema version. IMMUTABLE is deliberately wrong for
@@ -204,6 +204,45 @@ AS $$
       AND i.ref = format('%s/%s/%s', m.name, m.arity, m.member::int)
   );
 $$;
+
+-- The core scripts put "everything registered so far" into the
+-- standard env. On a fresh install that is exactly the core: the
+-- extension scripts run later. Run again over an installed schema --
+-- which is what an upgrade is -- the same sweep would also catch
+-- every extension row and every consumer row, enabling them in
+-- standard. A row is only swept when no env claims it yet and, if it
+-- has an implementation, that implementation lives in the cel
+-- schema.
+CREATE OR REPLACE FUNCTION cel._unclaimed(kind text, ref text,
+                                          impl regprocedure)
+RETURNS boolean
+LANGUAGE sql
+STABLE
+SET search_path = cel, pg_temp
+AS $$
+  SELECT NOT EXISTS (
+           SELECT FROM cel.env_item i
+           WHERE i.kind = _unclaimed.kind AND i.ref = _unclaimed.ref
+         )
+     AND (impl IS NULL
+          OR (SELECT pronamespace FROM pg_proc WHERE oid = impl)
+             = 'cel'::regnamespace);
+$$;
+
+-- Repair for schemas reinstalled before that guard existed (0.0.2
+-- and earlier): drop from standard what a shipped extension env
+-- also lists. On a fresh install nothing matches -- no shipped item
+-- is in two envs. A consumer row swept the same way cannot be told
+-- apart from one put in standard on purpose, so it stays.
+DELETE FROM cel.env_item s
+WHERE s.env = 'standard'
+  AND EXISTS (
+    SELECT FROM cel.env_item o
+    WHERE o.kind = s.kind AND o.ref = s.ref
+      AND o.env IN ('strings', 'math', 'lists', 'encoders',
+                    'bindings', 'two_var_comprehensions',
+                    'optionals', 'network')
+  );
 
 -- The spec-conformant default environment. Its items are seeded by
 -- the scripts that create the functions they reference. The
@@ -2825,6 +2864,8 @@ ON CONFLICT (name, arity, member) DO UPDATE SET expander = excluded.expander;
 INSERT INTO cel.env_item (env, kind, ref)
 SELECT 'standard', 'macro', format('%s/%s/%s', name, arity, member::int)
 FROM cel.macro
+WHERE cel._unclaimed('macro',
+        format('%s/%s/%s', name, arity, member::int), expander)
 ON CONFLICT DO NOTHING;
 
 -- Parses CEL source under an environment. Returns the AST envelope,
@@ -5886,10 +5927,12 @@ ON CONFLICT (name) DO NOTHING;
 -- Everything above is visible in the standard env.
 INSERT INTO cel.env_item (env, kind, ref)
 SELECT 'standard', 'overload', id FROM cel.overload
+WHERE cel._unclaimed('overload', id, impl)
 ON CONFLICT DO NOTHING;
 
 INSERT INTO cel.env_item (env, kind, ref)
 SELECT 'standard', 'type', name FROM cel.type
+WHERE cel._unclaimed('type', name, NULL)
 ON CONFLICT DO NOTHING;
 
 -- Part 2: type conversions and string functions. Conversion
@@ -6366,6 +6409,7 @@ ON CONFLICT (id) DO UPDATE SET
 
 INSERT INTO cel.env_item (env, kind, ref)
 SELECT 'standard', 'overload', id FROM cel.overload
+WHERE cel._unclaimed('overload', id, impl)
 ON CONFLICT DO NOTHING;
 
 -- ---- sql/070_wkt.sql ----
@@ -7242,10 +7286,12 @@ ON CONFLICT (id) DO UPDATE SET
 INSERT INTO cel.env_item (env, kind, ref)
 SELECT 'standard', 'type', name FROM cel.type
 WHERE name LIKE 'google.protobuf.%'
+  AND cel._unclaimed('type', name, NULL)
 ON CONFLICT DO NOTHING;
 
 INSERT INTO cel.env_item (env, kind, ref)
 SELECT 'standard', 'overload', id FROM cel.overload
+WHERE cel._unclaimed('overload', id, impl)
 ON CONFLICT DO NOTHING;
 
 -- ---- sql/100_ext_comprehensions.sql ----
@@ -7611,9 +7657,9 @@ ON CONFLICT DO NOTHING;
 -- The optionals extension, part one: the optional_type opaque type
 -- and the optional.of / optional.ofNonZeroValue / optional.none /
 -- value / hasValue functions (cel-go cel/library.go optionals, pinned
--- v0.32.0). Part two, further down, adds the optional-syntax sugar
--- (x.?f, [?x], {?k: v}), or / orValue, and the optMap/optFlatMap
--- macros.
+-- v0.33.1, library version 4). Part two, further down, adds the
+-- optional-syntax sugar (x.?f, [?x], {?k: v}), or / orValue, and the
+-- optMap/optFlatMap macros.
 --
 -- An optional value is the opaque
 --   {"@t": "opaque", "type": "optional_type", "v":
@@ -7761,6 +7807,130 @@ INSERT INTO cel.env_item (env, kind, ref) VALUES
   ('optionals', 'overload', 'optional_hasValue')
 ON CONFLICT DO NOTHING;
 
+-- opt.hasValue(v) (library version 3): whether the optional holds a
+-- value equal to v, i.e. opt.hasValue() ? opt.value() == v : false.
+-- v is compared as it is and never unwrapped, so
+-- optional.of(42).hasValue(dyn(optional.of(42))) is false.
+CREATE OR REPLACE FUNCTION cel._f_opt_has_value_value(args jsonb[])
+RETURNS jsonb
+LANGUAGE sql
+IMMUTABLE PARALLEL SAFE
+SET search_path = cel, pg_temp
+AS $$
+  SELECT cel._bool_val((args[1] -> 'v' ->> 'p')::boolean
+                       AND cel._equal(args[1] -> 'v' -> 'v', args[2]));
+$$;
+
+INSERT INTO cel.overload
+  (id, function, member, arg_types, result_type, impl, ordinal)
+VALUES
+  ('optional_hasValue_value', 'hasValue', true,
+   '[{"kind": "opaque", "name": "optional_type",
+      "params": [{"kind": "param", "name": "V"}]},
+     {"kind": "param", "name": "V"}]',
+   '{"kind": "bool"}',
+   'cel._f_opt_has_value_value(jsonb[])', 20)
+ON CONFLICT (id) DO UPDATE SET
+  function = excluded.function,
+  member = excluded.member,
+  arg_types = excluded.arg_types,
+  result_type = excluded.result_type,
+  impl = excluded.impl,
+  ordinal = excluded.ordinal;
+
+INSERT INTO cel.env_item (env, kind, ref) VALUES
+  ('optionals', 'overload', 'optional_hasValue_value')
+ON CONFLICT DO NOTHING;
+
+-- List helpers (library version 2): first() / last() lift the end
+-- elements of a list into optionals, and optional.unwrap(l) /
+-- l.unwrapOpt() keep the values of the present optionals in l.
+CREATE OR REPLACE FUNCTION cel._f_list_first(args jsonb[])
+RETURNS jsonb
+LANGUAGE sql
+IMMUTABLE PARALLEL SAFE
+SET search_path = cel, pg_temp
+AS $$
+  SELECT CASE WHEN jsonb_array_length(args[1] -> 'v') = 0
+              THEN cel._opt_none()
+              ELSE cel._opt_of(args[1] -> 'v' -> 0) END;
+$$;
+
+CREATE OR REPLACE FUNCTION cel._f_list_last(args jsonb[])
+RETURNS jsonb
+LANGUAGE sql
+IMMUTABLE PARALLEL SAFE
+SET search_path = cel, pg_temp
+AS $$
+  SELECT CASE WHEN jsonb_array_length(args[1] -> 'v') = 0
+              THEN cel._opt_none()
+              ELSE cel._opt_of(args[1] -> 'v' -> -1) END;
+$$;
+
+-- An element that is not an optional can only arrive through dyn;
+-- it is an error, not something to skip.
+CREATE OR REPLACE FUNCTION cel._f_opt_unwrap(args jsonb[])
+RETURNS jsonb
+LANGUAGE plpgsql
+IMMUTABLE PARALLEL SAFE
+SET search_path = cel, pg_temp
+AS $$
+DECLARE
+  e jsonb;
+  o jsonb := '[]'::jsonb;
+BEGIN
+  FOR e IN SELECT x FROM jsonb_array_elements(args[1] -> 'v') x LOOP
+    IF e ->> '@t' <> 'opaque' OR e ->> 'type' <> 'optional_type' THEN
+      RETURN cel._err(format('value %s is not optional', e ->> 'v'));
+    END IF;
+    IF (e -> 'v' ->> 'p')::boolean THEN
+      o := o || jsonb_build_array(e -> 'v' -> 'v');
+    END IF;
+  END LOOP;
+  RETURN jsonb_build_object('@t', 'list', 'v', o);
+END;
+$$;
+
+INSERT INTO cel.overload
+  (id, function, member, arg_types, result_type, impl, ordinal)
+VALUES
+  ('list_last', 'last', true,
+   '[{"kind": "list", "params": [{"kind": "param", "name": "V"}]}]',
+   '{"kind": "opaque", "name": "optional_type",
+     "params": [{"kind": "param", "name": "V"}]}',
+   'cel._f_list_last(jsonb[])', 10),
+  ('list_first', 'first', true,
+   '[{"kind": "list", "params": [{"kind": "param", "name": "V"}]}]',
+   '{"kind": "opaque", "name": "optional_type",
+     "params": [{"kind": "param", "name": "V"}]}',
+   'cel._f_list_first(jsonb[])', 10),
+  ('optional_unwrap', 'optional.unwrap', false,
+   '[{"kind": "list", "params": [{"kind": "opaque",
+      "name": "optional_type",
+      "params": [{"kind": "param", "name": "V"}]}]}]',
+   '{"kind": "list", "params": [{"kind": "param", "name": "V"}]}',
+   'cel._f_opt_unwrap(jsonb[])', 10),
+  ('optional_unwrapOpt', 'unwrapOpt', true,
+   '[{"kind": "list", "params": [{"kind": "opaque",
+      "name": "optional_type",
+      "params": [{"kind": "param", "name": "V"}]}]}]',
+   '{"kind": "list", "params": [{"kind": "param", "name": "V"}]}',
+   'cel._f_opt_unwrap(jsonb[])', 10)
+ON CONFLICT (id) DO UPDATE SET
+  function = excluded.function,
+  member = excluded.member,
+  arg_types = excluded.arg_types,
+  result_type = excluded.result_type,
+  impl = excluded.impl,
+  ordinal = excluded.ordinal;
+
+INSERT INTO cel.env_item (env, kind, ref) VALUES
+  ('optionals', 'overload', 'list_last'),
+  ('optionals', 'overload', 'list_first'),
+  ('optionals', 'overload', 'optional_unwrap'),
+  ('optionals', 'overload', 'optional_unwrapOpt')
+ON CONFLICT DO NOTHING;
+
 -- Part two: the optional-syntax operators, or/orValue, and the
 -- optMap/optFlatMap macros (cel/library.go optionals block,
 -- cel/library.go:430-560 at the pinned v0.32.0).
@@ -7874,7 +8044,9 @@ AS $$
               THEN args[1] -> 'v' -> 'v' ELSE args[2] END;
 $$;
 
--- optMap / optFlatMap (cel/library.go optMap/optFlatMap): expand to
+-- optMap / optFlatMap (cel/library.go optMapV2/optFlatMapV2, the
+-- library-version-4 expansion that evaluates the target once): expand
+-- to
 --   target.hasValue()
 --     ? <of?>(bind(v, target.value(), expr))
 --     : optional.none()
@@ -9544,9 +9716,11 @@ ON CONFLICT DO NOTHING;
 
 -- ---- sql/140_ext_lists.sql ----
 
--- The lists extension (cel-go ext/lists.go at the pinned v0.32.0):
--- slice, flatten, sort, sortBy (macro over @sortByAssociatedKeys),
--- lists.range, reverse, distinct. Registered under the 'lists' env.
+-- The lists extension (cel-go ext/lists.go at the pinned v0.33.1,
+-- library version 5): slice, flatten, sort, sortBy (macro over
+-- @sortByAssociatedKeys), lists.range, reverse, distinct, and the
+-- membership tests hasOnly / hasAny / hasAll / hasExactly.
+-- Registered under the 'lists' env.
 
 CREATE OR REPLACE FUNCTION cel._list_val(elems jsonb)
 RETURNS jsonb
@@ -9953,11 +10127,112 @@ INSERT INTO cel.env_item (env, kind, ref) VALUES
   ('lists', 'macro', 'sortBy/2/1')
 ON CONFLICT DO NOTHING;
 
+-- Membership tests (library version 5). Each compares elements with
+-- CEL equality, so [1, 2.0, 3u].hasAll([1.0, 2u, 3]) holds, and
+-- treats both lists as sets: duplicates and sizes do not matter.
+--
+--   a.hasOnly(b)     every element of a is in b    (a subset of b)
+--   a.hasAll(b)      every element of b is in a    (a superset of b)
+--   a.hasAny(b)      some element of a is in b     (false if empty)
+--   a.hasExactly(b)  both of the above             (set-equal)
+
+-- Whether every element of needles has an equal in haystack.
+CREATE OR REPLACE FUNCTION cel._list_covers(haystack jsonb,
+                                            needles jsonb)
+RETURNS boolean
+LANGUAGE sql
+IMMUTABLE PARALLEL SAFE
+SET search_path = cel, pg_temp
+AS $$
+  SELECT NOT EXISTS (
+    SELECT FROM jsonb_array_elements(needles) n
+    WHERE NOT EXISTS (
+      SELECT FROM jsonb_array_elements(haystack) h
+      WHERE cel._equal(n, h)
+    )
+  );
+$$;
+
+CREATE OR REPLACE FUNCTION cel._f_list_has_only(args jsonb[])
+RETURNS jsonb
+LANGUAGE sql
+IMMUTABLE PARALLEL SAFE
+SET search_path = cel, pg_temp
+AS $$
+  SELECT cel._bool_val(cel._list_covers(args[2] -> 'v', args[1] -> 'v'));
+$$;
+
+CREATE OR REPLACE FUNCTION cel._f_list_has_all(args jsonb[])
+RETURNS jsonb
+LANGUAGE sql
+IMMUTABLE PARALLEL SAFE
+SET search_path = cel, pg_temp
+AS $$
+  SELECT cel._bool_val(cel._list_covers(args[1] -> 'v', args[2] -> 'v'));
+$$;
+
+CREATE OR REPLACE FUNCTION cel._f_list_has_exactly(args jsonb[])
+RETURNS jsonb
+LANGUAGE sql
+IMMUTABLE PARALLEL SAFE
+SET search_path = cel, pg_temp
+AS $$
+  SELECT cel._bool_val(
+    cel._list_covers(args[1] -> 'v', args[2] -> 'v')
+    AND cel._list_covers(args[2] -> 'v', args[1] -> 'v'));
+$$;
+
+CREATE OR REPLACE FUNCTION cel._f_list_has_any(args jsonb[])
+RETURNS jsonb
+LANGUAGE sql
+IMMUTABLE PARALLEL SAFE
+SET search_path = cel, pg_temp
+AS $$
+  SELECT cel._bool_val(EXISTS (
+    SELECT FROM jsonb_array_elements(args[1] -> 'v') a,
+                jsonb_array_elements(args[2] -> 'v') b
+    WHERE cel._equal(a, b)
+  ));
+$$;
+
+INSERT INTO cel.overload
+  (id, function, member, arg_types, result_type, impl, ordinal)
+SELECT 'list_' || f || '_list', f, true,
+       '[{"kind": "list", "params": [{"kind": "param", "name": "T"}]},
+         {"kind": "list", "params": [{"kind": "param", "name": "T"}]}]',
+       '{"kind": "bool"}',
+       impl::regprocedure, 10
+FROM (VALUES
+  ('hasOnly', 'cel._f_list_has_only(jsonb[])'),
+  ('hasAny', 'cel._f_list_has_any(jsonb[])'),
+  ('hasAll', 'cel._f_list_has_all(jsonb[])'),
+  ('hasExactly', 'cel._f_list_has_exactly(jsonb[])')
+) v(f, impl)
+ON CONFLICT (id) DO UPDATE SET
+  function = excluded.function,
+  member = excluded.member,
+  arg_types = excluded.arg_types,
+  result_type = excluded.result_type,
+  impl = excluded.impl,
+  ordinal = excluded.ordinal;
+
+INSERT INTO cel.env_item (env, kind, ref) VALUES
+  ('lists', 'overload', 'list_hasOnly_list'),
+  ('lists', 'overload', 'list_hasAny_list'),
+  ('lists', 'overload', 'list_hasAll_list'),
+  ('lists', 'overload', 'list_hasExactly_list')
+ON CONFLICT DO NOTHING;
+
 -- ---- sql/150_ext_encoders.sql ----
 
 -- The encoders extension (cel-go ext/encoders.go at the pinned
--- v0.32.0): base64.encode / base64.decode. Registered under the
--- 'encoders' env.
+-- v0.33.1): base64.encode / base64.decode, and from library version
+-- 2 their URL-safe twins base64.encodeUrl / base64.decodeUrl.
+-- Registered under the 'encoders' env.
+--
+-- Not implemented: json.encode (version 1) and json.parse,
+-- yaml.encode, yaml.parse (version 2). docs/CONFORMANCE.md says why,
+-- and conformance/library_test.go names them as known-missing.
 
 -- Go accepts both padded and raw (unpadded) standard base64
 -- (encoders.go:143-150); Postgres decode requires padding, so pad
@@ -9994,6 +10269,45 @@ AS $$
       E'\n', ''));
 $$;
 
+-- The URL-safe alphabet (RFC 4648 section 5) swaps '+' and '/' for
+-- '-' and '_'. Postgres decode() knows only the standard alphabet, so
+-- translate in both directions; a standard-only character in the
+-- input is invalid here, as it is in Go's URLEncoding. Like
+-- base64.decode, padded and unpadded input are both accepted.
+CREATE OR REPLACE FUNCTION cel._f_base64_decode_url(args jsonb[])
+RETURNS jsonb
+LANGUAGE plpgsql
+IMMUTABLE PARALLEL SAFE
+SET search_path = cel, pg_temp
+AS $$
+DECLARE
+  s text := args[1] ->> 'v';
+BEGIN
+  IF s ~ '[+/]' THEN
+    RAISE 'not base64url';
+  END IF;
+  s := translate(s, '-_', '+/');
+  IF length(s) % 4 <> 0 THEN
+    s := rpad(s, length(s) + 4 - length(s) % 4, '=');
+  END IF;
+  RETURN jsonb_build_object('@t', 'bytes', 'v',
+    translate(encode(decode(s, 'base64'), 'base64'), E'\n', ''));
+EXCEPTION WHEN OTHERS THEN
+  RETURN cel._err(format('illegal base64 data in %s',
+    quote_literal(args[1] ->> 'v')));
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION cel._f_base64_encode_url(args jsonb[])
+RETURNS jsonb
+LANGUAGE sql
+IMMUTABLE PARALLEL SAFE
+SET search_path = cel, pg_temp
+AS $$
+  SELECT jsonb_build_object('@t', 'string', 'v',
+    translate(args[1] ->> 'v', '+/', '-_'));
+$$;
+
 INSERT INTO cel.overload
   (id, function, member, arg_types, result_type, impl, ordinal)
 VALUES
@@ -10002,7 +10316,13 @@ VALUES
    'cel._f_base64_decode(jsonb[])', 10),
   ('base64_encode_bytes', 'base64.encode', false,
    '[{"kind": "bytes"}]', '{"kind": "string"}',
-   'cel._f_base64_encode(jsonb[])', 10)
+   'cel._f_base64_encode(jsonb[])', 10),
+  ('base64_decode_url_string', 'base64.decodeUrl', false,
+   '[{"kind": "string"}]', '{"kind": "bytes"}',
+   'cel._f_base64_decode_url(jsonb[])', 10),
+  ('base64_encode_url_bytes', 'base64.encodeUrl', false,
+   '[{"kind": "bytes"}]', '{"kind": "string"}',
+   'cel._f_base64_encode_url(jsonb[])', 10)
 ON CONFLICT (id) DO UPDATE SET
   function = excluded.function,
   member = excluded.member,
@@ -10013,7 +10333,9 @@ ON CONFLICT (id) DO UPDATE SET
 
 INSERT INTO cel.env_item (env, kind, ref) VALUES
   ('encoders', 'overload', 'base64_decode_string'),
-  ('encoders', 'overload', 'base64_encode_bytes')
+  ('encoders', 'overload', 'base64_encode_bytes'),
+  ('encoders', 'overload', 'base64_decode_url_string'),
+  ('encoders', 'overload', 'base64_encode_url_bytes')
 ON CONFLICT DO NOTHING;
 
 -- ---- sql/160_ext_bindings.sql ----
