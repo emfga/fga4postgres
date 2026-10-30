@@ -65,12 +65,16 @@ a bug.
 Recorded with their reasoning because each one closes off an alternative
 a future contributor will otherwise reopen.
 
-1. **The conformance target is openfga/openfga v1.19.0, pinned
+1. **The conformance target is openfga/openfga v1.22.1, pinned
    everywhere at once.** The compose oracle image, the corpus files the
-   harness replays, and any `Ref:` permalinks all cite v1.19.0. Bump
+   harness replays, and any `Ref:` permalinks all cite v1.22.1. Bump
    them together or not at all — tsfga currently has a v1.18.2
    container beside a v1.19.0 checkout, and its own CLAUDE.md calls
-   that state untrustworthy.
+   that state untrustworthy. The oracle runs with upstream's
+   default flags: turning on an experimental feature is a
+   conformance decision, not a tuning knob. Inline `$expression`
+   conditions (experimental `inline_expressions`) are refused at
+   model write, as the stock server refuses them (PIN-EXPR-1).
 2. **The engine speaks upstream's JSON model shape; DSL conversion
    lives in the Go harness.** JSON is the actual API contract (SDKs
    convert DSL client-side), and the harness can use openfga's own
@@ -104,9 +108,9 @@ a future contributor will otherwise reopen.
    including the programmatic corpora (`tests/check/check_userset.go`
    etc.) that a non-Go harness must hand-port. Owner-selected.
 6. **Conformance is corpus replay and differential testing, both.**
-   Upstream's `assets/tests/*.yaml` (161 tests, ~1200 assertions
+   Upstream's `assets/tests/*.yaml` (171 tests, ~1260 assertions
    across check/list-objects/list-users) replays as the baseline; the
-   live v1.19.0 container in compose is the oracle for edge cases; and
+   live v1.22.1 container in compose is the oracle for edge cases; and
    tsfga's suite (~150 model fixtures, ported upstream matrices,
    real-world models) is ported over time. Adopt tsfga's assertion
    vocabulary: agreement asserts, refusal-as-outcome, and *pinned
@@ -354,7 +358,7 @@ close explicitly rather than drifting away from it.
   approach — not the what, which the diff already shows. Wrap at ~72
   columns.
 - Add `Ref:` trailers only for sources a reviewer could not reasonably
-  reconstruct: an openfga permalink pinned to the v1.19.0 SHA, an
+  reconstruct: an openfga permalink pinned to the v1.22.1 SHA, an
   upstream issue, a spec section settling a subtle point.
 - **Never create merge commits.** Merge with
   `git merge --ff-only --no-commit`; rebase if the fast-forward fails.
@@ -392,8 +396,8 @@ against `upstream/main`).
 
 - OpenFGA docs: https://openfga.dev/docs
 - OpenFGA API reference: https://openfga.dev/api/service
-- openfga/openfga v1.19.0:
-  https://github.com/openfga/openfga/tree/v1.19.0
+- openfga/openfga v1.22.1:
+  https://github.com/openfga/openfga/tree/v1.22.1
 - cel4postgres: https://github.com/emfga/cel4postgres
 - tsfga: https://github.com/emfga/tsfga
 - pg_tle: https://github.com/aws/pg_tle
