@@ -29,9 +29,10 @@
 --     the cap). Under an intersection or exclusion every operand
 --     is computed in full, since the operation may still remove
 --     users.
---   - depth: the userset ladder errors at 25 links where check
---     errors at 26 — list_users charges one hop more; cycles
---     yield nothing (fail-closed).
+--   - depth: the userset ladder errors at 25 links, where
+--     upstream's list_users does even on relations whose check
+--     its recursive resolver lets reach 26; cycles yield nothing
+--     (fail-closed).
 
 DO $$
 BEGIN

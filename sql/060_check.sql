@@ -6,8 +6,16 @@
 --
 --   Depth: charged only on dispatch to another object (userset
 --        expansion, TTU). Computed usersets and set operands cost
---        nothing. 25 dispatches succeed; the 26th raises
---        too-complex (YF102) — never a plain false.
+--        nothing. 24 dispatches succeed; the 25th raises
+--        too-complex (YF102) — never a plain false. The limit is
+--        a constant matching upstream's default resolve-node
+--        limit of 25 nodes. Upstream's default resolver refuses
+--        the 25th dispatch; its recursive resolver, chosen per
+--        relation from its weighted graph, admits it. The engine
+--        refuses it on every relation so that it never grants
+--        where upstream refuses, at the cost of a 2002 at exactly
+--        25 dispatches on recursive-resolver relations
+--        (PIN-DEPTH-1 in docs/CONFORMANCE.md).
 --   Error swallowing: a false sibling swallows an operand error
 --        in union and intersection; a true sibling never does.
 --        Implemented as deferred re-raise: operand errors of our
@@ -232,7 +240,7 @@ BEGIN
     END IF;
     grp_valid := true;
     BEGIN
-      IF depth >= 25 THEN
+      IF depth >= 24 THEN
         RAISE EXCEPTION 'resolution too complex: depth exceeded'
           USING ERRCODE = 'YF102';
       END IF;
@@ -515,7 +523,7 @@ BEGIN
     END IF;
     grp_valid := true;
     BEGIN
-      IF depth >= 25 THEN
+      IF depth >= 24 THEN
         RAISE EXCEPTION 'resolution too complex: depth exceeded'
           USING ERRCODE = 'YF102';
       END IF;

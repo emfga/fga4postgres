@@ -12,7 +12,7 @@ import (
 // Each generated kind spends depth like its counterpart, on the two
 // deep-chain shapes of TestProbeTTUChainBoundary and
 // TestProbeDeepChainEnvelope: __check refuses exactly where
-// fga.check refuses (25 dispatches resolve, the 26th raises YF102,
+// fga.check refuses (24 dispatches resolve, the 25th raises YF102,
 // never a silent false), __subjects refuses where list_users does,
 // and __objects charges no depth and lists the whole chain like
 // list_objects.
@@ -63,14 +63,14 @@ func TestCompiledDepthEnvelope(t *testing.T) {
 						t.Errorf("%s%d %s: __check %q, check %q",
 							c.prefix, i, user, got, want)
 					}
-					// The fixture itself: 25 dispatches resolve,
-					// the 26th refuses.
-					if user == "anne" && i == 25 && want != "true" {
-						t.Errorf("check at 25 links = %q, want true",
+					// The fixture itself: 24 dispatches resolve,
+					// the 25th refuses.
+					if user == "anne" && i == 24 && want != "true" {
+						t.Errorf("check at 24 links = %q, want true",
 							want)
 					}
-					if i == 26 && want != "error YF102" {
-						t.Errorf("check %s at 26 links = %q, want "+
+					if i == 25 && want != "error YF102" {
+						t.Errorf("check %s at 25 links = %q, want "+
 							"error YF102", user, want)
 					}
 				}

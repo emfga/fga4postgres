@@ -7,10 +7,10 @@ import (
 	openfgav1 "github.com/openfga/api/proto/openfga/v1"
 )
 
-// Does any fast-path resolver shape change the measured depth
-// boundary (first 2002 at 26 dispatches)? Probed on the two
-// remaining recursion shapes: a TTU parent chain and a
-// self-recursive TTU.
+// Where does each strategy put the depth boundary? Upstream's
+// recursive resolver, chosen for this self-recursive TTU chain,
+// first refuses at 26 dispatches; the engine refuses the 25th on
+// every relation (PIN-DEPTH-1).
 const ttuChainDSL = `model
   schema 1.1
 type user
@@ -46,10 +46,82 @@ func TestProbeTTUChainBoundary(t *testing.T) {
 				}
 			}
 		}
-		if boundary != 26 {
-			t.Errorf("%s: boundary at %d, want 26",
-				side.name, boundary)
+		want := 26
+		if side.name == "engine" {
+			want = 25
 		}
+		if boundary != want {
+			t.Errorf("%s: boundary at %d, want %d",
+				side.name, boundary, want)
+		}
+	}
+}
+
+// Relations upstream leaves to its default resolver refuse the 25th
+// dispatch, and so does the engine. Before the engine adopted that
+// budget it granted here, on the oncall real-world fixture's team
+// tree among others. Two shapes: a chain alternating two relations,
+// and a self-recursive TTU beside a second TTU operand, which keeps
+// it off the recursive resolver.
+func TestProbeDefaultResolverBoundary(t *testing.T) {
+	shapes := []struct{ name, dsl string }{
+		{"alternating", `model
+  schema 1.1
+type user
+type node
+  relations
+    define next: [node]
+    define a: [user] or b from next
+    define b: [user] or a from next
+`},
+		{"ttu-beside-ttu", `model
+  schema 1.1
+type user
+type org
+  relations
+    define m: [user]
+type node
+  relations
+    define next: [node]
+    define org: [org]
+    define a: [user] or a from next or m from org
+`},
+	}
+	for _, shape := range shapes {
+		t.Run(shape.name, func(t *testing.T) {
+			for _, n := range []int{24, 25} {
+				var tuples []*openfgav1.TupleKey
+				for i := 0; i < n; i++ {
+					tuples = append(tuples, tk(
+						fmt.Sprintf("node:n%d", i), "next",
+						fmt.Sprintf("node:n%d", i+1)))
+				}
+				rel := "a"
+				if shape.name == "alternating" && n%2 == 1 {
+					rel = "b"
+				}
+				tuples = append(tuples, tk(
+					fmt.Sprintf("node:n%d", n), rel, "user:anne"))
+				for _, side := range bothSides(t,
+					fmt.Sprintf("%s-%d", shape.name, n)) {
+					store, model := setup(t, side.client,
+						shape.dsl, tuples)
+					r := doCheck(t, side.client, store, model,
+						"node:n0", "a", "user:anne", nil, nil)
+					t.Logf("OBSERVED(%s): %d dispatches: %v",
+						side.name, n, r)
+					ok := r.err == nil && r.allowed
+					if n == 24 && !ok {
+						t.Errorf("%s: 24 dispatches: %v, "+
+							"want allowed=true", side.name, r)
+					}
+					if n == 25 && r.code != 2002 {
+						t.Errorf("%s: 25 dispatches: %v, "+
+							"want 2002", side.name, r)
+					}
+				}
+			}
+		})
 	}
 }
 

@@ -280,16 +280,19 @@ condition lcond(xs: list<double>) {
 	}
 }
 
-// PIN-DEPTH-1: near the depth boundary, deep recursive negatives
-// are strategy-dependent upstream: on the snowflake
-// fixture's full store, upstream refuses 2002 at 25 tuple hops
-// for an absent user where the engine — which implements the
-// documented budget (25 dispatches resolve, the 26th refuses) —
-// answers false. On a minimal store with only the role chain,
-// upstream's recursive fast path answers false at ANY depth
-// instead. Positives agree exactly on the boundary; the
-// disagreement class is only false-vs-2002, never true-vs-false.
-// The real-world sweep tolerates exactly this class.
+// PIN-DEPTH-1: upstream picks a check strategy per relation from
+// its weighted graph. Its default resolver refuses the 25th
+// dispatch; its recursive resolver, used on simple self-recursive
+// relations like the snowflake role chain, admits it. The engine
+// refuses the 25th dispatch on every relation, so on recursive-
+// resolver relations it answers 2002 exactly at 25 dispatches where
+// upstream grants. That is the refusing direction, and the only one
+// the engine allows itself: matching the recursive resolver
+// everywhere granted at 25 dispatches on default-resolver relations
+// where upstream refuses (TestProbeDefaultResolverBoundary). Past
+// the boundary both sides refuse; on a minimal store upstream's
+// recursive path may still answer an absent user false at any
+// depth. The real-world sweep tolerates exactly these classes.
 func TestPinnedDeepRecursionStrategy(t *testing.T) {
 	dsl, tuples := loadRealWorld(t, filepath.Join(
 		"testdata", "realworld", "snowflake"))
@@ -302,53 +305,46 @@ func TestPinnedDeepRecursionStrategy(t *testing.T) {
 	engStore, engModel := setup(t, eng, dsl, tuples)
 	oraStore, oraModel := setup(t, ora, dsl, tuples)
 
-	engCheck := func(object string) (bool, int) {
-		return checkOn(t, eng, engStore, engModel,
-			object, "member", "user_c3s:dan")
-	}
-	oraCheck := func(object string) (bool, int) {
-		return checkOn(t, ora, oraStore, oraModel,
-			object, "member", "user_c3s:dan")
-	}
-
-	// 25 hops (r05 -> r30), absent-from-chain user.
-	_, engCode := engCheck("role_c3s:r05")
-	_, oraCode := oraCheck("role_c3s:r05")
-	if engCode != 0 {
-		t.Errorf("engine side of the pin moved: got code %d, "+
-			"want allowed=false at 25 hops — update "+
-			"docs/CONFORMANCE.md", engCode)
-	}
-	if oraCode != 2002 {
-		t.Errorf("oracle side of the pin moved: got code %d, "+
-			"want 2002 at 25 hops on the full fixture store — "+
-			"the divergence may have closed; update "+
-			"docs/CONFORMANCE.md", oraCode)
-	}
-
-	// The positive boundary agrees exactly on both sides: alice
-	// sits at r30; 25 hops resolve, 26 refuse.
+	// alice sits at r30. r06 is 24 hops away, r05 25, r04 26.
 	alice := func(c probeClient, store, model, object string,
 	) (bool, int) {
 		return checkOn(t, c, store, model, object, "member",
 			"user_c3s:alice")
 	}
 	for _, tc := range []struct {
-		object      string
-		wantAllowed bool
-		wantCode    int
+		object     string
+		engAllowed bool
+		engCode    int
+		oraAllowed bool
+		oraCode    int
 	}{
-		{"role_c3s:r05", true, 0},
-		{"role_c3s:r04", false, 2002},
+		{"role_c3s:r06", true, 0, true, 0},
+		{"role_c3s:r05", false, 2002, true, 0},
+		{"role_c3s:r04", false, 2002, false, 2002},
 	} {
 		ea, ec := alice(eng, engStore, engModel, tc.object)
 		oa, oc := alice(ora, oraStore, oraModel, tc.object)
-		if ea != tc.wantAllowed || ec != tc.wantCode ||
-			oa != tc.wantAllowed || oc != tc.wantCode {
-			t.Errorf("positive boundary at %s: engine (%v,%d) "+
-				"oracle (%v,%d), want (%v,%d) on both",
-				tc.object, ea, ec, oa, oc,
-				tc.wantAllowed, tc.wantCode)
+		if ea != tc.engAllowed || ec != tc.engCode {
+			t.Errorf("engine side of the pin moved at %s: got "+
+				"(%v,%d), want (%v,%d) — update "+
+				"docs/CONFORMANCE.md", tc.object, ea, ec,
+				tc.engAllowed, tc.engCode)
 		}
+		if oa != tc.oraAllowed || oc != tc.oraCode {
+			t.Errorf("oracle side of the pin moved at %s: got "+
+				"(%v,%d), want (%v,%d) — the divergence may "+
+				"have closed; update docs/CONFORMANCE.md",
+				tc.object, oa, oc, tc.oraAllowed, tc.oraCode)
+		}
+	}
+
+	// An absent user at 25 hops: both refuse on the full store.
+	_, ec := checkOn(t, eng, engStore, engModel, "role_c3s:r05",
+		"member", "user_c3s:dan")
+	_, oc := checkOn(t, ora, oraStore, oraModel, "role_c3s:r05",
+		"member", "user_c3s:dan")
+	if ec != 2002 || oc != 2002 {
+		t.Errorf("absent user at 25 hops: engine code %d, oracle "+
+			"code %d, want 2002 on both", ec, oc)
 	}
 }

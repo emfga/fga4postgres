@@ -199,12 +199,16 @@ func runRealWorld(t *testing.T, dir string) {
 		// 2002, and upstream's user-first iteration can surface
 		// (nondeterministically) a 2000 condition error from a
 		// sibling object's tuple where plain resolution answers
-		// false. Tolerated in both directions; never
-		// true-vs-anything.
+		// false. Tolerated in both directions. The one
+		// true-vs-anything case tolerated is PIN-DEPTH-1's
+		// refusing side: the engine's 2002 where upstream's
+		// recursive resolver grants at 25 dispatches. The engine
+		// granting against anything else always fails.
 		if (strings.HasPrefix(e, "code=2") &&
 			o == "allowed=false") ||
 			(e == "allowed=false" &&
-				strings.HasPrefix(o, "code=2")) {
+				strings.HasPrefix(o, "code=2")) ||
+			(e == "code=2002" && o == "allowed=true") {
 			t.Logf("documented divergence class "+
 				"(docs/CONFORMANCE.md) at "+
 				"%s#%s@%s: engine %s (%s), oracle %s (%s)",

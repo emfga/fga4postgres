@@ -2173,15 +2173,19 @@ $$;
 --   __objects walks down from the subject, like list_objects, and
 --        charges no depth.
 --   __check walks up from the object, recording each node's dispatch
---        count d (computed usersets cost nothing). A grant at d <= 25
---        is check's true: the shortest path to it is simple, and
---        check's search follows every simple path of up to 25
---        dispatches. Otherwise check answers false or raises YF102,
---        and it raises only from a simple path of 25 dispatches whose
---        last node has a row to dispatch, which needs both a walk row
---        at d = 26 and 26 distinct nodes (the root and 25 distinct
---        dispatch targets). Without both, false is exact; with both,
---        the generic resolver decides, so the error is check's own.
+--        count d (computed usersets cost nothing) against check's
+--        budget: 24 dispatches resolve and the 25th refuses on every
+--        relation, upstream's default-resolver boundary, so neither
+--        path grants where upstream refuses (PIN-DEPTH-1). A grant
+--        at d <= 24 is check's true: the shortest path to it is
+--        simple, and check's search follows every simple path of up
+--        to 24 dispatches. Otherwise check answers false or raises
+--        YF102, and it raises only from a simple path of 24
+--        dispatches whose last node has a row to dispatch, which
+--        needs both a walk row at d = 25 and 25 distinct nodes (the
+--        root and 24 distinct dispatch targets). Without both,
+--        false is exact; with both, the generic resolver decides,
+--        so the error is check's own.
 --   __subjects walks up like __check. list_users refuses as soon as
 --        it enters a node 25 dispatches away, whatever it found
 --        elsewhere: a walk row at d = 25 and 26 distinct nodes hand
@@ -2217,6 +2221,7 @@ DECLARE
   grant_at text;
   walk_check text;
   walk_subjects text;
+  nodes text;
   risky text;
   subs text[] := '{}';
   sources jsonb;
@@ -2381,7 +2386,7 @@ BEGIN
   -- __check and __subjects: up from the object, counting dispatches
   -- up to a limit one past the counterpart's boundary.
   walk_check := fga._compiled_walk_up(store_id, root_type, root_rel,
-    computed_v, userset_v, ttu_v, 26);
+    computed_v, userset_v, ttu_v, 25);
   walk_subjects := fga._compiled_walk_up(store_id, root_type,
     root_rel, computed_v, userset_v, ttu_v, 25);
 
@@ -2411,15 +2416,16 @@ BEGIN
       'p_any_subject AND %4$s)', eq, userset_v, store_lit, uncond);
   END IF;
 
-  risky := '(SELECT pg_catalog.count(*) FROM (SELECT DISTINCT w.t, '
-    'w.o, w.r FROM w) AS n) OPERATOR(pg_catalog.>=) 26';
+  nodes := '(SELECT pg_catalog.count(*) FROM (SELECT DISTINCT w.t, '
+    'w.o, w.r FROM w) AS n) OPERATOR(pg_catalog.>=) ';
+  risky := nodes || '25';
   check_body := format(
     E'%s\nSELECT fga._compiled_sid(p_subject_id, p_any_subject, '
     || 'p_subject_relation) IS NOT NULL AND fga._compiled_oid(p_object) '
     'IS NOT NULL AND CASE WHEN NOT %s THEN (%s) '
-    'WHEN EXISTS (SELECT FROM w WHERE w.d OPERATOR(pg_catalog.<=) 25 '
+    'WHEN EXISTS (SELECT FROM w WHERE w.d OPERATOR(pg_catalog.<=) 24 '
     'AND (%s)) THEN true '
-    'WHEN EXISTS (SELECT FROM w WHERE w.d OPERATOR(pg_catalog.>=) 26) '
+    'WHEN EXISTS (SELECT FROM w WHERE w.d OPERATOR(pg_catalog.>=) 25) '
     'AND %s THEN (%s) ELSE false END',
     walk_check, live, substr(d.check_body, length('SELECT ') + 1),
     grant_at, risky, substr(d.check_body, length('SELECT ') + 1));
@@ -2476,7 +2482,7 @@ BEGIN
   END LOOP;
 
   risky := format('(EXISTS (SELECT FROM w WHERE w.d '
-    'OPERATOR(pg_catalog.>=) 25) AND %s)', risky);
+    'OPERATOR(pg_catalog.>=) 25) AND %s)', nodes || '26');
   subjects_body := format(
     E'%s\nSELECT NULL::pg_catalog.uuid WHERE '
     || 'fga._compiled_oid(p_object) IS NULL'

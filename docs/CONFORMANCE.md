@@ -53,12 +53,11 @@ All planned v1 APIs are implemented. Current verified surface:
   survives concrete subtraction as an invisible exception
   (`user:*` minus `user:bob` answers `user:*`, and an
   intersection sibling cannot resurrect the excluded user); a
-  wildcard subtrahend empties the result; depth refuses one
-  tuple-hop earlier than check (2002 at a 25-link ladder where
-  check refuses at 26); a condition error on a relevant path
-  fails the request immediately with 2000, while paths that
-  cannot reach the filter type are pruned before their tuples
-  (or conditions) are touched.
+  wildcard subtrahend empties the result; depth refuses at a
+  25-link ladder, as check does (PIN-DEPTH-1); a condition error
+  on a relevant path fails the request immediately with 2000,
+  while paths that cannot reach the filter type are pruned
+  before their tuples (or conditions) are touched.
 - Tuple `write`/`delete`: the full refusal matrix runs
   differentially (`TestWriteGateMatrix`) — the operation cap
   (2053), in-request duplicates across both lists (2004), the
@@ -131,7 +130,7 @@ sides refuse, at different limits.
 | PIN-ID-4 | Store/model ids are uuidv7; upstream-shaped ULID ids are refused as not-found, and ids never transfer between engines | refusing | TestPinnedULIDModelID |
 | PIN-READ-1 | A read continuation token reused under a changed filter is refused (2007); upstream's positional token silently continues at that offset under the new filter | refusing | TestPinnedReadTokenFilter |
 | PIN-CTX-1 | The condition-context write boundary is 32768 bytes of jsonb-normalized text; upstream's is 32768 proto bytes — number-heavy contexts refuse here and pass there, near-boundary strings flip at slightly different lengths | different-boundary | TestPinnedContextBoundary |
-| PIN-DEPTH-1 | Deep recursive negatives near the depth boundary are strategy-dependent upstream: the engine implements the documented budget (25 dispatches resolve, the 26th refuses 2002); upstream may answer false at any depth (recursive fast path) or refuse 2002 one dispatch early depending on model and store shape. The disagreement class is only false-vs-2002, never true-vs-false; positives agree exactly on the boundary | different-boundary | TestPinnedDeepRecursionStrategy |
+| PIN-DEPTH-1 | Upstream picks a check strategy per relation: its default resolver refuses the 25th dispatch, its recursive resolver (simple self-recursive relations, chosen from the weighted graph) admits it and refuses the 26th. The engine refuses the 25th dispatch on every relation, so on recursive-resolver relations it answers 2002 exactly at 25 dispatches where upstream grants; on default-resolver relations both sides agree (`TestProbeDefaultResolverBoundary`). Past the boundary upstream's recursive path may also answer an absent user false at any depth on a minimal store, where the engine refuses 2002. The engine never grants where upstream refuses; its limit is a constant matching upstream's default resolve-node limit of 25 | refusing | TestPinnedDeepRecursionStrategy |
 
 Condition-layer divergences (measured or by construction; none
 corpus-visible):
