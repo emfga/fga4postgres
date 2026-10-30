@@ -59,7 +59,12 @@ All planned v1 APIs are implemented. Current verified surface:
   25-link ladder, as check does (PIN-DEPTH-1); a condition error
   on a relevant path fails the request immediately with 2000,
   while paths that cannot reach the filter type are pruned
-  before their tuples (or conditions) are touched.
+  before their tuples (or conditions) are touched. Nested
+  exclusion over a type-bound public wildcard (upstream's
+  GHSA-h7w8-xr72-cv4r, fixed in v1.20.0: an excluded user
+  reached through a userset leaked back) never leaked here; the
+  fixed oracle and the engine agree on that family
+  (`TestListUsersNestedWildcardExclusion`), apart from PIN-LU-1.
 - Tuple `write`/`delete`: the full refusal matrix runs
   differentially (`TestWriteGateMatrix`) — the operation cap
   (2053), in-request duplicates across both lists (2004), the
@@ -130,7 +135,8 @@ printed in the run's skip register
 Direction vocabulary: **refusing** = fga4postgres refuses what
 upstream accepts (the safe direction); **granting** would be the
 reverse (none exist, by policy); **different-boundary** = both
-sides refuse, at different limits.
+sides refuse, at different limits; **different answer** = both
+sides answer, in a different form.
 
 | id | divergence | direction | pinned by |
 |----|-----------|-----------|-----------|
@@ -140,6 +146,7 @@ sides refuse, at different limits.
 | PIN-ID-4 | Store/model ids are uuidv7; upstream-shaped ULID ids are refused as not-found, and ids never transfer between engines | refusing | TestPinnedULIDModelID |
 | PIN-READ-1 | A read continuation token reused under a changed filter is refused (2007); upstream's positional token silently continues at that offset under the new filter | refusing | TestPinnedReadTokenFilter |
 | PIN-CTX-1 | The condition-context write boundary is 32768 bytes of jsonb-normalized text; upstream's is 32768 proto bytes — number-heavy contexts refuse here and pass there, near-boundary strings flip at slightly different lengths | different-boundary | TestPinnedContextBoundary |
+| PIN-LU-1 | `list_users` of a wildcard minus a nested exclusion that removes nobody (`everyone but not (banned but not suspended)`, bob both banned and suspended): upstream lists `user:bob` beside `user:*`, the engine `user:*` alone. Both grant bob; the form differs, not who has access (measured identically at v1.19.0) | different answer | TestPinnedListUsersRedundantUser |
 | PIN-EXPR-1 | Inline conditions (`[user with $expression]`): upstream with the experimental `inline_expressions` flag accepts the model and evaluates the CEL expression each tuple carries, and its v1.22.1 corpus exercises that. The engine refuses any such model at write with 2000, as stock upstream (flag off, the oracle's configuration) does; the oracle refusing too is asserted, so the pin turns red if upstream turns the feature on by default | refusing | TestPinnedInlineExpressionRefused |
 | PIN-DEPTH-1 | Upstream picks a check strategy per relation: its default resolver refuses the 25th dispatch, its recursive resolver (simple self-recursive relations, chosen from the weighted graph) admits it and refuses the 26th. The engine refuses the 25th dispatch on every relation, so on recursive-resolver relations it answers 2002 exactly at 25 dispatches where upstream grants; on default-resolver relations both sides agree (`TestProbeDefaultResolverBoundary`). Past the boundary upstream's recursive path may also answer an absent user false at any depth on a minimal store, where the engine refuses 2002. The engine never grants where upstream refuses; its limit is a constant matching upstream's default resolve-node limit of 25 | refusing | TestPinnedDeepRecursionStrategy |
 
