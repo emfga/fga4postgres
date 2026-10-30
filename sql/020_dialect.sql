@@ -107,6 +107,23 @@ INSERT INTO cel.env_item (env, kind, ref) VALUES
   ('openfga', 'overload', 'openfga_ipaddress_in_cidr')
 ON CONFLICT DO NOTHING;
 
+-- The dialect belongs to 'openfga' alone; upstream's condition env
+-- is standard CEL plus ipaddress, so plain 'standard' must not see
+-- it. cel4postgres 0.0.2 swept unclaimed rows into 'standard' on
+-- every reinstall, so a database upgraded through it carries these
+-- rows there too. cel4postgres 0.1.0 stops the sweep and repairs
+-- its own extensions, but leaves a consumer's rows alone, since it
+-- cannot tell them from ones placed in 'standard' on purpose. Only
+-- fga can, so it removes its own here. Idempotent: a clean install
+-- matches nothing.
+DELETE FROM cel.env_item s
+WHERE s.env = 'standard'
+  AND s.kind <> 'env'
+  AND EXISTS (
+    SELECT FROM cel.env_item o
+    WHERE o.env = 'openfga' AND o.kind = s.kind AND o.ref = s.ref
+  );
+
 -- Dyn conversion for untyped values: google.protobuf.Struct
 -- semantics, so every JSON number is a double.
 CREATE OR REPLACE FUNCTION fga._json_to_cel(val jsonb)

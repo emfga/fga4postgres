@@ -47,6 +47,17 @@ concurrent upgrade path is offered yet: schedule the upgrade where
 a pause in tuple traffic of that length is acceptable. Re-running
 the installer once the new index exists rebuilds nothing.
 
+Upgrading to 0.3.0 also upgrades the bundled cel4postgres from
+0.0.2 to 0.1.0. Re-running an installer built on 0.0.2 copied CEL
+extension functions, and fga4postgres's own `ipaddress` dialect,
+into cel4postgres's `standard` environment; the 0.1.0 installer
+removes the extension functions and fga4postgres's installer
+removes its dialect from there. Conditions evaluate in the
+`openfga` environment (standard CEL plus `ipaddress`, as upstream),
+so a condition that only compiled because an extension function
+such as a `strings` method had leaked in is now refused, as
+OpenFGA refuses it. A fresh install was never affected.
+
 From a checkout instead of a release:
 
 ```sh
