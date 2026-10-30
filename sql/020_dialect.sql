@@ -11,10 +11,10 @@
 -- evaluator the read paths call. Context merge precedence is
 -- measured against the pinned oracle (re-verified by
 -- conformance/probe_conditions_test.go): the tuple's condition
--- context wins over the request context per key; a parameter
--- absent from the merged context only errors if the expression
--- actually references it — which matches upstream's
--- partial-evaluation behaviour without needing UNKNOWN support.
+-- context wins over the request context per key; every declared
+-- parameter absent from the merged context is a missing-parameters
+-- error before evaluation, whether or not the expression reads it,
+-- as upstream refuses.
 
 INSERT INTO cel.env (name) VALUES ('openfga')
 ON CONFLICT DO NOTHING;
@@ -356,10 +356,12 @@ BEGIN
   merged := coalesce(req_ctx, '{}'::jsonb)
          || coalesce(tuple_ctx, '{}'::jsonb);
 
-  -- Pre-scan (measured against the corpus): a declared parameter
-  -- the expression references but the merged context lacks is a
-  -- missing-parameters error BEFORE evaluation — upstream does
-  -- not let CEL's || short-circuit around a missing operand.
+  -- Pre-scan (measured, conformance/probe_conditions_test.go):
+  -- every declared parameter the merged context lacks is a
+  -- missing-parameters error BEFORE evaluation, whether or not
+  -- the expression references it — upstream does not let CEL's
+  -- || short-circuit around a missing operand, nor an unused
+  -- declaration go unsupplied.
   DECLARE
     missing text[] := '{}';
   BEGIN
@@ -370,10 +372,7 @@ BEGIN
       IF merged ? p.key THEN
         activation := activation || jsonb_build_object(
           p.key, fga._param_value(p.value, merged -> p.key));
-      ELSIF jsonb_path_exists(cond.compiled_ast,
-        '$.** ? (@.k == "ident" && @.name == $n)',
-        jsonb_build_object('n', p.key))
-      THEN
+      ELSE
         missing := missing || p.key;
       END IF;
     END LOOP;

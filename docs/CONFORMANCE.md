@@ -25,8 +25,9 @@ All planned v1 APIs are implemented. Current verified surface:
   `openfga` env (the `ipaddress` type and `in_cidr` registered via
   its registries); typed parameters convert per upstream's
   grammar; the tuple's condition context wins over the request
-  context; a missing referenced parameter refuses before
-  evaluation exactly as measured.
+  context; a declared parameter missing from the merged context
+  refuses (2000) before evaluation, whether or not the expression
+  reads it (`TestConditionUnreferencedParameter`).
 
 - `check` and `batch_check`: every non-condition case of the
   upstream YAML corpus (`consolidated_1_1_tests.yaml` +

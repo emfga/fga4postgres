@@ -137,3 +137,44 @@ func TestProbeIteratorOverlay(t *testing.T) {
 		"doc:1", "viewer", "user:anne", nil, nil)
 	t.Logf("OBSERVED: userset stored x=1 alone: %v", r)
 }
+
+// Every declared parameter is required, referenced or not: a
+// context lacking one the expression never reads is still a
+// missing-parameters refusal (2000), on both engines.
+func TestConditionUnreferencedParameter(t *testing.T) {
+	const dsl = `model
+  schema 1.1
+type user
+type doc
+  relations
+    define v: [user with ycond]
+condition ycond(x: int, y: int) {
+  x == 1
+}`
+	tuples := []*openfgav1.TupleKey{
+		condTK(t, "doc:1", "v", "user:anne", "ycond", nil),
+		condTK(t, "doc:2", "v", "user:anne", "ycond", kv("y", 1)),
+	}
+	for _, sd := range listSides(t, "unreferenced") {
+		t.Run(sd.name, func(t *testing.T) {
+			store, model := setup(t, sd.client, dsl, tuples)
+			for _, c := range []struct {
+				obj  string
+				req  map[string]any
+				want string
+			}{
+				{"doc:1", kv("x", 1), "2000"},
+				{"doc:1", kv("x", 1, "y", 1), "true"},
+				{"doc:1", kv("y", 1), "2000"},
+				{"doc:2", kv("x", 1), "true"},
+			} {
+				r := doCheck(t, sd.client, store, model, c.obj, "v",
+					"user:anne", nil, toStruct(t, c.req))
+				if got := outcome(r.allowed, r.err); got != c.want {
+					t.Errorf("%s with %v: got %s, want %s (%v)",
+						c.obj, c.req, got, c.want, r.err)
+				}
+			}
+		})
+	}
+}
