@@ -5,7 +5,7 @@
 #
 # BASE_IMAGE must match compose.yaml's pinned image; the workflow
 # extracts it from there so the two cannot drift.
-ARG BASE_IMAGE=postgres:18-alpine
+ARG BASE_IMAGE=postgres:18-alpine@sha256:123b17998ccaf47e53b502e8c6a1e79afd8f579c6f3eec83c563da026f957395
 FROM ${BASE_IMAGE}
 
 # Pinned like every other reference: a bump is a deliberate change.
